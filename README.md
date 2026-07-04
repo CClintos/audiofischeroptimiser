@@ -2,6 +2,10 @@
 
 This repo is a local AFPX tuning tool for Helix / Audiotec Fischer DSP systems.
 
+It takes your baseline `.afpx` tune plus REW measurement exports, tries many possible PEQ combinations, scores them, and gives you back ranked AFPX tune candidates to test.
+
+The goal is to improve the tune without touching delays, crossovers, polarity, or all-pass filters.
+
 It is meant to be used through Claude or Codex:
 
 1. Drag in your REW measurement text exports.
@@ -23,9 +27,7 @@ Please verify the files, run the optimizer locally, merge the results, and give 
 Do not change delays, crossovers, polarity, or all-pass filters.
 ```
 
-## What It Does
-
-The optimizer reads your baseline tune and REW measurement exports, tries many possible PEQ combinations, and writes out ranked AFPX candidates to audition.
+## How It Scores
 
 It does not just chase a flat mono sum. Its scoring is designed to:
 
