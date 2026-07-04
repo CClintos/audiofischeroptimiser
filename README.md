@@ -54,36 +54,14 @@ Target curve:
 
 ## Quick Start
 
-1. Create a working folder with your REW exports and rename your baseline tune to `baseline.afpx`.
-2. Run the worker launcher and point `-DataRoot` and `-Baseline` at your files.
-3. Wait for the run to finish.
-4. Run the merge script to build the final ranked AFPX outputs.
+The intended workflow is to use this repo through Claude or Codex, not to make people hand-run PowerShell commands.
 
-Example:
+1. Drag in your REW measurement text exports.
+2. Drag in your baseline `.afpx` tune.
+3. Optionally drag in your target curve text file.
+4. Ask the model to use the optimizer repo as a local AFPX tuning tool and run a 20 minute optimization.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_guided_stream_workers.ps1 `
-  -Root "Optimizer_Run" `
-  -Workers 8 `
-  -Seconds 1200 `
-  -Proposal guided `
-  -ValidationThreshold 3.0 `
-  -DataRoot "C:\path\to\your\measurements" `
-  -Baseline "C:\path\to\your\measurements\baseline.afpx" `
-  -Target ".\ResoNix Target Curve 2026.txt"
-```
-
-Then merge:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\merge_guided_stream_results.ps1 `
-  -Root "Optimizer_Run" `
-  -Top 30 `
-  -ValidationThreshold 3.0 `
-  -DataRoot "C:\path\to\your\measurements" `
-  -Baseline "C:\path\to\your\measurements\baseline.afpx" `
-  -Target ".\ResoNix Target Curve 2026.txt"
-```
+That is the main user workflow this repo is set up for.
 
 ## Using It With Claude or Codex
 
