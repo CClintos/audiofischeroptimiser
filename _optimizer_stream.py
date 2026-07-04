@@ -89,43 +89,31 @@ def branch_contribution(freqs, traces, group: str) -> np.ndarray:
     if cfg.get("trace"):
         branch = traces[cfg["trace"]]
     else:
-        branch = {
-            "sub": traces["Sub"],
-            "low": traces["Mid Bass Together"],
-            "high": traces["Tweeters Together"],
-        }[branch_name]
-    total = (
-        10 ** (traces["Sub"] / 10)
-        + 10 ** (traces["Mid Bass Together"] / 10)
-        + 10 ** (traces["Tweeters Together"] / 10)
-    )
+        branch = {"sub": traces["Sub"]}.get(branch_name)
+        if branch is None:
+            pair = opt.PAIR_DEFS[branch_name]
+            branch = traces[pair["together"]]
+    total = 10 ** (traces["Sub"] / 10)
+    for pair in opt.PAIR_DEFS.values():
+        total = total + 10 ** (traces[pair["together"]] / 10)
     share = 10 ** (branch / 10) / np.maximum(total, 1e-30)
     return np.clip(share, 0.0, 1.0)
 
 
 def interference_masks(freqs, traces):
     masks = {group: np.zeros_like(freqs, dtype=bool) for group in opt.GROUPS}
-    low_mask = np.zeros_like(freqs, dtype=bool)
-    high_mask = np.zeros_like(freqs, dtype=bool)
-    try:
-        low_audit = opt.interference_audit(
-            freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"]
-        )
-        low_mask |= low_audit[3]
-    except Exception:
-        pass
-    try:
-        tw_audit = opt.interference_audit(
-            freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"]
-        )
-        high_mask |= tw_audit[3]
-    except Exception:
-        pass
+    pair_masks = {name: np.zeros_like(freqs, dtype=bool) for name in opt.PAIR_DEFS}
+    for name, pair in opt.PAIR_DEFS.items():
+        try:
+            pair_masks[name] |= opt.interference_audit(
+                freqs, traces[pair["left"]], traces[pair["right"]], traces[pair["together"]]
+            )[3]
+        except Exception:
+            pass
     for group, cfg in opt.GROUPS.items():
-        if cfg.get("branch") == "low":
-            masks[group] |= low_mask
-        elif cfg.get("branch") == "high":
-            masks[group] |= high_mask
+        branch = cfg.get("branch")
+        if branch in pair_masks:
+            masks[group] |= pair_masks[branch]
     return masks
 
 
@@ -615,17 +603,15 @@ def load_state(path: Path, rng: np.random.Generator, component_score=None, archi
 
 def interference_notes(freqs, traces):
     notes = []
-    low_audit = opt.interference_audit(
-        freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"]
-    )
-    tw_audit = opt.interference_audit(
-        freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"]
-    )
-    for label, audit, band in [
-        ("Midbass L/R", low_audit, (80.0, 1200.0)),
-        ("Tweeter L/R", tw_audit, (2200.0, 16000.0)),
-    ]:
-        ranges = opt.mask_ranges(freqs, audit[3], band)
+    for name, pair in opt.PAIR_DEFS.items():
+        try:
+            audit = opt.interference_audit(
+                freqs, traces[pair["left"]], traces[pair["right"]], traces[pair["together"]]
+            )
+        except Exception:
+            continue
+        label = {"low": "Midbass L/R", "mid": "Midrange L/R", "high": "Tweeter L/R"}.get(name, name)
+        ranges = opt.mask_ranges(freqs, audit[3], pair["branch_band"])
         if ranges:
             pretty = ", ".join(f"{lo:.0f}-{hi:.0f} Hz" for lo, hi in ranges[:8])
             if len(ranges) > 8:

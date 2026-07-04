@@ -64,6 +64,8 @@ Expected measurement files:
 - `Tweeters Together.txt` or `Both Tweeters.txt`
 - `Mid Bass Together.txt` or `Both Mids.txt`
 
+For a true front 3-way system, also provide separate mid and low branch measurements so the optimizer can detect and score `high + mid + low + sub` instead of the simpler 2-way front layout.
+
 Expected tune file:
 
 - `baseline.afpx`

@@ -77,16 +77,59 @@ def _load_external_objective():
 
 AFPX_OBJECTIVE = _load_external_objective()
 
-MEASUREMENT_ALIASES = {
-    "FL High": ("Front L High.txt", "Front L Tweeter.txt"),
-    "FR High": ("Front R High.txt", "Front R Tweeter.txt"),
-    "FL Low": ("Front L Low.txt", "Front L Mid.txt", "Front L MID.txt"),
-    "FR Low": ("Front R Low.txt", "Front R Mid.txt", "Front R MID.txt"),
-    "Sub": ("Sub.txt", "SUB.txt"),
-    "System Sum": ("System Sum.txt", "SYSTEM SUM.txt"),
-    "Tweeters Together": ("Tweeters Together.txt", "Both Tweeters.txt"),
-    "Mid Bass Together": ("Mid Bass Together.txt", "Both Mids.txt", "Mid Bass Together.txt"),
-}
+HIGH_ALIASES_L = ("Front L High.txt", "Front L Tweeter.txt")
+HIGH_ALIASES_R = ("Front R High.txt", "Front R Tweeter.txt")
+MID_ALIASES_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt")
+MID_ALIASES_R = ("Front R Mid.txt", "Front R MID.txt", "Front R Midrange.txt")
+LOW_ALIASES_L = ("Front L Low.txt", "Front L Midbass.txt", "Front L Mid Bass.txt")
+LOW_ALIASES_R = ("Front R Low.txt", "Front R Midbass.txt", "Front R Mid Bass.txt")
+MID_PAIR_ALIASES = ("Both Mids.txt", "Mids Together.txt", "Midrange Together.txt")
+LOW_PAIR_ALIASES = ("Mid Bass Together.txt", "Both Midbass.txt", "Both Midbasses.txt", "Both Mid Bass.txt")
+SUB_ALIASES = ("Sub.txt", "SUB.txt")
+SYSTEM_ALIASES = ("System Sum.txt", "SYSTEM SUM.txt")
+HIGH_PAIR_ALIASES = ("Tweeters Together.txt", "Both Tweeters.txt")
+
+
+def _has_any(data_root: Path, aliases: Tuple[str, ...]) -> bool:
+    return any((data_root / alias).exists() for alias in aliases)
+
+
+def detect_front_layout(data_root: Path = DATA_ROOT) -> str:
+    has_mid = _has_any(data_root, MID_ALIASES_L) and _has_any(data_root, MID_ALIASES_R) and _has_any(data_root, MID_PAIR_ALIASES)
+    has_low = _has_any(data_root, LOW_ALIASES_L) and _has_any(data_root, LOW_ALIASES_R) and _has_any(data_root, LOW_PAIR_ALIASES)
+    return "3way" if has_mid and has_low else "2way"
+
+
+FRONT_LAYOUT = detect_front_layout(DATA_ROOT)
+
+
+def measurement_aliases_for_layout(layout: str) -> Dict[str, Tuple[str, ...]]:
+    aliases = {
+        "FL High": HIGH_ALIASES_L,
+        "FR High": HIGH_ALIASES_R,
+        "Sub": SUB_ALIASES,
+        "System Sum": SYSTEM_ALIASES,
+        "Tweeters Together": HIGH_PAIR_ALIASES,
+    }
+    if layout == "3way":
+        aliases.update({
+            "FL Mid": MID_ALIASES_L,
+            "FR Mid": MID_ALIASES_R,
+            "Mids Together": MID_PAIR_ALIASES,
+            "FL Low": LOW_ALIASES_L,
+            "FR Low": LOW_ALIASES_R,
+            "Mid Bass Together": LOW_PAIR_ALIASES,
+        })
+    else:
+        aliases.update({
+            "FL Low": LOW_ALIASES_L + MID_ALIASES_L,
+            "FR Low": LOW_ALIASES_R + MID_ALIASES_R,
+            "Mid Bass Together": LOW_PAIR_ALIASES + MID_PAIR_ALIASES,
+        })
+    return aliases
+
+
+MEASUREMENT_ALIASES = measurement_aliases_for_layout(FRONT_LAYOUT)
 
 
 def resolve_measurement_files(data_root: Path = DATA_ROOT) -> Dict[str, Path]:
@@ -104,160 +147,173 @@ def resolve_measurement_files(data_root: Path = DATA_ROOT) -> Dict[str, Path]:
 
 MEASUREMENT_FILES = resolve_measurement_files()
 
-# Candidate groups. These are shared voicing layers, so paired channels get the
-# same filters. The ranges are passband-focused and avoid asking MMM magnitude
-# data to solve phase/time problems.
-GROUPS = {
-    "sub": {
-        "channels": (6, 7),
-        "branch": "sub",
-        "range": (30.0, 90.0),
-        "q_range": (0.5, 5.0),
-        "gain_range": (-6.0, 0.0),
-        "max_bands": 2,
-    },
-    "low_sym": {
-        "channels": (2, 3),
-        "branch": "low",
-        "range": (80.0, 1600.0),
-        "q_range": (0.5, 5.0),
-        "gain_range": (-6.0, 0.0),
-        "max_bands": 1,
-    },
-    "fl_low": {
-        "channels": (2,),
-        "branch": "low",
-        "trace": "FL Low",
-        "pair": "low",
-        "side": "left",
-        "range": (80.0, 2000.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-6.0, 3.0),
-        "max_bands": 2,
-    },
-    "fr_low": {
-        "channels": (3,),
-        "branch": "low",
-        "trace": "FR Low",
-        "pair": "low",
-        "side": "right",
-        "range": (80.0, 2000.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-6.0, 3.0),
-        "max_bands": 2,
-    },
-    "fl_high": {
-        "channels": (0,),
-        "branch": "high",
-        "trace": "FL High",
-        "pair": "high",
-        "side": "left",
-        "range": (1800.0, 12000.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-6.0, 3.0),
-        "max_bands": 2,
-    },
-    "fr_high": {
-        "channels": (1,),
-        "branch": "high",
-        "trace": "FR High",
-        "pair": "high",
-        "side": "right",
-        "range": (1800.0, 12000.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-6.0, 3.0),
-        "max_bands": 2,
-    },
-    "high_sym": {
-        "channels": (0, 1),
-        "branch": "high",
-        "symmetric_tweeter": True,
-        "range": (6000.0, 16000.0),
-        "q_range": (0.5, 4.5),
-        "gain_range": (-6.0, 0.0),
-        "max_bands": 1,
-    },
-}
 
-SAFE_GROUPS = {k: dict(v) for k, v in GROUPS.items()}
-EXPLORE_GROUPS = {
-    "sub": {
-        "channels": (6, 7),
-        "branch": "sub",
-        "range": (30.0, 90.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-8.0, 1.5),
-        "max_bands": 2,
-    },
-    "low_sym": {
-        "channels": (2, 3),
-        "branch": "low",
-        "range": (70.0, 1800.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-8.0, 0.0),
-        "max_bands": 2,
-    },
-    "fl_low": {
-        "channels": (2,),
-        "branch": "low",
-        "trace": "FL Low",
-        "pair": "low",
-        "side": "left",
-        "range": (70.0, 2200.0),
-        "q_range": (0.5, 8.0),
-        "gain_range": (-8.0, 3.0),
-        "max_bands": 3,
-    },
-    "fr_low": {
-        "channels": (3,),
-        "branch": "low",
-        "trace": "FR Low",
-        "pair": "low",
-        "side": "right",
-        "range": (70.0, 2200.0),
-        "q_range": (0.5, 8.0),
-        "gain_range": (-8.0, 3.0),
-        "max_bands": 3,
-    },
-    "fl_high": {
-        "channels": (0,),
-        "branch": "high",
-        "trace": "FL High",
-        "pair": "high",
-        "side": "left",
-        "range": (1800.0, 12000.0),
-        "q_range": (0.5, 8.0),
-        "gain_range": (-8.0, 3.0),
-        "max_bands": 3,
-    },
-    "fr_high": {
-        "channels": (1,),
-        "branch": "high",
-        "trace": "FR High",
-        "pair": "high",
-        "side": "right",
-        "range": (1800.0, 12000.0),
-        "q_range": (0.5, 8.0),
-        "gain_range": (-8.0, 3.0),
-        "max_bands": 3,
-    },
-    "high_sym": {
-        "channels": (0, 1),
-        "branch": "high",
-        "symmetric_tweeter": True,
-        "range": (6000.0, 16000.0),
-        "q_range": (0.5, 6.0),
-        "gain_range": (-8.0, 0.0),
-        "max_bands": 2,
-    },
-}
+def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str, object]]:
+    gain_sym = (-8.0, 0.0) if explore else (-6.0, 0.0)
+    gain_side = (-8.0, 3.0) if explore else (-6.0, 3.0)
+    q_sym = (0.5, 6.0) if explore else (0.5, 5.0)
+    q_side = (0.5, 8.0) if explore else (0.5, 6.0)
+    max_sym = 2 if explore else 1
+    max_side = 3 if explore else 2
+    groups: Dict[str, Dict[str, object]] = {
+        "sub": {
+            "channels": (6, 7),
+            "branch": "sub",
+            "range": (30.0, 90.0),
+            "q_range": (0.5, 6.0 if explore else 5.0),
+            "gain_range": (-8.0, 1.5) if explore else (-6.0, 0.0),
+            "max_bands": 2,
+        },
+        "high_sym": {
+            "channels": (0, 1),
+            "branch": "high",
+            "symmetric_tweeter": True,
+            "range": (6000.0, 16000.0),
+            "q_range": (0.5, 6.0 if explore else 4.5),
+            "gain_range": gain_sym,
+            "max_bands": 2 if explore else 1,
+        },
+        "fl_high": {
+            "channels": (0,),
+            "branch": "high",
+            "trace": "FL High",
+            "pair": "high",
+            "side": "left",
+            "range": (1800.0, 12000.0),
+            "q_range": q_side,
+            "gain_range": gain_side,
+            "max_bands": max_side,
+        },
+        "fr_high": {
+            "channels": (1,),
+            "branch": "high",
+            "trace": "FR High",
+            "pair": "high",
+            "side": "right",
+            "range": (1800.0, 12000.0),
+            "q_range": q_side,
+            "gain_range": gain_side,
+            "max_bands": max_side,
+        },
+    }
+    if layout == "3way":
+        groups.update({
+            "mid_sym": {
+                "channels": (2, 3),
+                "branch": "mid",
+                "range": (250.0, 3500.0),
+                "q_range": q_sym,
+                "gain_range": gain_sym,
+                "max_bands": max_sym,
+            },
+            "fl_mid": {
+                "channels": (2,),
+                "branch": "mid",
+                "trace": "FL Mid",
+                "pair": "mid",
+                "side": "left",
+                "range": (250.0, 4000.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+            "fr_mid": {
+                "channels": (3,),
+                "branch": "mid",
+                "trace": "FR Mid",
+                "pair": "mid",
+                "side": "right",
+                "range": (250.0, 4000.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+            "low_sym": {
+                "channels": (4, 5),
+                "branch": "low",
+                "range": (50.0, 500.0),
+                "q_range": q_sym,
+                "gain_range": gain_sym,
+                "max_bands": max_sym,
+            },
+            "fl_low": {
+                "channels": (4,),
+                "branch": "low",
+                "trace": "FL Low",
+                "pair": "low",
+                "side": "left",
+                "range": (50.0, 600.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+            "fr_low": {
+                "channels": (5,),
+                "branch": "low",
+                "trace": "FR Low",
+                "pair": "low",
+                "side": "right",
+                "range": (50.0, 600.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+        })
+    else:
+        groups.update({
+            "low_sym": {
+                "channels": (2, 3),
+                "branch": "low",
+                "range": (70.0, 1800.0) if explore else (80.0, 1600.0),
+                "q_range": q_sym,
+                "gain_range": gain_sym,
+                "max_bands": max_sym,
+            },
+            "fl_low": {
+                "channels": (2,),
+                "branch": "low",
+                "trace": "FL Low",
+                "pair": "low",
+                "side": "left",
+                "range": (70.0, 2200.0) if explore else (80.0, 2000.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+            "fr_low": {
+                "channels": (3,),
+                "branch": "low",
+                "trace": "FR Low",
+                "pair": "low",
+                "side": "right",
+                "range": (70.0, 2200.0) if explore else (80.0, 2000.0),
+                "q_range": q_side,
+                "gain_range": gain_side,
+                "max_bands": max_side,
+            },
+        })
+    return groups
 
-CH_TRACE = {
-    0: "FL High",
-    1: "FR High",
-    2: "FL Low",
-    3: "FR Low",
-}
+GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
+SAFE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
+EXPLORE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=True)
+
+if FRONT_LAYOUT == "3way":
+    CH_TRACE = {
+        0: "FL High",
+        1: "FR High",
+        2: "FL Mid",
+        3: "FR Mid",
+        4: "FL Low",
+        5: "FR Low",
+    }
+else:
+    CH_TRACE = {
+        0: "FL High",
+        1: "FR High",
+        2: "FL Low",
+        3: "FR Low",
+    }
 
 REPORT_FREQS = [
     31.5, 40, 50, 63, 80, 100, 125, 160, 250, 315, 400, 500, 630, 800,
@@ -472,22 +528,47 @@ def make_fast_audibility(freqs: np.ndarray, band: Tuple[float, float] = (20.0, 1
     return score
 
 
-PAIR_DEFS = {
-    "low": {
-        "left": "FL Low",
-        "right": "FR Low",
-        "together": "Mid Bass Together",
-        "branch_band": (80.0, 2200.0),
-        "balance_band": (200.0, 2200.0),
-    },
-    "high": {
-        "left": "FL High",
-        "right": "FR High",
-        "together": "Tweeters Together",
-        "branch_band": (1800.0, 16000.0),
-        "balance_band": (1800.0, 8000.0),
-    },
-}
+if FRONT_LAYOUT == "3way":
+    PAIR_DEFS = {
+        "low": {
+            "left": "FL Low",
+            "right": "FR Low",
+            "together": "Mid Bass Together",
+            "branch_band": (50.0, 700.0),
+            "balance_band": (80.0, 500.0),
+        },
+        "mid": {
+            "left": "FL Mid",
+            "right": "FR Mid",
+            "together": "Mids Together",
+            "branch_band": (250.0, 4500.0),
+            "balance_band": (300.0, 3500.0),
+        },
+        "high": {
+            "left": "FL High",
+            "right": "FR High",
+            "together": "Tweeters Together",
+            "branch_band": (1800.0, 16000.0),
+            "balance_band": (2500.0, 12000.0),
+        },
+    }
+else:
+    PAIR_DEFS = {
+        "low": {
+            "left": "FL Low",
+            "right": "FR Low",
+            "together": "Mid Bass Together",
+            "branch_band": (80.0, 2200.0),
+            "balance_band": (200.0, 2200.0),
+        },
+        "high": {
+            "left": "FL High",
+            "right": "FR High",
+            "together": "Tweeters Together",
+            "branch_band": (1800.0, 16000.0),
+            "balance_band": (1800.0, 8000.0),
+        },
+    }
 
 
 def weighted_rms(values: np.ndarray, weights: np.ndarray, sel: np.ndarray) -> float:
@@ -536,40 +617,31 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
         sub_delta = sub_delta / sub_count
     pred["Sub"] = traces["Sub"] + sub_delta
 
-    tw_power = power_sum_db([traces["FL High"], traces["FR High"]])
-    tw_residual = traces["Tweeters Together"] - tw_power
-    pred["Tweeters Together"] = power_sum_db([pred["FL High"], pred["FR High"]]) + tw_residual
+    branch_outputs = []
+    for pair in PAIR_DEFS.values():
+        pair_power = power_sum_db([traces[pair["left"]], traces[pair["right"]]])
+        pair_residual = traces[pair["together"]] - pair_power
+        pred[pair["together"]] = power_sum_db([pred[pair["left"]], pred[pair["right"]]]) + pair_residual
+        branch_outputs.append(pred[pair["together"]])
 
-    mid_power = power_sum_db([traces["FL Low"], traces["FR Low"]])
-    mid_residual = traces["Mid Bass Together"] - mid_power
-    pred["Mid Bass Together"] = power_sum_db([pred["FL Low"], pred["FR Low"]]) + mid_residual
-
-    branch_power = power_sum_db([traces["Tweeters Together"], traces["Mid Bass Together"], traces["Sub"]])
+    branch_power = power_sum_db([traces[pair["together"]] for pair in PAIR_DEFS.values()] + [traces["Sub"]])
     system_residual = traces["System Sum"] - branch_power
-    pred["System Sum"] = power_sum_db(
-        [pred["Tweeters Together"], pred["Mid Bass Together"], pred["Sub"]]
-    ) + system_residual
+    pred["System Sum"] = power_sum_db(branch_outputs + [pred["Sub"]]) + system_residual
     return pred
 
 
 def null_masks(freqs: np.ndarray, traces: TraceMap) -> Dict[str, np.ndarray]:
-    masks = {
-        "low": np.zeros_like(freqs, dtype=bool),
-        "high": np.zeros_like(freqs, dtype=bool),
-    }
-    try:
-        masks["low"] = interference_audit(
-            freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"]
-        )[3]
-    except Exception:
-        pass
-    try:
-        masks["high"] = interference_audit(
-            freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"]
-        )[3]
-    except Exception:
-        pass
-    masks["system"] = masks["low"] | masks["high"]
+    masks = {name: np.zeros_like(freqs, dtype=bool) for name in PAIR_DEFS}
+    for name, pair in PAIR_DEFS.items():
+        try:
+            masks[name] = interference_audit(
+                freqs, traces[pair["left"]], traces[pair["right"]], traces[pair["together"]]
+            )[3]
+        except Exception:
+            pass
+    masks["system"] = np.zeros_like(freqs, dtype=bool)
+    for name in PAIR_DEFS:
+        masks["system"] |= masks[name]
     return masks
 
 
@@ -603,9 +675,15 @@ def make_component_scorer(
             comp = dict(AFPX_OBJECTIVE.score_bands(groups_to_band_sets(groups)))
             tonal = float(comp.get("tonal_masked", 0.0))
             worst = float(comp.get("worst_masked", 0.0))
+            low_balance = abs(float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0)))
             mid_balance = abs(float(comp.get("mid_balance", 0.0)))
             tweeter_balance = abs(float(comp.get("tweeter_balance", 0.0)))
-            balance = math.sqrt((mid_balance * mid_balance + tweeter_balance * tweeter_balance) / 2.0)
+            balance_terms = [tweeter_balance]
+            if FRONT_LAYOUT == "3way":
+                balance_terms.extend([low_balance, mid_balance])
+            else:
+                balance_terms.append(mid_balance)
+            balance = math.sqrt(sum(x * x for x in balance_terms) / max(len(balance_terms), 1))
             headroom = float(comp.get("headroom_peak", 0.0)) + float(comp.get("null_boost_avg", 0.0))
             comp.update({
                 "objective": float(comp["objective"]),
@@ -621,9 +699,11 @@ def make_component_scorer(
                 "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
                 "filter_count": float(comp.get("n_front_bands", 0.0)),
                 "filter_cost_units": float(filter_cost(groups)),
-                "low_balance_rms_db": mid_balance,
+                "low_balance_rms_db": low_balance if FRONT_LAYOUT == "3way" else mid_balance,
+                "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
                 "high_balance_rms_db": tweeter_balance,
-                "low_balance_median_db": float(comp.get("mid_balance", 0.0)),
+                "low_balance_median_db": float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0)),
+                "mid_balance_median_db": float(comp.get("mid_balance", 0.0)) if FRONT_LAYOUT == "3way" else 0.0,
                 "high_balance_median_db": float(comp.get("tweeter_balance", 0.0)),
             })
             return comp
@@ -645,14 +725,12 @@ def make_component_scorer(
     balance_w[(freqs >= 700.0) & (freqs <= 5000.0)] *= 1.8
 
     headroom_w = audible.copy()
-    headroom_sel_by_channel = {
-        0: (freqs >= 1800.0) & (freqs <= 16000.0),
-        1: (freqs >= 1800.0) & (freqs <= 16000.0),
-        2: (freqs >= 70.0) & (freqs <= 2200.0),
-        3: (freqs >= 70.0) & (freqs <= 2200.0),
-        6: (freqs >= 25.0) & (freqs <= 120.0),
-        7: (freqs >= 25.0) & (freqs <= 120.0),
-    }
+    headroom_sel_by_channel = {6: (freqs >= 25.0) & (freqs <= 120.0), 7: (freqs >= 25.0) & (freqs <= 120.0)}
+    for name, pair in PAIR_DEFS.items():
+        sel = (freqs >= pair["branch_band"][0]) & (freqs <= pair["branch_band"][1])
+        for channel, trace_name in CH_TRACE.items():
+            if trace_name in (pair["left"], pair["right"]):
+                headroom_sel_by_channel[channel] = sel
 
     def score(groups: GroupBands) -> Dict[str, float]:
         pred = predict_traces(freqs, traces, groups)
@@ -806,12 +884,11 @@ def format_ranges(ranges: List[Tuple[float, float]], limit: int = 3) -> str:
 def left_alone_note(freqs: np.ndarray, traces: TraceMap) -> str:
     masks = null_masks(freqs, traces)
     notes = []
-    low = format_ranges(mask_ranges(freqs, masks["low"], PAIR_DEFS["low"]["branch_band"]))
-    high = format_ranges(mask_ranges(freqs, masks["high"], PAIR_DEFS["high"]["branch_band"]))
-    if low:
-        notes.append(f"midbass nulls {low}: flagged as destructive summing, not EQ-able")
-    if high:
-        notes.append(f"tweeter nulls {high}: flagged as destructive summing, not EQ-able")
+    labels = {"low": "midbass", "mid": "midrange", "high": "tweeter"}
+    for name, pair in PAIR_DEFS.items():
+        pretty = format_ranges(mask_ranges(freqs, masks[name], pair["branch_band"]))
+        if pretty:
+            notes.append(f"{labels.get(name, name)} nulls {pretty}: flagged as destructive summing, not EQ-able")
     notes.append("sub low edge/top-octave rolloff/crossover skirts: treated as driver or phase behaviour")
     return "; ".join(notes)
 

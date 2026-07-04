@@ -36,19 +36,50 @@ from _tunefit import peaking_db, erb_smooth, interference_audit, headroom_report
 
 # ---- config ---------------------------------------------------------------
 REW_DIR = DATA_ROOT
-SOLO_FILES = {  # REW .txt export names, with aliases for different session labels
-    'FL High': ('Front L High', 'Front L Tweeter'),
-    'FR High': ('Front R High', 'Front R Tweeter'),
-    'FL Low': ('Front L Low', 'Front L Mid', 'Front L MID'),
-    'FR Low': ('Front R Low', 'Front R Mid', 'Front R MID'),
-    'Sub': ('Sub', 'SUB'),
-    'System Sum': ('System Sum', 'SYSTEM SUM'),
-    'Tweeters Together': ('Tweeters Together', 'Both Tweeters'),
-    'Mid Bass Together': ('Mid Bass Together', 'Both Mids'),
-}
+def _has_any(names):
+    return any((REW_DIR / (name + '.txt')).exists() for name in names)
+
+
+THREE_WAY = _has_any(('Front L Mid', 'Front L MID', 'Front L Midrange')) and _has_any(('Front R Mid', 'Front R MID', 'Front R Midrange')) and _has_any(('Both Mids', 'Mids Together', 'Midrange Together')) and _has_any(('Front L Low', 'Front L Midbass', 'Front L Mid Bass')) and _has_any(('Front R Low', 'Front R Midbass', 'Front R Mid Bass')) and _has_any(('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
+
+if THREE_WAY:
+    SOLO_FILES = {
+        'FL High': ('Front L High', 'Front L Tweeter'),
+        'FR High': ('Front R High', 'Front R Tweeter'),
+        'FL Mid': ('Front L Mid', 'Front L MID', 'Front L Midrange'),
+        'FR Mid': ('Front R Mid', 'Front R MID', 'Front R Midrange'),
+        'FL Low': ('Front L Low', 'Front L Midbass', 'Front L Mid Bass'),
+        'FR Low': ('Front R Low', 'Front R Midbass', 'Front R Mid Bass'),
+        'Sub': ('Sub', 'SUB'),
+        'System Sum': ('System Sum', 'SYSTEM SUM'),
+        'Tweeters Together': ('Tweeters Together', 'Both Tweeters'),
+        'Mids Together': ('Both Mids', 'Mids Together', 'Midrange Together'),
+        'Mid Bass Together': ('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'),
+    }
+    CH_KEYS = ['FL High', 'FR High', 'FL Mid', 'FR Mid', 'FL Low', 'FR Low']
+    PAIR_SPECS = {
+        'low': ('FL Low', 'FR Low', 'Mid Bass Together', (50.0, 700.0), (80.0, 500.0)),
+        'mid': ('FL Mid', 'FR Mid', 'Mids Together', (250.0, 4500.0), (300.0, 3500.0)),
+        'high': ('FL High', 'FR High', 'Tweeters Together', (1800.0, 16000.0), (2500.0, 12000.0)),
+    }
+else:
+    SOLO_FILES = {
+        'FL High': ('Front L High', 'Front L Tweeter'),
+        'FR High': ('Front R High', 'Front R Tweeter'),
+        'FL Low': ('Front L Low', 'Front L Mid', 'Front L MID'),
+        'FR Low': ('Front R Low', 'Front R Mid', 'Front R MID'),
+        'Sub': ('Sub', 'SUB'),
+        'System Sum': ('System Sum', 'SYSTEM SUM'),
+        'Tweeters Together': ('Tweeters Together', 'Both Tweeters'),
+        'Mid Bass Together': ('Mid Bass Together', 'Both Mids'),
+    }
+    CH_KEYS = ['FL High', 'FR High', 'FL Low', 'FR Low']
+    PAIR_SPECS = {
+        'low': ('FL Low', 'FR Low', 'Mid Bass Together', (80.0, 2600.0), (200.0, 2000.0)),
+        'high': ('FL High', 'FR High', 'Tweeters Together', (2600.0, 16000.0), (2800.0, 16000.0)),
+    }
 TARGET = Path(os.environ.get('AFPX_TARGET', str(DATA_ROOT / 'ResoNix Target Curve 2026.txt')))
 BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'baseline.afpx')))
-CH_KEYS = ['FL High', 'FR High', 'FL Low', 'FR Low']  # the 4 front channels EQ acts on
 ANCHOR_BAND = (300.0, 3000.0)
 
 # ---- objective weights (tunable; defaults encode the reviewed priorities) --
@@ -148,9 +179,9 @@ def _init():
         tog = _T[tog_key]
         alive = tog > (np.max(tog[band]) - 20.0)  # pair is meaningfully present
         return flagged & band & alive
-    m1 = _pair_null('FL Low', 'FR Low', 'Mid Bass Together', 80.0, 2600.0)
-    m2 = _pair_null('FL High', 'FR High', 'Tweeters Together', 2600.0, 16000.0)
-    _NULL_MASK = m1 | m2
+    _NULL_MASK = np.zeros_like(F, dtype=bool)
+    for _name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
+        _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
     _V5 = _peqset(zlib.decompress(open(BASELINE_AFPX, 'rb').read()[4:]).decode('utf-8', 'replace'))
 
 
@@ -179,13 +210,19 @@ def _predict(band_sets):
 
     def ps(a, b):
         return 10 * np.log10(10 ** (a / 10) + 10 ** (b / 10))
-    pr['Tweeters Together'] = ps(pr['FL High'], pr['FR High']) + (
-        _T['Tweeters Together'] - ps(_T['FL High'], _T['FR High']))
-    pr['Mid Bass Together'] = ps(pr['FL Low'], pr['FR Low']) + (
-        _T['Mid Bass Together'] - ps(_T['FL Low'], _T['FR Low']))
-    old = ps(ps(_T['Tweeters Together'], _T['Mid Bass Together']), _T['Sub'])
+
+    branch_outputs = []
+    for _name, (left, right, together, _band_range, _balance) in PAIR_SPECS.items():
+        pr[together] = ps(pr[left], pr[right]) + (_T[together] - ps(_T[left], _T[right]))
+        branch_outputs.append(pr[together])
+
+    old = _T['Sub'].copy()
+    for _name, (_left, _right, together, _band_range, _balance) in PAIR_SPECS.items():
+        old = 10 * np.log10(10 ** (old / 10) + 10 ** (_T[together] / 10))
     rest = np.maximum(10 ** (_T['System Sum'] / 10) - 10 ** (old / 10), 1e-9)
-    new = ps(ps(pr['Tweeters Together'], pr['Mid Bass Together']), pr['Sub'])
+    new = pr['Sub'].copy()
+    for branch in branch_outputs:
+        new = 10 * np.log10(10 ** (new / 10) + 10 ** (branch / 10))
     pr['System Sum'] = 10 * np.log10(rest + 10 ** (new / 10))
     return pr
 
@@ -204,34 +241,43 @@ def objective(band_sets):
 
     worst = float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)])))
 
-    mb = erb_smooth(_F, pr['FL Low'] - pr['FR Low'])
-    mid_bal = float(np.median(mb[(_F >= 200) & (_F <= 2000)]))
-    tb = erb_smooth(_F, pr['FL High'] - pr['FR High'])
-    tw_bal = float(np.median(tb[(_F >= 2800) & (_F <= 16000)]))
+    balances = {}
+    for name, (left, right, _together, _band_range, balance_band) in PAIR_SPECS.items():
+        diff = erb_smooth(_F, pr[left] - pr[right])
+        sel = (_F >= balance_band[0]) & (_F <= balance_band[1])
+        balances[name] = float(np.median(diff[sel])) if np.any(sel) else 0.0
 
     # headroom: worst front-channel cascade peak, + boost landing in null bins
     head_peak = 0.0
     null_boost = 0.0
-    for i in range(4):
+    for i in range(len(CH_KEYS)):
         r = headroom_report(_F, band_sets[i])
         head_peak = max(head_peak, r['peak_cascade_gain_db'])
         b = _casc(band_sets[i])  # this channel's EQ curve; penalize boost in null bins
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
-    n_bands = sum(len(bs) for bs in band_sets[:4])
+    n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
 
     comp = {
         'tonal_masked': round(tonal, 3),
         'worst_masked': round(worst, 2),
-        'mid_balance': round(mid_bal, 2),
-        'tweeter_balance': round(tw_bal, 2),
         'headroom_peak': round(head_peak, 2),
         'null_boost_avg': round(null_boost, 2),
         'n_front_bands': n_bands,
     }
+    if 'low' in balances:
+        comp['low_balance'] = round(balances['low'], 2)
+    if 'mid' in balances:
+        comp['mid_balance'] = round(balances['mid'], 2)
+    if 'high' in balances:
+        comp['tweeter_balance'] = round(balances['high'], 2)
+    balance_term = (
+        W['mid_balance'] * abs(balances.get('mid', balances.get('low', 0.0)))
+        + W['tw_balance'] * abs(balances.get('high', 0.0))
+        + (0.25 * abs(balances.get('low', 0.0)) if 'mid' in balances else 0.0)
+    )
     scalar = (W['tonal'] * tonal
-              + W['mid_balance'] * abs(mid_bal)
-              + W['tw_balance'] * abs(tw_bal)
+              + balance_term
               + W['worst'] * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
               + W['null_boost'] * null_boost
@@ -257,8 +303,9 @@ if __name__ == '__main__':
     for p in sys.argv[1:]:
         import ntpath
         c = score_afpx(p)
+        balance_mid = c.get('mid_balance', c.get('low_balance', 0.0))
         print('\n%s' % ntpath.basename(p))
         print('  OBJECTIVE = %.3f   (lower = better)' % c['objective'])
         print('  tonal_masked=%.3f worst_masked=%.2f mid_bal=%+.2f tw_bal=%+.2f headroom=%.2f null_boost=%.2f bands=%d'
-              % (c['tonal_masked'], c['worst_masked'], c['mid_balance'], c['tweeter_balance'],
+              % (c['tonal_masked'], c['worst_masked'], balance_mid, c.get('tweeter_balance', 0.0),
                  c['headroom_peak'], c['null_boost_avg'], c['n_front_bands']))
