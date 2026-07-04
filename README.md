@@ -6,6 +6,15 @@ It takes your baseline `.afpx` tune plus REW measurement exports, tries many pos
 
 The goal is to improve the tune without touching delays, crossovers, polarity, or all-pass filters.
 
+Its scoring system is built to reward tunes that are more likely to sound better, not just look flatter on one graph.
+
+It scores candidates by:
+
+- how close the full system response is to the target, with extra weight through the vocal and midrange region
+- how well left and right match each other, using the individual driver measurements
+- whether the tune avoids boosting into destructive cancellation nulls
+- whether it avoids wasting filters or using unnecessary gain
+
 It is meant to be used through Claude or Codex:
 
 1. Drag in your REW measurement text exports.
