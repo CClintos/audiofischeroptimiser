@@ -1,0 +1,1337 @@
+"""Optuna-based safe tuner search for REW TXT exports + Helix AFPX.
+
+This runner is deliberately conservative about what it writes:
+  - magnitude-only REW TXT input;
+  - PEQ cuts only, added in free middle slots;
+  - per-side front PEQ is allowed so L/R balance can be scored and corrected;
+  - no delay, polarity, crossover, all-pass, shelf, or level writes.
+
+The optimizer searches extra filters on top of the supplied baseline tune, writes
+ranked candidate AFPX files, and leaves all input files untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import importlib.util
+import math
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+# Keep each optimizer worker to one internal math-library thread. Without this,
+# several Python workers can multiply into many OpenMP/BLAS threads, which can
+# make Windows sluggish or fail to create new threads under load.
+for _var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_var, "1")
+
+import numpy as np
+import optuna
+
+from _make_v3 import (
+    add_bands,
+    afpx_roundtrip_lint,
+    decode_afpx,
+    encode_afpx,
+)
+from _tunefit import (
+    audibility_score,
+    audibility_weight,
+    cascade_db,
+    erb_smooth,
+    erb_hz,
+    headroom_report,
+    interference_audit,
+    LOGSTEP,
+    target_anchor_offset,
+    tune_scorecard,
+)
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ.get("AFPX_DATA_ROOT", str(ROOT)))
+DEFAULT_BASELINE = Path(os.environ.get("AFPX_BASELINE", str(DATA_ROOT / "New Tune_v5     .afpx")))
+DEFAULT_TARGET = Path(os.environ.get("AFPX_TARGET", str(ROOT / "ResoNix Target Curve 2026.txt")))
+OBJECTIVE_PATH = ROOT / "New folder" / "afpx_objective.py"
+
+
+def _load_external_objective():
+    if not OBJECTIVE_PATH.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("afpx_objective", OBJECTIVE_PATH)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+AFPX_OBJECTIVE = _load_external_objective()
+
+MEASUREMENT_ALIASES = {
+    "FL High": ("Front L High.txt", "Front L Tweeter.txt"),
+    "FR High": ("Front R High.txt", "Front R Tweeter.txt"),
+    "FL Low": ("Front L Low.txt", "Front L Mid.txt", "Front L MID.txt"),
+    "FR Low": ("Front R Low.txt", "Front R Mid.txt", "Front R MID.txt"),
+    "Sub": ("Sub.txt", "SUB.txt"),
+    "System Sum": ("System Sum.txt", "SYSTEM SUM.txt"),
+    "Tweeters Together": ("Tweeters Together.txt", "Both Tweeters.txt"),
+    "Mid Bass Together": ("Mid Bass Together.txt", "Both Mids.txt", "Mid Bass Together.txt"),
+}
+
+
+def resolve_measurement_files(data_root: Path = DATA_ROOT) -> Dict[str, Path]:
+    files: Dict[str, Path] = {}
+    for name, aliases in MEASUREMENT_ALIASES.items():
+        found = None
+        for alias in aliases:
+            p = data_root / alias
+            if p.exists():
+                found = p
+                break
+        files[name] = found if found is not None else data_root / aliases[0]
+    return files
+
+
+MEASUREMENT_FILES = resolve_measurement_files()
+
+# Candidate groups. These are shared voicing layers, so paired channels get the
+# same filters. The ranges are passband-focused and avoid asking MMM magnitude
+# data to solve phase/time problems.
+GROUPS = {
+    "sub": {
+        "channels": (6, 7),
+        "branch": "sub",
+        "range": (30.0, 90.0),
+        "q_range": (0.5, 5.0),
+        "gain_range": (-6.0, 0.0),
+        "max_bands": 2,
+    },
+    "low_sym": {
+        "channels": (2, 3),
+        "branch": "low",
+        "range": (80.0, 1600.0),
+        "q_range": (0.5, 5.0),
+        "gain_range": (-6.0, 0.0),
+        "max_bands": 1,
+    },
+    "fl_low": {
+        "channels": (2,),
+        "branch": "low",
+        "trace": "FL Low",
+        "pair": "low",
+        "side": "left",
+        "range": (80.0, 2000.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-6.0, 3.0),
+        "max_bands": 2,
+    },
+    "fr_low": {
+        "channels": (3,),
+        "branch": "low",
+        "trace": "FR Low",
+        "pair": "low",
+        "side": "right",
+        "range": (80.0, 2000.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-6.0, 3.0),
+        "max_bands": 2,
+    },
+    "fl_high": {
+        "channels": (0,),
+        "branch": "high",
+        "trace": "FL High",
+        "pair": "high",
+        "side": "left",
+        "range": (1800.0, 12000.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-6.0, 3.0),
+        "max_bands": 2,
+    },
+    "fr_high": {
+        "channels": (1,),
+        "branch": "high",
+        "trace": "FR High",
+        "pair": "high",
+        "side": "right",
+        "range": (1800.0, 12000.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-6.0, 3.0),
+        "max_bands": 2,
+    },
+    "high_sym": {
+        "channels": (0, 1),
+        "branch": "high",
+        "symmetric_tweeter": True,
+        "range": (6000.0, 16000.0),
+        "q_range": (0.5, 4.5),
+        "gain_range": (-6.0, 0.0),
+        "max_bands": 1,
+    },
+}
+
+SAFE_GROUPS = {k: dict(v) for k, v in GROUPS.items()}
+EXPLORE_GROUPS = {
+    "sub": {
+        "channels": (6, 7),
+        "branch": "sub",
+        "range": (30.0, 90.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-8.0, 1.5),
+        "max_bands": 2,
+    },
+    "low_sym": {
+        "channels": (2, 3),
+        "branch": "low",
+        "range": (70.0, 1800.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-8.0, 0.0),
+        "max_bands": 2,
+    },
+    "fl_low": {
+        "channels": (2,),
+        "branch": "low",
+        "trace": "FL Low",
+        "pair": "low",
+        "side": "left",
+        "range": (70.0, 2200.0),
+        "q_range": (0.5, 8.0),
+        "gain_range": (-8.0, 3.0),
+        "max_bands": 3,
+    },
+    "fr_low": {
+        "channels": (3,),
+        "branch": "low",
+        "trace": "FR Low",
+        "pair": "low",
+        "side": "right",
+        "range": (70.0, 2200.0),
+        "q_range": (0.5, 8.0),
+        "gain_range": (-8.0, 3.0),
+        "max_bands": 3,
+    },
+    "fl_high": {
+        "channels": (0,),
+        "branch": "high",
+        "trace": "FL High",
+        "pair": "high",
+        "side": "left",
+        "range": (1800.0, 12000.0),
+        "q_range": (0.5, 8.0),
+        "gain_range": (-8.0, 3.0),
+        "max_bands": 3,
+    },
+    "fr_high": {
+        "channels": (1,),
+        "branch": "high",
+        "trace": "FR High",
+        "pair": "high",
+        "side": "right",
+        "range": (1800.0, 12000.0),
+        "q_range": (0.5, 8.0),
+        "gain_range": (-8.0, 3.0),
+        "max_bands": 3,
+    },
+    "high_sym": {
+        "channels": (0, 1),
+        "branch": "high",
+        "symmetric_tweeter": True,
+        "range": (6000.0, 16000.0),
+        "q_range": (0.5, 6.0),
+        "gain_range": (-8.0, 0.0),
+        "max_bands": 2,
+    },
+}
+
+CH_TRACE = {
+    0: "FL High",
+    1: "FR High",
+    2: "FL Low",
+    3: "FR Low",
+}
+
+REPORT_FREQS = [
+    31.5, 40, 50, 63, 80, 100, 125, 160, 250, 315, 400, 500, 630, 800,
+    1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000,
+    12500, 16000,
+]
+
+Band = Tuple[float, float, float]
+GroupBands = Dict[str, List[Band]]
+TraceMap = Dict[str, np.ndarray]
+
+
+def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    freqs: List[float] = []
+    spl: List[float] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("*") or s[0].isalpha():
+            continue
+        parts = s.replace(",", " ").split()
+        try:
+            freqs.append(float(parts[0]))
+            spl.append(float(parts[1]))
+        except (IndexError, ValueError):
+            continue
+    if len(freqs) < 16:
+        raise ValueError(f"No usable frequency/SPL rows found in {path}")
+    return np.asarray(freqs, dtype=float), np.asarray(spl, dtype=float)
+
+
+def load_measurements() -> Tuple[np.ndarray, TraceMap]:
+    missing = [str(p) for p in MEASUREMENT_FILES.values() if not p.exists()]
+    if missing:
+        raise FileNotFoundError("Missing measurement file(s):\n  " + "\n  ".join(missing))
+
+    base_f, base_spl = load_txt_export(MEASUREMENT_FILES["System Sum"])
+    traces: TraceMap = {"System Sum": base_spl}
+    log_base = np.log10(base_f)
+    for name, path in MEASUREMENT_FILES.items():
+        if name == "System Sum":
+            continue
+        f, spl = load_txt_export(path)
+        traces[name] = np.interp(log_base, np.log10(f), spl)
+    return base_f, traces
+
+
+def load_target(path: Path, freqs: np.ndarray) -> np.ndarray:
+    tf: List[float] = []
+    ts: List[float] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("*") or s[0].isalpha():
+            continue
+        parts = s.replace(",", " ").split()
+        try:
+            tf.append(float(parts[0]))
+            ts.append(float(parts[1]))
+        except (IndexError, ValueError):
+            continue
+    if len(tf) < 4:
+        raise ValueError(f"No usable target rows found in {path}")
+    return np.interp(np.log10(freqs), np.log10(np.asarray(tf)), np.asarray(ts))
+
+
+def power_sum_db(curves: Iterable[np.ndarray]) -> np.ndarray:
+    total = None
+    for curve in curves:
+        p = 10.0 ** (curve / 10.0)
+        total = p if total is None else total + p
+    if total is None:
+        raise ValueError("power_sum_db needs at least one curve")
+    return 10.0 * np.log10(np.maximum(total, 1e-30))
+
+
+def q_cap_for_band(F: float, G: float) -> float:
+    """Single-position MMM data should not create needle filters up high."""
+    cap = 8.0
+    if F >= 1000.0:
+        cap = min(cap, 4.5)
+    if F >= 6000.0:
+        cap = min(cap, 3.0)
+    if G > 0.0 and F >= 1000.0:
+        cap = min(cap, 2.5)
+    return cap
+
+
+def rounded_band(F: float, Q: float, G: float) -> Band | None:
+    # Hardware/UI-friendly values. Gains are 0.25 dB steps; filters below
+    # roughly half a dB are not worth burning a slot in safe mode.
+    F = float(F)
+    G = float(G)
+    if F > 10000.0 and G > 0.0:
+        return None
+    Q = min(float(Q), q_cap_for_band(F, G))
+    G = round(float(G) * 4.0) / 4.0
+    if abs(G) < 0.5:
+        return None
+    F = round(F, 1)
+    Q = round(Q, 2)
+    return (F, Q, G)
+
+
+def baseline_band_sets() -> List[List[Band]]:
+    if AFPX_OBJECTIVE is not None and hasattr(AFPX_OBJECTIVE, "baseline_band_sets"):
+        return AFPX_OBJECTIVE.baseline_band_sets()
+    return [[] for _ in range(8)]
+
+
+def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
+    band_sets = [list(bands) for bands in baseline_band_sets()]
+    while len(band_sets) < 8:
+        band_sets.append([])
+    for group, bands in groups.items():
+        if not bands:
+            continue
+        for channel in GROUPS[group]["channels"]:
+            band_sets[channel].extend(bands)
+            band_sets[channel].sort(key=lambda b: b[0])
+    return band_sets
+
+
+def suggest_group_bands(trial: optuna.Trial, group: str) -> List[Band]:
+    cfg = GROUPS[group]
+    out: List[Band] = []
+    for idx in range(cfg["max_bands"]):
+        if not trial.suggest_categorical(f"{group}_{idx}_on", [False, True]):
+            continue
+        F = trial.suggest_float(
+            f"{group}_{idx}_freq",
+            cfg["range"][0],
+            cfg["range"][1],
+            log=True,
+        )
+        Q = trial.suggest_float(f"{group}_{idx}_q", cfg["q_range"][0], cfg["q_range"][1])
+        G = trial.suggest_float(
+            f"{group}_{idx}_gain",
+            cfg["gain_range"][0],
+            cfg["gain_range"][1],
+        )
+        band = rounded_band(F, Q, G)
+        if band is not None:
+            out.append(band)
+    out.sort(key=lambda b: b[0])
+    return out
+
+
+def trial_bands(trial: optuna.Trial) -> GroupBands:
+    return {group: suggest_group_bands(trial, group) for group in GROUPS}
+
+
+def bands_signature(groups: GroupBands) -> Tuple[Tuple[str, Tuple[Band, ...]], ...]:
+    return tuple((name, tuple(groups.get(name, []))) for name in sorted(GROUPS))
+
+
+def duplicate_penalty(groups: GroupBands) -> float:
+    penalty = 0.0
+    for bands in groups.values():
+        for i, a in enumerate(bands):
+            for b in bands[i + 1:]:
+                if abs(math.log2(a[0] / b[0])) < 1 / 6:
+                    penalty += 0.10
+    return penalty
+
+
+def filter_cost(groups: GroupBands) -> float:
+    cost = 0.0
+    for group, bands in groups.items():
+        for F, Q, G in bands:
+            cost += 0.018
+            cost += 0.006 * max(0.0, Q - 3.0)
+            cost += 0.004 * abs(G)
+            # Extra skepticism for narrow upper-mid/treble filters from MMM data.
+            if "high" in group and Q > 2.5:
+                cost += 0.020 * (Q - 2.5)
+    return cost + duplicate_penalty(groups)
+
+
+def make_fast_smoother(freqs: np.ndarray):
+    """Same rectangular ERB window as _tunefit.erb_smooth, but pre-indexed."""
+    dlog = np.log(LOGSTEP)
+    starts = []
+    ends = []
+    for i, f in enumerate(freqs):
+        hb = max(1, int(round(np.log(1 + 0.5 * erb_hz(float(f)) / float(f)) / dlog)))
+        starts.append(max(0, i - hb))
+        ends.append(min(len(freqs), i + hb + 1))
+    starts_a = np.asarray(starts, dtype=int)
+    ends_a = np.asarray(ends, dtype=int)
+    widths = (ends_a - starts_a).astype(float)
+
+    def smooth(y: np.ndarray) -> np.ndarray:
+        cs = np.empty(len(y) + 1, dtype=float)
+        cs[0] = 0.0
+        np.cumsum(y, out=cs[1:])
+        return (cs[ends_a] - cs[starts_a]) / widths
+
+    return smooth
+
+
+def make_fast_audibility(freqs: np.ndarray, band: Tuple[float, float] = (20.0, 16000.0)):
+    smooth = make_fast_smoother(freqs)
+    sel = (freqs >= band[0]) & (freqs <= band[1])
+    w = audibility_weight(freqs)[sel]
+    den = float(np.sum(w ** 2))
+
+    def score(dev_db: np.ndarray) -> Tuple[float, np.ndarray]:
+        sm = smooth(dev_db)
+        if den <= 1e-12 or not np.any(sel):
+            return float("inf"), sm
+        return float(np.sqrt(np.sum((sm[sel] * w) ** 2) / den)), sm
+
+    return score
+
+
+PAIR_DEFS = {
+    "low": {
+        "left": "FL Low",
+        "right": "FR Low",
+        "together": "Mid Bass Together",
+        "branch_band": (80.0, 2200.0),
+        "balance_band": (200.0, 2200.0),
+    },
+    "high": {
+        "left": "FL High",
+        "right": "FR High",
+        "together": "Tweeters Together",
+        "branch_band": (1800.0, 16000.0),
+        "balance_band": (1800.0, 8000.0),
+    },
+}
+
+
+def weighted_rms(values: np.ndarray, weights: np.ndarray, sel: np.ndarray) -> float:
+    if not np.any(sel):
+        return 0.0
+    w = np.asarray(weights, dtype=float)[sel]
+    den = float(np.sum(w ** 2))
+    if den <= 1e-12:
+        return 0.0
+    v = np.asarray(values, dtype=float)[sel]
+    return float(np.sqrt(np.sum((v * w) ** 2) / den))
+
+
+def channel_deltas(freqs: np.ndarray, groups: GroupBands) -> Dict[int, np.ndarray]:
+    deltas: Dict[int, np.ndarray] = {}
+    for group, bands in groups.items():
+        if not bands:
+            continue
+        cfg = GROUPS.get(group)
+        if not cfg:
+            continue
+        delta = cascade_db(freqs, bands)
+        for channel in cfg["channels"]:
+            if channel not in deltas:
+                deltas[channel] = np.zeros_like(freqs)
+            deltas[channel] = deltas[channel] + delta
+    return deltas
+
+
+def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> TraceMap:
+    pred: TraceMap = dict(traces)
+
+    deltas = channel_deltas(freqs, groups)
+    for channel, trace_name in CH_TRACE.items():
+        pred[trace_name] = traces[trace_name] + deltas.get(channel, np.zeros_like(freqs))
+    sub_delta = np.zeros_like(freqs)
+    sub_count = 0
+    for channel in (6, 7):
+        if channel in deltas:
+            sub_delta = sub_delta + deltas[channel]
+            sub_count += 1
+    if sub_count:
+        # The sub trace is a combined branch capture, and we only write shared
+        # sub filters. Average the duplicate channel deltas to model one shared
+        # acoustic change instead of double-counting it.
+        sub_delta = sub_delta / sub_count
+    pred["Sub"] = traces["Sub"] + sub_delta
+
+    tw_power = power_sum_db([traces["FL High"], traces["FR High"]])
+    tw_residual = traces["Tweeters Together"] - tw_power
+    pred["Tweeters Together"] = power_sum_db([pred["FL High"], pred["FR High"]]) + tw_residual
+
+    mid_power = power_sum_db([traces["FL Low"], traces["FR Low"]])
+    mid_residual = traces["Mid Bass Together"] - mid_power
+    pred["Mid Bass Together"] = power_sum_db([pred["FL Low"], pred["FR Low"]]) + mid_residual
+
+    branch_power = power_sum_db([traces["Tweeters Together"], traces["Mid Bass Together"], traces["Sub"]])
+    system_residual = traces["System Sum"] - branch_power
+    pred["System Sum"] = power_sum_db(
+        [pred["Tweeters Together"], pred["Mid Bass Together"], pred["Sub"]]
+    ) + system_residual
+    return pred
+
+
+def null_masks(freqs: np.ndarray, traces: TraceMap) -> Dict[str, np.ndarray]:
+    masks = {
+        "low": np.zeros_like(freqs, dtype=bool),
+        "high": np.zeros_like(freqs, dtype=bool),
+    }
+    try:
+        masks["low"] = interference_audit(
+            freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"]
+        )[3]
+    except Exception:
+        pass
+    try:
+        masks["high"] = interference_audit(
+            freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"]
+        )[3]
+    except Exception:
+        pass
+    masks["system"] = masks["low"] | masks["high"]
+    return masks
+
+
+def pair_sum_validation(freqs: np.ndarray, traces: TraceMap, threshold: float = 2.5) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for name, pair in PAIR_DEFS.items():
+        psum = power_sum_db([traces[pair["left"]], traces[pair["right"]]])
+        diff = erb_smooth(freqs, traces[pair["together"]] - psum)
+        lo, hi = pair["branch_band"]
+        sel = (freqs >= lo) & (freqs <= hi)
+        rms = float(np.sqrt(np.mean(diff[sel] ** 2))) if np.any(sel) else float("inf")
+        rows.append({
+            "pair": name,
+            "together": pair["together"],
+            "rms_db": round(rms, 2),
+            "pass": bool(rms <= threshold),
+            "threshold_db": float(threshold),
+        })
+    return rows
+
+
+def make_component_scorer(
+    freqs: np.ndarray,
+    traces: TraceMap,
+    target: np.ndarray,
+    filter_cost_scale: float = 0.1,
+    worst_weight: float = 0.10,
+):
+    if AFPX_OBJECTIVE is not None:
+        def external_score(groups: GroupBands) -> Dict[str, float]:
+            comp = dict(AFPX_OBJECTIVE.score_bands(groups_to_band_sets(groups)))
+            tonal = float(comp.get("tonal_masked", 0.0))
+            worst = float(comp.get("worst_masked", 0.0))
+            mid_balance = abs(float(comp.get("mid_balance", 0.0)))
+            tweeter_balance = abs(float(comp.get("tweeter_balance", 0.0)))
+            balance = math.sqrt((mid_balance * mid_balance + tweeter_balance * tweeter_balance) / 2.0)
+            headroom = float(comp.get("headroom_peak", 0.0)) + float(comp.get("null_boost_avg", 0.0))
+            comp.update({
+                "objective": float(comp["objective"]),
+                "tonal_error_db": tonal,
+                "sum_tonal_anchor_db": tonal,
+                "presence_error_db": tonal,
+                "pareto_tonal_db": tonal,
+                "peak_penalty_db": worst,
+                "balance_penalty_db": balance,
+                "worst_presence_dev_db": worst,
+                "positive_gain_penalty_db": headroom,
+                "positive_gain_rms_db": float(comp.get("headroom_peak", 0.0)),
+                "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
+                "filter_count": float(comp.get("n_front_bands", 0.0)),
+                "filter_cost_units": float(filter_cost(groups)),
+                "low_balance_rms_db": mid_balance,
+                "high_balance_rms_db": tweeter_balance,
+                "low_balance_median_db": float(comp.get("mid_balance", 0.0)),
+                "high_balance_median_db": float(comp.get("tweeter_balance", 0.0)),
+            })
+            return comp
+
+        return external_score
+
+    smooth = make_fast_smoother(freqs)
+    masks = null_masks(freqs, traces)
+    audible = audibility_weight(freqs)
+    vocal_weight = np.ones_like(freqs)
+    vocal_weight[(freqs >= 200.0) & (freqs <= 6000.0)] = 1.8
+    tonal_w = audible * vocal_weight
+    tonal_sel = (freqs >= 25.0) & (freqs <= 16000.0) & ~masks["system"]
+    tonal_anchor_sel = (freqs >= 25.0) & (freqs <= 16000.0)
+    presence_sel = (freqs >= 200.0) & (freqs <= 6000.0)
+    worst_sel = presence_sel & ~masks["system"]
+
+    balance_w = audible.copy()
+    balance_w[(freqs >= 700.0) & (freqs <= 5000.0)] *= 1.8
+
+    headroom_w = audible.copy()
+    headroom_sel_by_channel = {
+        0: (freqs >= 1800.0) & (freqs <= 16000.0),
+        1: (freqs >= 1800.0) & (freqs <= 16000.0),
+        2: (freqs >= 70.0) & (freqs <= 2200.0),
+        3: (freqs >= 70.0) & (freqs <= 2200.0),
+        6: (freqs >= 25.0) & (freqs <= 120.0),
+        7: (freqs >= 25.0) & (freqs <= 120.0),
+    }
+
+    def score(groups: GroupBands) -> Dict[str, float]:
+        pred = predict_traces(freqs, traces, groups)
+        dev = smooth(pred["System Sum"] - target)
+
+        tonal = weighted_rms(dev, tonal_w, tonal_sel)
+        tonal_anchor = weighted_rms(dev, tonal_w, tonal_anchor_sel)
+        presence = weighted_rms(dev, tonal_w, presence_sel)
+        peak = weighted_rms(np.maximum(dev, 0.0), tonal_w, tonal_sel)
+        worst = float(np.max(np.abs(dev[worst_sel]))) if np.any(worst_sel) else 0.0
+
+        pair_scores = []
+        pair_outputs: Dict[str, float] = {}
+        for name, pair in PAIR_DEFS.items():
+            diff = smooth(pred[pair["left"]] - pred[pair["right"]])
+            lo, hi = pair["balance_band"]
+            sel = (freqs >= lo) & (freqs <= hi)
+            bal = weighted_rms(diff, balance_w, sel)
+            pair_scores.append(bal)
+            pair_outputs[f"{name}_balance_rms_db"] = bal
+            pair_outputs[f"{name}_balance_median_db"] = float(np.median(diff[sel])) if np.any(sel) else 0.0
+        balance = float(np.sqrt(np.mean(np.square(pair_scores)))) if pair_scores else 0.0
+
+        pos_rms_scores = []
+        pos_peak = 0.0
+        for channel, delta in channel_deltas(freqs, groups).items():
+            sel = headroom_sel_by_channel.get(channel, np.ones_like(freqs, dtype=bool))
+            pos = np.maximum(delta, 0.0)
+            pos_rms_scores.append(weighted_rms(pos, headroom_w, sel))
+            if np.any(sel):
+                pos_peak = max(pos_peak, float(np.max(pos[sel])))
+        positive_gain = float(np.sqrt(np.mean(np.square(pos_rms_scores)))) if pos_rms_scores else 0.0
+
+        total_filters = float(sum(len(bands) for bands in groups.values()))
+        filter_units = float(filter_cost(groups))
+        headroom = positive_gain + 0.12 * pos_peak
+        pareto_tonal = 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence
+        objective = (
+            1.35 * tonal
+            + 1.00 * tonal_anchor
+            + 0.60 * presence
+            + 0.45 * peak
+            + 0.28 * balance
+            + float(worst_weight) * worst
+            + 0.22 * headroom
+            + 0.04 * total_filters
+            + float(filter_cost_scale) * filter_units
+        )
+        out = {
+            "objective": float(objective),
+            "tonal_error_db": float(tonal),
+            "sum_tonal_anchor_db": float(tonal_anchor),
+            "presence_error_db": float(presence),
+            "pareto_tonal_db": float(pareto_tonal),
+            "peak_penalty_db": float(peak),
+            "balance_penalty_db": float(balance),
+            "worst_presence_dev_db": float(worst),
+            "positive_gain_penalty_db": float(headroom),
+            "positive_gain_rms_db": float(positive_gain),
+            "positive_gain_peak_db": float(pos_peak),
+            "filter_count": total_filters,
+            "filter_cost_units": filter_units,
+            "null_masked_bins": float(np.count_nonzero(masks["system"] & (freqs >= 25.0) & (freqs <= 16000.0))),
+        }
+        out.update(pair_outputs)
+        return out
+
+    return score
+
+
+def make_objective(
+    freqs: np.ndarray,
+    traces: TraceMap,
+    target: np.ndarray,
+    filter_cost_scale: float = 1.0,
+    worst_weight: float = 0.018,
+    min_total_bands: int = 0,
+):
+    component_score = make_component_scorer(freqs, traces, target, filter_cost_scale, worst_weight)
+
+    def objective(trial: optuna.Trial) -> float:
+        groups = trial_bands(trial)
+        return component_score(groups)["objective"]
+
+    return objective
+
+
+def replace_oc_blocks(xml: str, blocks: List[str]) -> str:
+    import re
+
+    matches = list(re.finditer(r"<OC\b.*?</OC>", xml, re.S))
+    if len(matches) < len(blocks):
+        raise ValueError("AFPX contains fewer OC blocks than expected")
+    out = xml
+    for old_match, new_block in zip(matches, blocks):
+        old = old_match.group()
+        if old != new_block:
+            out = out.replace(old, new_block, 1)
+    return out
+
+
+def write_candidate(base_xml: str, path: Path, groups: GroupBands) -> Dict[str, object]:
+    import re
+
+    blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
+    new_blocks = list(blocks)
+    for group, bands in groups.items():
+        if not bands:
+            continue
+        for channel in GROUPS[group]["channels"]:
+            new_blocks[channel] = add_bands(new_blocks[channel], bands)
+
+    new_xml = replace_oc_blocks(base_xml, new_blocks)
+    encode_afpx(new_xml, path)
+    written = decode_afpx(path)
+    lint = afpx_roundtrip_lint(base_xml, written, allowed_added_types=("17",))
+    if not lint["pass"]:
+        raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
+    return lint
+
+
+def mask_ranges(freqs: np.ndarray, mask: np.ndarray, band: Tuple[float, float]) -> List[Tuple[float, float]]:
+    sel = mask & (freqs >= band[0]) & (freqs <= band[1])
+    ranges: List[Tuple[float, float]] = []
+    start = None
+    last = None
+    for f, on in zip(freqs, sel):
+        if on and start is None:
+            start = float(f)
+        if on:
+            last = float(f)
+        elif start is not None:
+            ranges.append((start, float(last)))
+            start = None
+            last = None
+    if start is not None:
+        ranges.append((start, float(last)))
+    # Drop one-bin specks; they are report noise.
+    return [(lo, hi) for lo, hi in ranges if hi / lo > 2 ** (1 / 48)]
+
+
+def format_ranges(ranges: List[Tuple[float, float]], limit: int = 3) -> str:
+    if not ranges:
+        return ""
+    parts = [f"{lo:.0f}-{hi:.0f} Hz" for lo, hi in ranges[:limit]]
+    if len(ranges) > limit:
+        parts.append(f"+{len(ranges) - limit} more")
+    return ", ".join(parts)
+
+
+def left_alone_note(freqs: np.ndarray, traces: TraceMap) -> str:
+    masks = null_masks(freqs, traces)
+    notes = []
+    low = format_ranges(mask_ranges(freqs, masks["low"], PAIR_DEFS["low"]["branch_band"]))
+    high = format_ranges(mask_ranges(freqs, masks["high"], PAIR_DEFS["high"]["branch_band"]))
+    if low:
+        notes.append(f"midbass nulls {low}: flagged as destructive summing, not EQ-able")
+    if high:
+        notes.append(f"tweeter nulls {high}: flagged as destructive summing, not EQ-able")
+    notes.append("sub low edge/top-octave rolloff/crossover skirts: treated as driver or phase behaviour")
+    return "; ".join(notes)
+
+
+def format_bands(groups: GroupBands) -> str:
+    lines: List[str] = []
+    for group in GROUPS:
+        bands = groups.get(group, [])
+        if not bands:
+            lines.append(f"- {group}: no added filters")
+            continue
+        joined = ", ".join(f"{F:g} Hz Q{Q:g} {G:+g} dB" for F, Q, G in bands)
+        lines.append(f"- {group}: {joined}")
+    return "\n".join(lines)
+
+
+def score_row(freqs: np.ndarray, traces: TraceMap, target: np.ndarray, groups: GroupBands) -> Dict[str, float]:
+    pred = predict_traces(freqs, traces, groups)
+    raw = tune_scorecard(freqs, pred, target)
+    components = make_component_scorer(freqs, traces, target)(groups)
+    raw["objective"] = round(float(components["objective"]), 4)
+    raw.update({f"objective_{k}": round(float(v), 4) for k, v in components.items()})
+    return raw
+
+
+def format_component_summary(comp: Dict[str, float]) -> str:
+    if "tonal_masked" in comp:
+        return (
+            f"objective `{comp.get('objective', 0.0):.3f}`, tonal_masked `{comp.get('tonal_masked', 0.0):.3f}`, "
+            f"worst_masked `{comp.get('worst_masked', 0.0):.2f}`, mid_balance `{comp.get('mid_balance', 0.0):+.2f}`, "
+            f"tweeter_balance `{comp.get('tweeter_balance', 0.0):+.2f}`, headroom_peak `{comp.get('headroom_peak', 0.0):.2f}`, "
+            f"null_boost_avg `{comp.get('null_boost_avg', 0.0):.2f}`, front_bands `{comp.get('n_front_bands', 0.0):.0f}`"
+        )
+    return (
+        f"tonal `{comp.get('tonal_error_db', 0.0):.2f}`, "
+        f"anchor `{comp.get('sum_tonal_anchor_db', 0.0):.2f}`, presence `{comp.get('presence_error_db', 0.0):.2f}`, "
+        f"pareto-tonal `{comp.get('pareto_tonal_db', 0.0):.2f}`, peak `{comp.get('peak_penalty_db', 0.0):.2f}`, "
+        f"balance `{comp.get('balance_penalty_db', 0.0):.2f}` "
+        f"(low `{comp.get('low_balance_rms_db', 0.0):.2f}`, high `{comp.get('high_balance_rms_db', 0.0):.2f}`), "
+        f"headroom `{comp.get('positive_gain_penalty_db', 0.0):.2f}`, filters `{comp.get('filter_count', 0.0):.0f}`"
+    )
+
+
+PARETO_KEYS = (
+    "pareto_tonal_db",
+    "peak_penalty_db",
+    "balance_penalty_db",
+    "positive_gain_penalty_db",
+    "filter_count",
+)
+
+
+def row_metrics(row: Dict[str, object]) -> Dict[str, float]:
+    return dict(row.get("components", {}))
+
+
+def row_metric(row: Dict[str, object], key: str) -> float:
+    return float(row_metrics(row).get(key, float("inf")))
+
+
+def dominates(row_a: Dict[str, object], row_b: Dict[str, object], keys=PARETO_KEYS) -> bool:
+    better = False
+    for key in keys:
+        va = row_metric(row_a, key)
+        vb = row_metric(row_b, key)
+        if va > vb + 1e-9:
+            return False
+        if va + 1e-9 < vb:
+            better = True
+    return better
+
+
+def pareto_front_rows(rows: List[Dict[str, object]], keys=PARETO_KEYS) -> List[Dict[str, object]]:
+    front = []
+    for i, row in enumerate(rows):
+        dominated = False
+        for j, other in enumerate(rows):
+            if i == j:
+                continue
+            if dominates(other, row, keys):
+                dominated = True
+                break
+        if not dominated:
+            front.append(row)
+    return front
+
+
+def pareto_rank_rows(rows: List[Dict[str, object]], keys=PARETO_KEYS) -> None:
+    remaining = list(rows)
+    rank = 1
+    while remaining:
+        front = pareto_front_rows(remaining, keys)
+        if not front:
+            break
+        front_ids = {id(row) for row in front}
+        for row in front:
+            row["pareto_rank"] = rank
+        remaining = [row for row in remaining if id(row) not in front_ids]
+        rank += 1
+    for row in rows:
+        row.setdefault("pareto_rank", rank)
+
+
+def normalized_metric(row: Dict[str, object], key: str, spans: Dict[str, Tuple[float, float]]) -> float:
+    lo, hi = spans[key]
+    val = row_metric(row, key)
+    if not np.isfinite(val):
+        return 1.0
+    if hi <= lo + 1e-12:
+        return 0.0
+    return float(np.clip((val - lo) / (hi - lo), 0.0, 1.0))
+
+
+def family_pick_scores(rows: List[Dict[str, object]], role: str) -> List[Tuple[float, Dict[str, object]]]:
+    if not rows:
+        return []
+    span_keys = set(PARETO_KEYS) | {
+        "tonal_error_db",
+        "sum_tonal_anchor_db",
+        "presence_error_db",
+    }
+    spans = {
+        key: (
+            min(row_metric(row, key) for row in rows),
+            max(row_metric(row, key) for row in rows),
+        )
+        for key in span_keys
+    }
+
+    def score_of(row: Dict[str, object]) -> float:
+        nm = lambda key: normalized_metric(row, key, spans)
+        if role == "conservative":
+            return (
+                0.70 * nm("positive_gain_penalty_db")
+                + 0.55 * nm("filter_count")
+                + 0.35 * nm("peak_penalty_db")
+                + 0.25 * nm("balance_penalty_db")
+                + 0.20 * nm("sum_tonal_anchor_db")
+                + 0.15 * nm("presence_error_db")
+            )
+        if role == "aggressive":
+            return (
+                0.95 * nm("sum_tonal_anchor_db")
+                + 0.80 * nm("presence_error_db")
+                + 0.65 * nm("tonal_error_db")
+                + 0.30 * nm("peak_penalty_db")
+                + 0.15 * nm("balance_penalty_db")
+            )
+        return (
+            0.85 * nm("sum_tonal_anchor_db")
+            + 0.75 * nm("presence_error_db")
+            + 0.55 * nm("tonal_error_db")
+            + 0.50 * nm("balance_penalty_db")
+            + 0.30 * nm("positive_gain_penalty_db")
+            + 0.20 * nm("peak_penalty_db")
+            + 0.12 * nm("filter_count")
+        )
+
+    return sorted((score_of(row), row) for row in rows)
+
+
+def select_family_rows(rows: List[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    for row in rows:
+        row["family_role"] = ""
+    if not rows:
+        return {}
+    pareto_rank_rows(rows)
+    first_front = [row for row in rows if int(row.get("pareto_rank", 99)) == 1]
+    pool = first_front if first_front else list(rows)
+    chosen: Dict[str, Dict[str, object]] = {}
+    used = set()
+    for role in ("conservative", "balanced", "aggressive"):
+        ranked = family_pick_scores(pool, role)
+        pick = None
+        for _score, row in ranked:
+            if id(row) not in used:
+                pick = row
+                break
+        if pick is None and ranked:
+            pick = ranked[0][1]
+        if pick is not None:
+            chosen[role] = pick
+            used.add(id(pick))
+            pick["family_role"] = role
+    return chosen
+
+
+def write_family_aliases(out_dir: Path, rows: List[Dict[str, object]], base_xml: str) -> Dict[str, str]:
+    picks = select_family_rows(rows)
+    aliases = {}
+    for old in out_dir.glob("family_*.afpx"):
+        old.unlink()
+    for role, row in picks.items():
+        file_name = f"family_{role}.afpx"
+        write_candidate(base_xml, out_dir / file_name, row["groups"])
+        aliases[role] = file_name
+    return aliases
+
+
+class StaticTrial:
+    """Tiny Optuna-trial shim so one objective function can score fixed bands."""
+
+    def __init__(self, groups: GroupBands):
+        self.groups = groups
+
+    def suggest_categorical(self, name, choices):
+        group, idx, field = name.split("_", 2)
+        return idx.isdigit() and int(idx) < len(self.groups.get(group, []))
+
+    def suggest_float(self, name, low, high, log=False):
+        group, idx, field = name.split("_", 2)
+        F, Q, G = self.groups[group][int(idx)]
+        if field == "freq":
+            return F
+        if field == "q":
+            return Q
+        if field == "gain":
+            return G
+        raise KeyError(name)
+
+
+def write_report(
+    out_dir: Path,
+    rows: List[Dict[str, object]],
+    baseline_score: Dict[str, float],
+    interference_notes: List[str],
+    args: argparse.Namespace,
+    family_rows: List[Dict[str, object]] | None = None,
+) -> None:
+    md = out_dir / "optimizer_report.md"
+    csv_path = out_dir / "optimizer_results.csv"
+    family_source = list(family_rows) if family_rows is not None else list(rows)
+    family_picks = select_family_rows(family_source)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "rank", "file", "objective", "pareto_rank", "family_role", "sum_rms_db", "sum_wrms_img_db",
+            "worst_dev_db", "mid_balance_db", "tweeter_balance_db",
+            "tonal_error_db", "sum_tonal_anchor_db", "presence_error_db", "pareto_tonal_db",
+            "peak_penalty_db", "balance_penalty_db",
+            "low_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
+            "filter_count", "tonal_masked", "worst_masked", "mid_balance", "tweeter_balance",
+            "headroom_peak", "null_boost_avg", "n_front_bands", "left_alone", "bands",
+        ])
+        for row in rows:
+            sc = row["score"]
+            comp = row.get("components", {})
+            writer.writerow([
+                row["rank"], row["file"], row["objective"], row.get("pareto_rank", ""), row.get("family_role", ""),
+                sc["sum_rms_db"],
+                sc["sum_wrms_img_db"], sc["worst_dev_db"],
+                sc.get("mid_balance_db", ""), sc.get("tweeter_balance_db", ""),
+                comp.get("tonal_error_db", ""), comp.get("sum_tonal_anchor_db", ""),
+                comp.get("presence_error_db", ""), comp.get("pareto_tonal_db", ""),
+                comp.get("peak_penalty_db", ""),
+                comp.get("balance_penalty_db", ""), comp.get("low_balance_rms_db", ""),
+                comp.get("high_balance_rms_db", ""), comp.get("positive_gain_penalty_db", ""),
+                comp.get("filter_count", ""),
+                comp.get("tonal_masked", ""), comp.get("worst_masked", ""),
+                comp.get("mid_balance", ""), comp.get("tweeter_balance", ""),
+                comp.get("headroom_peak", ""), comp.get("null_boost_avg", ""),
+                comp.get("n_front_bands", ""), row.get("left_alone", ""),
+                row["signature"],
+            ])
+
+    base_comp = baseline_score.get("components", {})
+    baseline_line = (
+        f"- sum RMS `{baseline_score['sum_rms_db']}` dB, "
+        f"image-weighted `{baseline_score['sum_wrms_img_db']}` dB, "
+        f"worst `{baseline_score['worst_dev_db']}` dB"
+    )
+    if base_comp:
+        baseline_line += f"; {format_component_summary(base_comp)}"
+
+    lines = [
+        "# Optimizer Report",
+        "",
+        f"- Baseline: `{args.baseline}`",
+        f"- Target: `{args.target}`",
+        f"- Trials: `{args.trials}`",
+        "- Mode: MMM magnitude PEQ only; per-side front filters allowed; no delay/APF/crossover/shelf/level writes",
+        "- Objective: imported `afpx_objective.score_bands(band_sets)['objective']`; lower is better. Search-space guardrails restrict what candidates are generated, but no extra target-matching term is added.",
+        "",
+        "## Validation Gate",
+        "",
+    ]
+    validation = getattr(args, "validation", [])
+    if validation:
+        for item in validation:
+            verdict = "PASS" if item.get("pass") else "FAIL"
+            lines.append(
+                f"- {item['pair']} solo power-sum -> `{item['together']}`: "
+                f"`{item['rms_db']}` dB RMS vs `{item['threshold_db']}` dB gate: {verdict}"
+            )
+    else:
+        lines.append("- Solo/together validation was not provided for this run.")
+    lines.extend([
+        "",
+        "## Baseline Score",
+        "",
+        baseline_line,
+        "",
+        "## Rejected / Flagged Regions",
+        "",
+    ])
+    if interference_notes:
+        lines.extend(f"- {note}" for note in interference_notes)
+    else:
+        lines.append("- No strong L/R destructive-summing regions were flagged by the TXT magnitude audit.")
+    lines.extend([
+        "- Destructive pair-summing regions are masked from tonal scoring so EQ cannot win by filling phase nulls.",
+        "- Delay, all-pass, polarity, and crossover changes require phase-valid fixed-position sweeps.",
+        "",
+        "## Family Picks",
+        "",
+    ])
+    if family_picks:
+        for role in ("conservative", "balanced", "aggressive"):
+            row = family_picks.get(role)
+            if row is None:
+                continue
+            sc = row["score"]
+            comp = row.get("components", {})
+            alias = f"family_{role}.afpx"
+            lines.extend([
+                f"### {role.title()}: `{row['file']}`",
+                "",
+                (
+                    f"- alias `{alias}`; Pareto rank `{row.get('pareto_rank', '?')}`; "
+                    f"sum RMS `{sc['sum_rms_db']}` dB; image-weighted `{sc['sum_wrms_img_db']}` dB"
+                ),
+                f"- components: {format_component_summary(comp)}",
+                f"- left alone: {row.get('left_alone', '')}",
+                "",
+            ])
+    else:
+        lines.append("- No Pareto family picks were available.")
+    lines.extend([
+        "",
+        "## Candidates",
+        "",
+    ])
+    for row in rows:
+        sc = row["score"]
+        comp = row.get("components", {})
+        component_line = ""
+        if comp:
+            component_line = f"- components: {format_component_summary(comp)}"
+            lines.extend([
+            f"### Rank {row['rank']}: `{row['file']}`",
+            "",
+            (
+                f"- objective `{row['objective']:.4f}`; Pareto rank `{row.get('pareto_rank', '?')}`; "
+                f"family `{row.get('family_role', '-') or '-'}`; sum RMS `{sc['sum_rms_db']}` dB; "
+                f"image-weighted `{sc['sum_wrms_img_db']}` dB; worst `{sc['worst_dev_db']}` dB"
+            ),
+            component_line,
+            f"- left alone: {row.get('left_alone', '')}",
+            format_bands(row["groups"]),
+            "",
+        ])
+    md.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Safe Optuna PEQ optimizer for Helix AFPX + REW TXT exports.")
+    parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument("--target", type=Path, default=DEFAULT_TARGET)
+    parser.add_argument("--trials", type=int, default=5000)
+    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=20260703)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--timeout", type=int, default=None, help="Optional optimizer timeout in seconds.")
+    parser.add_argument("--sampler", choices=("random", "tpe"), default="random")
+    parser.add_argument("--profile", choices=("safe", "explore"), default="safe")
+    parser.add_argument("--filter-cost-scale", type=float, default=None)
+    parser.add_argument("--worst-weight", type=float, default=0.10)
+    parser.add_argument("--min-total-bands", type=int, default=0)
+    parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
+    parser.add_argument("--out", type=Path, default=None)
+    args = parser.parse_args()
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    global GROUPS
+    GROUPS = {k: dict(v) for k, v in (EXPLORE_GROUPS if args.profile == "explore" else SAFE_GROUPS).items()}
+    if args.filter_cost_scale is None:
+        args.filter_cost_scale = 0.25 if args.profile == "explore" else 1.0
+
+    freqs, traces = load_measurements()
+    raw_target = load_target(args.target, freqs)
+    target = raw_target + target_anchor_offset(freqs, traces["System Sum"], raw_target)
+    base_xml = decode_afpx(args.baseline)
+    args.validation = pair_sum_validation(freqs, traces)
+    failed_validation = [item for item in args.validation if not item["pass"]]
+    if failed_validation:
+        details = "; ".join(
+            f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB"
+            for item in failed_validation
+        )
+        raise SystemExit("Measurement validation gate failed: " + details)
+
+    baseline_groups: GroupBands = {group: [] for group in GROUPS}
+    baseline_pred = predict_traces(freqs, traces, baseline_groups)
+    baseline_score = tune_scorecard(freqs, baseline_pred, target)
+    component_score = make_component_scorer(
+        freqs,
+        traces,
+        target,
+        filter_cost_scale=args.filter_cost_scale,
+        worst_weight=args.worst_weight,
+    )
+    baseline_score["components"] = component_score(baseline_groups)
+    objective = make_objective(
+        freqs,
+        traces,
+        target,
+        filter_cost_scale=args.filter_cost_scale,
+        worst_weight=args.worst_weight,
+        min_total_bands=args.min_total_bands,
+    )
+    baseline_objective = objective(StaticTrial(baseline_groups))
+
+    if args.sampler == "tpe":
+        sampler = optuna.samplers.TPESampler(seed=args.seed)
+    else:
+        sampler = optuna.samplers.RandomSampler(seed=args.seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(
+        objective,
+        n_trials=args.trials,
+        timeout=args.timeout,
+        n_jobs=args.jobs,
+        show_progress_bar=args.progress,
+    )
+
+    out_dir = args.out or ROOT / ("Optimizer_Output_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ranked_rows: List[Dict[str, object]] = []
+    seen = set()
+    complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    for trial in sorted(complete, key=lambda t: t.value if t.value is not None else float("inf")):
+        groups = trial_bands(trial)
+        sig = bands_signature(groups)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        rank = len(ranked_rows) + 1
+        file_name = f"candidate_{rank:02d}_objective_{trial.value:.4f}.afpx"
+        out_path = out_dir / file_name
+        lint = write_candidate(base_xml, out_path, groups)
+        pred = predict_traces(freqs, traces, groups)
+        score = tune_scorecard(freqs, pred, target)
+        components = component_score(groups)
+        hr = {}
+        for group, bands in groups.items():
+            hr[group] = headroom_report(freqs, bands)
+        ranked_rows.append({
+            "rank": rank,
+            "file": file_name,
+            "path": str(out_path),
+            "objective": float(trial.value),
+            "score": score,
+            "components": components,
+            "groups": groups,
+            "signature": sig,
+            "lint": lint,
+            "headroom": hr,
+            "left_alone": left_alone_note(freqs, traces),
+        })
+        if len(ranked_rows) >= args.top:
+            break
+
+    low_audit = interference_audit(freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"])
+    tw_audit = interference_audit(freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"])
+    notes: List[str] = []
+    for label, audit, band in [
+        ("Midbass L/R", low_audit, (80.0, 1200.0)),
+        ("Tweeter L/R", tw_audit, (2200.0, 16000.0)),
+    ]:
+        ranges = mask_ranges(freqs, audit[3], band)
+        if ranges:
+            pretty = ", ".join(f"{lo:.0f}-{hi:.0f} Hz" for lo, hi in ranges[:8])
+            if len(ranges) > 8:
+                pretty += ", ..."
+            notes.append(f"{label} destructive-summing audit flagged: {pretty}.")
+
+    write_family_aliases(out_dir, ranked_rows, base_xml)
+    write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows)
+
+    print("Optimizer complete")
+    print("Output:", out_dir)
+    print(
+        "Baseline: objective %.4f | sum RMS %.2f | image %.2f | worst %.1f"
+        % (
+            baseline_objective,
+            baseline_score["sum_rms_db"],
+            baseline_score["sum_wrms_img_db"],
+            baseline_score["worst_dev_db"],
+        )
+    )
+    for row in ranked_rows:
+        sc = row["score"]
+        print(
+            "#%d %-36s objective %.4f | sum RMS %.2f | image %.2f | worst %.1f"
+            % (
+                row["rank"],
+                row["file"],
+                row["objective"],
+                sc["sum_rms_db"],
+                sc["sum_wrms_img_db"],
+                sc["worst_dev_db"],
+            )
+        )
+        print(format_bands(row["groups"]))
+    print("Report:", out_dir / "optimizer_report.md")
+    print("CSV:", out_dir / "optimizer_results.csv")
+
+
+if __name__ == "__main__":
+    main()

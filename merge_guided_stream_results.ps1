@@ -1,0 +1,81 @@
+param(
+    [string]$Root = "Optimizer_Component_20min_70cpu",
+    [int]$Top = 20,
+    [string]$DataRoot = "",
+    [string]$Baseline = "",
+    [string]$Target = "",
+    [double]$ValidationThreshold = 2.5
+)
+
+$ErrorActionPreference = "Stop"
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $here
+
+function Quote-Arg([string]$Value) {
+    if ($null -eq $Value) { return '""' }
+    return '"' + ($Value -replace '(\\*)"', '$1$1\"') + '"'
+}
+
+function Join-Args([string[]]$Items) {
+    return ($Items | ForEach-Object { Quote-Arg $_ }) -join ' '
+}
+
+if ($DataRoot -ne "") { $env:AFPX_DATA_ROOT = $DataRoot }
+if ($Baseline -ne "") { $env:AFPX_BASELINE = $Baseline }
+if ($Target -ne "") { $env:AFPX_TARGET = $Target }
+
+$pythonExe = Join-Path $here ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    throw "Missing Python runtime at $pythonExe"
+}
+if (-not (Test-Path -LiteralPath $Root)) {
+    throw "Run root not found: $Root"
+}
+$baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $here "New Tune_v5     .afpx" }
+$targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
+if (-not (Test-Path -LiteralPath $baselinePath)) {
+    throw "Baseline AFPX not found: $baselinePath"
+}
+if (-not (Test-Path -LiteralPath $targetPath)) {
+    throw "Target curve not found: $targetPath"
+}
+
+$args = @("_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"), "--top", "$Top", "--validation-threshold", "$ValidationThreshold")
+if ($Baseline -ne "") { $args += @("--baseline", $baselinePath) }
+if ($Target -ne "") { $args += @("--target", $targetPath) }
+$rootToken = "_merge_stream_results.py " + $Root
+$existing = Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.Name -eq "python.exe" -and
+        $_.CommandLine -like "*$rootToken*"
+    } |
+    Select-Object -First 1
+
+if ($null -ne $existing) {
+    Write-Host "Merge already running for $Root (PID $($existing.ProcessId))."
+    exit 0
+}
+
+$activeWorkers = Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.Name -eq "python.exe" -and
+        $_.CommandLine -like "*_optimizer_stream.py*" -and
+        $_.CommandLine -like "*$Root\\worker_*"
+    } |
+    Select-Object -First 1
+
+if ($null -ne $activeWorkers) {
+    throw "Optimizer workers are still running for $Root (PID $($activeWorkers.ProcessId)). Merge after the run completes."
+}
+
+$argLine = Join-Args $args
+$proc = Start-Process -FilePath $pythonExe `
+    -WorkingDirectory $here `
+    -ArgumentList $argLine `
+    -NoNewWindow `
+    -PassThru `
+    -Wait
+
+if ($proc.ExitCode -ne 0) {
+    throw "_merge_stream_results.py exited with code $($proc.ExitCode)"
+}

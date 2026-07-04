@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+*.afpx
+
+Optimizer_*/
+*_Smoke/
+*_FailSmoke/
+*_MergeSmoke/
+*_20min_*/
+*_Run_*/
+*_Resume*/
+*_Stability*/
+*_Output_*/
+
+*.stdout.log
+*.stderr.log
+
+optimizer_app_only/
+
+rollout-*.jsonl
+
+New Tune_*best*.afpx
+New Tune_*pick*.afpx
