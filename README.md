@@ -85,6 +85,58 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\merge_guided_stream_result
   -Target ".\ResoNix Target Curve 2026.txt"
 ```
 
+## Using It With Claude or Codex
+
+You can also hand this repo to a coding model such as Claude or Codex and have it run the optimizer for you.
+
+### What To Give The Model
+
+Attach or point it to:
+
+- this repo
+- your measurement folder
+- your `baseline.afpx`
+- optionally your own target curve
+
+Make sure your measurement folder contains the expected REW text exports listed above.
+
+### Suggested Prompt
+
+Use something close to this:
+
+```text
+Read the optimizer repo in this folder and use it as a local AFPX tuning tool.
+
+My input folder is: C:\path\to\my\measurements
+My baseline tune is: C:\path\to\my\measurements\baseline.afpx
+My target curve is: C:\path\to\my\target.txt
+
+Please:
+1. verify the required measurement files are present
+2. run the streaming optimizer locally for 20 minutes
+3. merge the worker outputs at the end
+4. give me the best AFPX candidates and a short summary of what improved
+
+Do not invent your own scoring method if the repo already defines one.
+Do not change delays, crossovers, polarity, or all-pass filters.
+Treat this as a local file-and-script workflow, not a rewrite project.
+```
+
+### What A Good Agent Run Should Do
+
+- read the repo before making assumptions
+- check that your measurement filenames match the accepted aliases
+- launch `run_guided_stream_workers.ps1`
+- wait for the run to finish
+- run `merge_guided_stream_results.ps1`
+- hand back the best `candidate_*.afpx` files or family picks
+
+### What To Watch Out For
+
+- If the solo/pair validation gate fails, the model should stop and tell you why instead of tuning anyway.
+- If your sweep names differ from the supported aliases, the model should either map them or ask you to rename them.
+- If a model starts proposing delay or APF changes automatically, it is going beyond what this repo is built to do.
+
 ## Main Files
 
 - [_optimizer.py](./_optimizer.py): core scoring, prediction, AFPX writing, reporting
