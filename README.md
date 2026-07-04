@@ -107,9 +107,10 @@ Use something close to this:
 ```text
 Read the optimizer repo in this folder and use it as a local AFPX tuning tool.
 
-My input folder is: C:\path\to\my\measurements
-My baseline tune is: C:\path\to\my\measurements\baseline.afpx
-My target curve is: C:\path\to\my\target.txt
+I have attached or dragged in:
+- my REW measurement text exports
+- my baseline .afpx tune
+- optionally my target curve text file
 
 Please:
 1. verify the required measurement files are present
