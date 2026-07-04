@@ -848,8 +848,8 @@ if __name__ == '__main__':
     # ---- VALIDATION: joint fit vs the hand/greedy set on REAL FR Low -------
     # This is an optional historical laptop data check. Keep it when the exact
     # files exist, but do not let a missing archived .mdat break portable tests.
-    MDAT = Path(r'C:\Users\Adroit\Desktop\New.mdat')
-    TGT = Path(r'C:\Users\Adroit\Downloads\ResoNix Target Curve 2026.txt')
+    MDAT = Path('validation_sample.mdat')
+    TGT = Path('ResoNix Target Curve 2026.txt')
     if MDAT.exists() and TGT.exists():
         data = open(MDAT, 'rb').read()
         def gar(o):

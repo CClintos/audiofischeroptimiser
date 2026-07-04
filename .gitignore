@@ -2,6 +2,25 @@
 __pycache__/
 *.pyc
 *.afpx
+baseline.afpx
+Front L High.txt
+Front L Tweeter.txt
+Front L Low.txt
+Front L Mid.txt
+Front L MID.txt
+Front R High.txt
+Front R Tweeter.txt
+Front R Low.txt
+Front R Mid.txt
+Front R MID.txt
+Both Mids.txt
+Both Tweeters.txt
+Mid Bass Together.txt
+Tweeters Together.txt
+System Sum.txt
+SYSTEM SUM.txt
+Sub.txt
+SUB.txt
 
 Optimizer_*/
 *_Smoke/
@@ -22,3 +41,5 @@ rollout-*.jsonl
 
 New Tune_*best*.afpx
 New Tune_*pick*.afpx
+MDAT_AFPX_INSTRUCTIONS.md
+New folder/

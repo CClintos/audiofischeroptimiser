@@ -1,15 +1,15 @@
 # _make_v3.py — hardened .afpx writer TEMPLATE (roundtrip lint + FN-ignoring semantic diff,
 # PEQ-limit validation, reserved special slots, delay+crossover preservation).
 # Upgraded 2026-07-03 from the reviewed ChatGPT 'improved copy' (kept the writer safety;
-# rejected the over-engineered scorers — see MDAT_AFPX_INSTRUCTIONS.md §6).
+# rejected the over-engineered scorers used in earlier project notes).
 import re
 import struct
 import zlib
 from pathlib import Path
 
 
-SRC = Path(r'C:\Users\Adroit\Desktop\New Tune.afpx')
-DST = Path(__file__).resolve().with_name('New Tune_v3.afpx')
+SRC = Path('baseline.afpx')
+DST = Path(__file__).resolve().with_name('baseline_updated.afpx')
 
 # Free slots at the extremes are useful for shelves/all-pass/tone-control quirks.
 # Use ordinary middle slots for normal PEQ unless the channel is genuinely full.

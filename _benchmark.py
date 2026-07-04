@@ -8,17 +8,20 @@
 # Usage:  python _benchmark.py <measurements.mdat> <baseline.afpx> <tune1.afpx> [tune2.afpx ...]
 # Assumes the 8-trace RTA capture convention (names: Front L/R High, Front L/R Low,
 # Sub, System Sum, Tweeters Together, Mid Bass Together) and magnitude-only RTA data.
+import os
 import re
 import struct
 import sys
 import zlib
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, r'C:\Users\Adroit\Downloads\Claude AF Tuner')
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 from _tunefit import peaking_db, tune_scorecard
 
-TARGET = r'C:\Users\Adroit\Downloads\ResoNix Target Curve 2026.txt'
+TARGET = os.environ.get("AFPX_TARGET", str(ROOT / "ResoNix Target Curve 2026.txt"))
 NAMES = ['FL High', 'FR High', 'FL Low', 'FR Low', 'Sub', 'System Sum',
          'Tweeters Together', 'Mid Bass Together']
 CH = ['FL High', 'FR High', 'FL Low', 'FR Low']

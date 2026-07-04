@@ -59,9 +59,9 @@ from _tunefit import (
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("AFPX_DATA_ROOT", str(ROOT)))
-DEFAULT_BASELINE = Path(os.environ.get("AFPX_BASELINE", str(DATA_ROOT / "New Tune_v5     .afpx")))
+DEFAULT_BASELINE = Path(os.environ.get("AFPX_BASELINE", str(DATA_ROOT / "baseline.afpx")))
 DEFAULT_TARGET = Path(os.environ.get("AFPX_TARGET", str(ROOT / "ResoNix Target Curve 2026.txt")))
-OBJECTIVE_PATH = ROOT / "New folder" / "afpx_objective.py"
+OBJECTIVE_PATH = ROOT / "objective_module" / "afpx_objective.py"
 
 
 def _load_external_objective():

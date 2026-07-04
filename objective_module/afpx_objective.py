@@ -13,8 +13,7 @@
 # CLI: python afpx_objective.py candidate.afpx [candidate2.afpx ...]
 #
 # REQUIRES (same folder / same env): _tunefit.py, the 8 REW .txt solo/together
-# exports, the ResoNix target, and the baseline .afpx the measurements were taken
-# at (v5). Paths configured at top -- edit for your environment.
+# exports, the target curve, and the baseline .afpx that matches the measurements.
 #
 # MAGNITUDE-ONLY: this scores EQ/gain. It does NOT model all-pass/delay (phase).
 # Keep phase edits (APF) out of the optimizer's search until phase-valid sweeps
@@ -48,7 +47,7 @@ SOLO_FILES = {  # REW .txt export names, with aliases for different session labe
     'Mid Bass Together': ('Mid Bass Together', 'Both Mids'),
 }
 TARGET = Path(os.environ.get('AFPX_TARGET', str(DATA_ROOT / 'ResoNix Target Curve 2026.txt')))
-BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'New Tune_v5     .afpx')))
+BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'baseline.afpx')))
 CH_KEYS = ['FL High', 'FR High', 'FL Low', 'FR Low']  # the 4 front channels EQ acts on
 ANCHOR_BAND = (300.0, 3000.0)
 

@@ -31,7 +31,8 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
 if (-not (Test-Path -LiteralPath $Root)) {
     throw "Run root not found: $Root"
 }
-$baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $here "New Tune_v5     .afpx" }
+$dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
+$baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"

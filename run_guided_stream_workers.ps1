@@ -41,7 +41,7 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Missing Python runtime at $pythonExe"
 }
 
-$baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $here "New Tune_v5     .afpx" }
+$baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 

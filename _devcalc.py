@@ -1,3 +1,4 @@
+import os
 import struct
 import numpy as np
 
@@ -7,8 +8,8 @@ except Exception:
     optimize_allpass = None
     target_anchor_offset = None
 
-MDAT = r'C:\Users\Adroit\Downloads\Backup\System Sum.mdat'
-TGT  = r'C:\Users\Adroit\Downloads\ResoNix Target Curve 2026.txt'
+MDAT = os.environ.get('MDAT_PATH', 'System Sum.mdat')
+TGT  = os.environ.get('TARGET_PATH', 'ResoNix Target Curve 2026.txt')
 
 data = open(MDAT, 'rb').read()
 
@@ -147,8 +148,8 @@ def load_complex_export(path, freqs):
     return mag * np.exp(1j * np.interp(lf, np.log10(f), ph))
 
 # Set these to two per-driver exports (with phase) to evaluate an APF on driver A.
-DRIVER_A = None   # e.g. r'C:\Users\Adroit\Downloads\FL Low solo.txt'   (gets the APF)
-DRIVER_B = None   # e.g. r'C:\Users\Adroit\Downloads\FL High solo.txt'
+DRIVER_A = None   # e.g. r'C:\path\to\FL Low solo.txt'   (gets the APF)
+DRIVER_B = None   # e.g. r'C:\path\to\FL High solo.txt'
 APF      = (415.0, 2.0, 2)   # (F, Q, order) all-pass to try on driver A
 APF_SEARCH_BAND = None       # e.g. (320.0, 520.0) to auto-search APF F/Q on driver A
 if DRIVER_A and DRIVER_B:
@@ -225,9 +226,9 @@ def propose_cuts(freqs, resid, band, thresh=2.0, max_bands=6, min_sep_oct=1/3.0)
     return out
 
 # Config: set any to a REW text export path. PASSBAND = the driver pair's crossover band.
-LEFT_SOLO  = None   # e.g. r'C:\Users\Adroit\Downloads\FL Low solo.txt'
-RIGHT_SOLO = None   # e.g. r'C:\Users\Adroit\Downloads\FR Low solo.txt'
-SUM_EXPORT = None   # e.g. r'C:\Users\Adroit\Downloads\System Sum.txt'
+LEFT_SOLO  = None   # e.g. r'C:\path\to\FL Low solo.txt'
+RIGHT_SOLO = None   # e.g. r'C:\path\to\FR Low solo.txt'
+SUM_EXPORT = None   # e.g. r'C:\path\to\System Sum.txt'
 PASSBAND   = (80.0, 2600.0)
 
 if SUM_EXPORT:

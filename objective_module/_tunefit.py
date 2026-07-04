@@ -14,6 +14,7 @@
 #    -> correctable. Sharp dips with wild excess-GD swings are non-minimum-phase
 #    -> EQ cannot fix them. excess_gd_mask() computes that classifier from a
 #    single-position export WITH PHASE (REW text export, 3 columns).
+import os
 
 import numpy as np
 
@@ -844,41 +845,38 @@ if __name__ == '__main__':
     print('   score %.3f -> %.3f with %d bands' % (rep['score_before'], rep['score_after'], rep['bands_used']))
     assert rep['score_after'] < 0.35 * rep['score_before'] and rep['bands_used'] <= 3
 
-    # ---- VALIDATION: joint fit vs the hand/greedy set on REAL FR Low -------
-    MDAT = r'C:\Users\Adroit\Desktop\New.mdat'
-    TGT = r'C:\Users\Adroit\Downloads\ResoNix Target Curve 2026.txt'
-    data = open(MDAT, 'rb').read()
-    def gar(o):
-        p = o + 6; n = struct.unpack('>I', data[p:p + 4])[0]
-        return np.frombuffer(data[p + 4:p + 4 + 4 * n], dtype='>f4').astype(float)
-    FR = gar(760318)                                   # FR Low, v3 loaded
-    tf, ts = [], []
-    for line in open(TGT, encoding='utf-8', errors='replace'):
-        s = line.strip()
-        if s and not s[0].isalpha() and not s.startswith('*'):
-            p = s.replace(',', ' ').split()
-            try: tf.append(float(p[0])); ts.append(float(p[1]))
-            except Exception: pass
-    tgt = np.interp(np.log10(freqs), np.log10(np.array(tf)), np.array(ts))
-    b = (freqs >= 300) & (freqs <= 1200)
-    dev = FR - (tgt + np.median(FR[b] - tgt[b]))
+    # ---- OPTIONAL historical validation on a real exported sample ----------
+    MDAT = 'validation_sample.mdat'
+    TGT = 'ResoNix Target Curve 2026.txt'
+    if os.path.exists(MDAT) and os.path.exists(TGT):
+        data = open(MDAT, 'rb').read()
+        def gar(o):
+            p = o + 6; n = struct.unpack('>I', data[p:p + 4])[0]
+            return np.frombuffer(data[p + 4:p + 4 + 4 * n], dtype='>f4').astype(float)
+        FR = gar(760318)
+        tf, ts = [], []
+        for line in open(TGT, encoding='utf-8', errors='replace'):
+            s = line.strip()
+            if s and not s[0].isalpha() and not s.startswith('*'):
+                p = s.replace(',', ' ').split()
+                try: tf.append(float(p[0])); ts.append(float(p[1]))
+                except Exception: pass
+        tgt = np.interp(np.log10(freqs), np.log10(np.array(tf)), np.array(ts))
+        b = (freqs >= 300) & (freqs <= 1200)
+        dev = FR - (tgt + np.median(FR[b] - tgt[b]))
 
-    # magnitude-only EQ-ability mask (no phase in mdat): exclude deep dips
-    # (>3 dB below ERB-smoothed baseline = candidate nulls, never fit into them)
-    base_sm = erb_smooth(freqs, dev)
-    mask_mag = ~((dev - base_sm) < -3.0) & ~(base_sm < -4.0)
+        base_sm = erb_smooth(freqs, dev)
+        mask_mag = ~((dev - base_sm) < -3.0) & ~(base_sm < -4.0)
 
-    FIT = (150.0, 2450.0)
-    # what v4 actually did to FR (greedy/hand): recenter 628->615, 1000 Q2->3,
-    # add 1175 Q4 -4.5 => as INCREMENTAL bands on this measurement:
-    hand = [(615.0, 5.5, -7.5), (628.0, 5.5, +7.5),        # recenter = remove+add
-            (1000.0, 3.0, -3.5), (1000.0, 2.0, +3.5),      # Q change  = remove+add
-            (1175.0, 4.0, -4.5)]
-    hand_dev = dev + cascade_db(freqs, hand)
-    s_before = audibility_score(freqs, dev, band=FIT, mask=mask_mag)
-    s_hand = audibility_score(freqs, hand_dev, band=FIT, mask=mask_mag)
-    bands, rep = fit_peq(freqs, dev, FIT, n_bands_max=4, mask=mask_mag, verbose=True)
-    print('VALIDATION on real FR Low (New.mdat, v3 loaded):')
+        FIT = (150.0, 2450.0)
+        hand = [(615.0, 5.5, -7.5), (628.0, 5.5, +7.5),
+                (1000.0, 3.0, -3.5), (1000.0, 2.0, +3.5),
+                (1175.0, 4.0, -4.5)]
+        hand_dev = dev + cascade_db(freqs, hand)
+        s_before = audibility_score(freqs, dev, band=FIT, mask=mask_mag)
+        s_hand = audibility_score(freqs, hand_dev, band=FIT, mask=mask_mag)
+        bands, rep = fit_peq(freqs, dev, FIT, n_bands_max=4, mask=mask_mag, verbose=True)
+        print('VALIDATION on real FR Low sample:')
     print('  audibility score  as-measured : %.3f' % s_before)
     print('  after v4 hand/greedy changes  : %.3f' % s_hand)
     print('  after joint fit (%d new bands): %.3f' % (rep['bands_used'], rep['score_after']))
