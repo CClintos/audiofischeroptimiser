@@ -23,6 +23,18 @@ Please verify the files, run the optimizer locally, merge the results, and give 
 Do not change delays, crossovers, polarity, or all-pass filters.
 ```
 
+## What It Does
+
+The optimizer reads your baseline tune and REW measurement exports, tries many possible PEQ combinations, and writes out ranked AFPX candidates to audition.
+
+It does not just chase a flat mono sum. Its scoring is designed to:
+
+- improve tonal accuracy, especially through the vocal band
+- improve left/right balance using the solo driver traces
+- penalize boosting into destructive nulls
+- penalize unnecessary gain and wasted filters
+- leave delays, crossovers, polarity, and all-pass filters alone
+
 The optimizer is designed to:
 
 - improve tonal accuracy
