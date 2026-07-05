@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     args = parser.parse_args()
 
+    opt.sync_external_objective(args.baseline, args.target)
     worker_dirs = sorted(p for p in args.root.glob("worker_*") if p.is_dir())
     items = []
     for worker in worker_dirs:

@@ -20,10 +20,6 @@ function Join-Args([string[]]$Items) {
     return ($Items | ForEach-Object { Quote-Arg $_ }) -join ' '
 }
 
-if ($DataRoot -ne "") { $env:AFPX_DATA_ROOT = $DataRoot }
-if ($Baseline -ne "") { $env:AFPX_BASELINE = $Baseline }
-if ($Target -ne "") { $env:AFPX_TARGET = $Target }
-
 $pythonExe = Join-Path $here ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Missing Python runtime at $pythonExe"
@@ -40,6 +36,14 @@ if (-not (Test-Path -LiteralPath $baselinePath)) {
 if (-not (Test-Path -LiteralPath $targetPath)) {
     throw "Target curve not found: $targetPath"
 }
+
+$dataRootPath = (Resolve-Path -LiteralPath $dataRootPath).Path
+$baselinePath = (Resolve-Path -LiteralPath $baselinePath).Path
+$targetPath = (Resolve-Path -LiteralPath $targetPath).Path
+
+$env:AFPX_DATA_ROOT = $dataRootPath
+$env:AFPX_BASELINE = $baselinePath
+$env:AFPX_TARGET = $targetPath
 
 $args = @("_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"), "--top", "$Top", "--validation-threshold", "$ValidationThreshold")
 if ($Baseline -ne "") { $args += @("--baseline", $baselinePath) }

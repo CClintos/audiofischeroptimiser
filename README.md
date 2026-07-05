@@ -13,7 +13,8 @@ It scores candidates by:
 - how close the full system response is to the target, with extra weight through the vocal and midrange region
 - how well left and right match each other, using the individual driver measurements
 - whether the tune avoids boosting into destructive cancellation nulls
-- whether it avoids wasting filters or using unnecessary gain
+- whether each filter is on a driver that is actually contributing at that frequency
+- whether it avoids wasting filters, using unnecessary gain, or adding deep/narrow one-seat corrections
 
 It is meant to be used through Claude or Codex:
 
@@ -43,7 +44,8 @@ It does not just chase a flat mono sum. Its scoring is designed to:
 - improve tonal accuracy, especially through the vocal band
 - improve left/right balance using the solo driver traces
 - penalize boosting into destructive nulls
-- penalize unnecessary gain and wasted filters
+- penalize unsupported asymmetric EQ
+- penalize unnecessary gain, wasted filters, and deep/narrow corrections
 - leave delays, crossovers, polarity, and all-pass filters alone
 
 The optimizer is designed to:
@@ -52,6 +54,7 @@ The optimizer is designed to:
 - improve left/right balance
 - avoid boosting into destructive nulls
 - keep the tune conservative and PEQ-only
+- prefer fewer, wider, symmetric, shallower filters unless the solo measurements justify otherwise
 
 Expected measurement files:
 

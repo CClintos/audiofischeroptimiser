@@ -77,6 +77,32 @@ def _load_external_objective():
 
 AFPX_OBJECTIVE = _load_external_objective()
 
+
+def sync_external_objective(baseline: Path | None = None, target: Path | None = None) -> None:
+    """Keep the imported objective pointed at this run's actual files.
+
+    The worker scripts usually pass AFPX_* environment variables before Python
+    starts. This also protects direct CLI runs where --baseline/--target are
+    supplied after _optimizer has already imported objective_module.
+    """
+    if AFPX_OBJECTIVE is None:
+        return
+    changed = False
+    if baseline is not None and hasattr(AFPX_OBJECTIVE, "BASELINE_AFPX"):
+        new_baseline = Path(baseline)
+        if Path(getattr(AFPX_OBJECTIVE, "BASELINE_AFPX")) != new_baseline:
+            setattr(AFPX_OBJECTIVE, "BASELINE_AFPX", new_baseline)
+            changed = True
+    if target is not None and hasattr(AFPX_OBJECTIVE, "TARGET"):
+        new_target = Path(target)
+        if Path(getattr(AFPX_OBJECTIVE, "TARGET")) != new_target:
+            setattr(AFPX_OBJECTIVE, "TARGET", new_target)
+            changed = True
+    if changed:
+        for name, value in (("_F", None), ("_T", {}), ("_TGT", None), ("_NULL_MASK", None), ("_V5", None)):
+            if hasattr(AFPX_OBJECTIVE, name):
+                setattr(AFPX_OBJECTIVE, name, value)
+
 HIGH_ALIASES_L = ("Front L High.txt", "Front L Tweeter.txt")
 HIGH_ALIASES_R = ("Front R High.txt", "Front R Tweeter.txt")
 MID_ALIASES_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt")
@@ -389,14 +415,10 @@ def power_sum_db(curves: Iterable[np.ndarray]) -> np.ndarray:
 
 
 def q_cap_for_band(F: float, G: float) -> float:
-    """Single-position MMM data should not create needle filters up high."""
-    cap = 8.0
-    if F >= 1000.0:
-        cap = min(cap, 4.5)
-    if F >= 6000.0:
-        cap = min(cap, 3.0)
-    if G > 0.0 and F >= 1000.0:
-        cap = min(cap, 2.5)
+    """Single-position RTA/MMM data should not create needle filters."""
+    cap = 2.5
+    if G > 0.0:
+        cap = min(cap, 2.0)
     return cap
 
 
@@ -408,6 +430,9 @@ def rounded_band(F: float, Q: float, G: float) -> Band | None:
     if F > 10000.0 and G > 0.0:
         return None
     Q = min(float(Q), q_cap_for_band(F, G))
+    # The search is intentionally shallow by default. The objective still knows
+    # how to punish deeper hand-supplied bands unless the solo trace supports it.
+    G = max(G, -4.0)
     G = round(float(G) * 4.0) / 4.0
     if abs(G) < 0.5:
         return None
@@ -482,12 +507,15 @@ def filter_cost(groups: GroupBands) -> float:
     cost = 0.0
     for group, bands in groups.items():
         for F, Q, G in bands:
-            cost += 0.018
-            cost += 0.006 * max(0.0, Q - 3.0)
-            cost += 0.004 * abs(G)
-            # Extra skepticism for narrow upper-mid/treble filters from MMM data.
-            if "high" in group and Q > 2.5:
-                cost += 0.020 * (Q - 2.5)
+            cost += 0.050
+            cost += 0.012 * abs(G) * Q
+            cost += 0.120 * max(0.0, -G - 4.0)
+            cost += 0.090 * max(0.0, Q - 2.5)
+            if G > 0.0:
+                cost += 0.030 * G * Q
+            # Extra skepticism for narrow upper-mid/treble filters from one-seat data.
+            if F >= 1000.0 and Q > 2.0:
+                cost += 0.035 * (Q - 2.0)
     return cost + duplicate_penalty(groups)
 
 
@@ -699,6 +727,12 @@ def make_component_scorer(
                 "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
                 "filter_count": float(comp.get("n_front_bands", 0.0)),
                 "filter_cost_units": float(filter_cost(groups)),
+                "guardrail_penalty_db": float(comp.get("guardrail_penalty", 0.0)),
+                "shape_penalty_db": float(comp.get("shape_penalty", 0.0)),
+                "unsupported_filter_penalty_db": float(comp.get("unsupported_filter_penalty", 0.0)),
+                "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
+                "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
+                "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
                 "low_balance_rms_db": low_balance if FRONT_LAYOUT == "3way" else mid_balance,
                 "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
                 "high_balance_rms_db": tweeter_balance,
@@ -920,7 +954,9 @@ def format_component_summary(comp: Dict[str, float]) -> str:
             f"objective `{comp.get('objective', 0.0):.3f}`, tonal_masked `{comp.get('tonal_masked', 0.0):.3f}`, "
             f"worst_masked `{comp.get('worst_masked', 0.0):.2f}`, mid_balance `{comp.get('mid_balance', 0.0):+.2f}`, "
             f"tweeter_balance `{comp.get('tweeter_balance', 0.0):+.2f}`, headroom_peak `{comp.get('headroom_peak', 0.0):.2f}`, "
-            f"null_boost_avg `{comp.get('null_boost_avg', 0.0):.2f}`, front_bands `{comp.get('n_front_bands', 0.0):.0f}`"
+            f"null_boost_avg `{comp.get('null_boost_avg', 0.0):.2f}`, guardrail `{comp.get('guardrail_penalty', 0.0):.3f}`, "
+            f"unsupported `{comp.get('unsupported_filter_penalty', 0.0):.3f}`, wasted `{comp.get('wasted_band_penalty', 0.0):.3f}`, "
+            f"asym `{comp.get('asymmetric_eq_penalty', 0.0):.3f}`, added_bands `{comp.get('n_added_front_bands', 0.0):.0f}`"
         )
     return (
         f"tonal `{comp.get('tonal_error_db', 0.0):.2f}`, "
@@ -1273,6 +1309,7 @@ def main() -> None:
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    sync_external_objective(args.baseline, args.target)
 
     global GROUPS
     GROUPS = {k: dict(v) for k, v in (EXPLORE_GROUPS if args.profile == "explore" else SAFE_GROUPS).items()}

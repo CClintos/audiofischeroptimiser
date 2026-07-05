@@ -22,6 +22,7 @@ import re
 import os
 import sys
 import zlib
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +92,7 @@ W = {
     'headroom': 0.4,     # per dB of cascade boost above SOFT_CAP
     'null_boost': 0.8,   # per dB of EQ BOOST landing in a masked null bin (the exploit)
     'parsimony': 0.02,   # per active band
+    'added_band': 0.05,   # a new filter must beat the one-seat noise floor
 }
 SOFT_CAP_DB = 3.0        # cascade boost above this starts costing
 VOCAL_BAND = (200.0, 6000.0)
@@ -198,6 +200,134 @@ def _casc(bands):
     return d
 
 
+def _band_key(band):
+    f, q, g = band
+    return (round(float(f), 1), round(float(q), 2), round(float(g) * 4.0) / 4.0)
+
+
+def _added_bands_by_channel(band_sets):
+    """Return only filters added on top of the matching baseline tune."""
+    added = {}
+    for i, _key in enumerate(CH_KEYS):
+        candidate = list(band_sets[i]) if i < len(band_sets) else []
+        baseline = list(_V5[i]) if i < len(_V5) else []
+        remaining = Counter(_band_key(b) for b in baseline)
+        new_bands = []
+        for band in candidate:
+            key = _band_key(band)
+            if remaining[key] > 0:
+                remaining[key] -= 1
+            else:
+                new_bands.append((float(band[0]), float(band[1]), float(band[2])))
+        added[i] = new_bands
+    return added
+
+
+def _interp_at(values, f):
+    return float(np.interp(np.log10(float(f)), np.log10(_F), values))
+
+
+def _system_branch_total_db():
+    total = 10 ** (_T['Sub'] / 10)
+    for _name, (_left, _right, together, _band_range, _balance) in PAIR_SPECS.items():
+        total += 10 ** (_T[together] / 10)
+    return 10 * np.log10(np.maximum(total, 1e-30))
+
+
+def _driver_share_db(channel_key, f, total_db=None):
+    # Side solos are naturally about 3 dB below their pair when L/R are equal,
+    # so add that back before judging whether the driver is meaningfully active.
+    if total_db is None:
+        total_db = _system_branch_total_db()
+    share = _interp_at(_T[channel_key] - total_db, f)
+    if channel_key.startswith('F'):
+        share += 3.0
+    return share
+
+
+def _solo_peak_support(channel_key, f):
+    """True when a narrow/deep cut is backed by a real local solo peak."""
+    sm = erb_smooth(_F, _T[channel_key])
+    oct_dist = np.abs(np.log2(_F / float(f)))
+    window = oct_dist <= (1 / 3)
+    center = oct_dist <= (1 / 12)
+    if not np.any(window) or not np.any(center):
+        return False
+    side = window & ~center
+    side_ref = sm[side] if np.any(side) else sm[window]
+    center_peak = float(np.max(sm[center]))
+    local_peak = float(np.max(sm[window]))
+    prominence = center_peak - float(np.median(side_ref))
+    return center_peak >= local_peak - 0.4 and prominence >= 1.25
+
+
+def _delta_channel(i, band_sets):
+    candidate = list(band_sets[i]) if i < len(band_sets) else []
+    baseline = list(_V5[i]) if i < len(_V5) else []
+    return _casc(candidate) - _casc(baseline)
+
+
+def _asymmetry_penalty(band_sets, total=None):
+    if total is None:
+        total = _system_branch_total_db()
+    penalty = 0.0
+    for _name, (left, right, together, _band_range, balance_band) in PAIR_SPECS.items():
+        if left not in CH_KEYS or right not in CH_KEYS:
+            continue
+        li = CH_KEYS.index(left)
+        ri = CH_KEYS.index(right)
+        eq_diff = erb_smooth(_F, _delta_channel(li, band_sets) - _delta_channel(ri, band_sets))
+        solo_diff = np.abs(erb_smooth(_F, _T[left] - _T[right]))
+        allowed = 0.75 + 0.55 * solo_diff
+        active = (_T[together] - total) >= -10.0
+        sel = (_F >= balance_band[0]) & (_F <= balance_band[1]) & active
+        excess = np.maximum(np.abs(eq_diff) - allowed, 0.0)
+        if np.any(sel):
+            penalty += 0.35 * float(np.sqrt(np.mean(excess[sel] ** 2)))
+    return penalty
+
+
+def _guardrail_score(band_sets):
+    added = _added_bands_by_channel(band_sets)
+    total_db = _system_branch_total_db()
+    shape = 0.0
+    unsupported = 0.0
+    wasted = 0.0
+    boost_q = 0.0
+    n_added = 0
+    worst_share = None
+    for i, bands in added.items():
+        channel_key = CH_KEYS[i]
+        for f, q, g in bands:
+            n_added += 1
+            shape += 0.012 * abs(g) * q
+            if g > 0.0 and q > 1.8:
+                boost_q += 0.08 * g * q * (1.0 + max(0.0, q - 2.0))
+            needs_solo_proof = g < -4.0 or q > 2.5
+            if needs_solo_proof and not (g < 0.0 and _solo_peak_support(channel_key, f)):
+                unsupported += 0.75
+                unsupported += 0.85 * max(0.0, -g - 4.0)
+                unsupported += 0.65 * max(0.0, q - 2.5)
+            share = _driver_share_db(channel_key, f, total_db)
+            worst_share = share if worst_share is None else min(worst_share, share)
+            if share < -6.0:
+                wasted += 0.18 * (-6.0 - share) * (0.5 + abs(g) / 4.0)
+    asym = _asymmetry_penalty(band_sets, total_db)
+    parsimony = W['added_band'] * n_added
+    total = shape + unsupported + wasted + boost_q + asym + parsimony
+    return {
+        'guardrail_penalty': round(total, 3),
+        'shape_penalty': round(shape, 3),
+        'unsupported_filter_penalty': round(unsupported, 3),
+        'wasted_band_penalty': round(wasted, 3),
+        'asymmetric_eq_penalty': round(asym, 3),
+        'high_q_boost_penalty': round(boost_q, 3),
+        'added_band_penalty': round(parsimony, 3),
+        'n_added_front_bands': n_added,
+        'worst_driver_share_db': round(worst_share if worst_share is not None else 0.0, 2),
+    }
+
+
 def _predict(band_sets):
     """band_sets: 8 lists of (F,Q,G). Returns predicted magnitude traces."""
     pr = {}
@@ -257,6 +387,7 @@ def objective(band_sets):
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
+    guard = _guardrail_score(band_sets)
 
     comp = {
         'tonal_masked': round(tonal, 3),
@@ -281,7 +412,9 @@ def objective(band_sets):
               + W['worst'] * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
               + W['null_boost'] * null_boost
-              + W['parsimony'] * n_bands)
+              + W['parsimony'] * n_bands
+              + guard['guardrail_penalty'])
+    comp.update(guard)
     comp['objective'] = round(scalar, 3)
     return comp
 
@@ -309,3 +442,7 @@ if __name__ == '__main__':
         print('  tonal_masked=%.3f worst_masked=%.2f mid_bal=%+.2f tw_bal=%+.2f headroom=%.2f null_boost=%.2f bands=%d'
               % (c['tonal_masked'], c['worst_masked'], balance_mid, c.get('tweeter_balance', 0.0),
                  c['headroom_peak'], c['null_boost_avg'], c['n_front_bands']))
+        print('  guardrail=%.3f shape=%.3f unsupported=%.3f wasted=%.3f asym=%.3f added_bands=%d'
+              % (c.get('guardrail_penalty', 0.0), c.get('shape_penalty', 0.0),
+                 c.get('unsupported_filter_penalty', 0.0), c.get('wasted_band_penalty', 0.0),
+                 c.get('asymmetric_eq_penalty', 0.0), c.get('n_added_front_bands', 0)))

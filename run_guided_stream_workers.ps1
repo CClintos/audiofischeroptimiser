@@ -32,18 +32,14 @@ function Join-Args([string[]]$Items) {
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
-if ($DataRoot -ne "") { $env:AFPX_DATA_ROOT = $DataRoot }
-if ($Baseline -ne "") { $env:AFPX_BASELINE = $Baseline }
-if ($Target -ne "") { $env:AFPX_TARGET = $Target }
-
 $pythonExe = Join-Path $here ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Missing Python runtime at $pythonExe"
 }
 
+$dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
-$dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -54,6 +50,14 @@ if (-not (Test-Path -LiteralPath $targetPath)) {
 if (-not (Test-Path -LiteralPath $dataRootPath)) {
     throw "Measurement folder not found: $dataRootPath"
 }
+
+$dataRootPath = (Resolve-Path -LiteralPath $dataRootPath).Path
+$baselinePath = (Resolve-Path -LiteralPath $baselinePath).Path
+$targetPath = (Resolve-Path -LiteralPath $targetPath).Path
+
+$env:AFPX_DATA_ROOT = $dataRootPath
+$env:AFPX_BASELINE = $baselinePath
+$env:AFPX_TARGET = $targetPath
 
 $measurementNames = @(
     @("System Sum.txt", "SYSTEM SUM.txt"),

@@ -152,15 +152,17 @@ def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, 
         while r < len(freqs) - 1 and strength[r] > half and freqs[r] < hi:
             r += 1
         width_oct = max(math.log2(freqs[r] / freqs[l]), 1 / 12)
+        if freqs[i] >= 1000.0:
+            width_oct = max(width_oct, 1 / 6)
         q_hint = q_from_oct_width(width_oct, q_range)
         gain_hint = float(np.clip(desired_gain[i], gain_range[0], gain_range[1]))
         band = opt.rounded_band(float(freqs[i]), q_hint, gain_hint)
         if band is None:
             continue
-        _F, _Q, rounded_gain = band
+        rounded_f, rounded_q, rounded_gain = band
         candidates.append({
-            "F": float(freqs[i]),
-            "Q": q_hint,
+            "F": float(rounded_f),
+            "Q": float(rounded_q),
             "G": float(rounded_gain),
             "strength": float(strength[i]),
             "width_oct": float(width_oct),
@@ -194,10 +196,12 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         q_range = cfg["q_range"]
         gain_range = cfg["gain_range"]
         contribution = branch_contribution(freqs, traces, group)
+        active_driver = contribution >= (10 ** (-6.0 / 10.0))
         candidates = []
         tonal_strength = np.abs(system_dev) * contribution * audible * vocal * peak_mult
         tonal_strength[masks.get(group, False)] = 0.0
-        tonal_gain = -0.75 * system_dev / np.maximum(contribution, 0.25)
+        tonal_strength[~active_driver] = 0.0
+        tonal_gain = -0.65 * system_dev / np.maximum(contribution, 0.35)
         candidates.extend(candidate_peaks(
             freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, "tonal", profile
         ))
@@ -210,6 +214,7 @@ def find_guided_candidates(freqs, traces, target, profile: str):
             else:
                 bal_gain = 0.85 * diff
             bal_strength = np.abs(bal_gain) * balance_w
+            bal_strength[~active_driver] = 0.0
             blo, bhi = pair["balance_band"]
             bal_strength[(freqs < blo) | (freqs > bhi)] = 0.0
             candidates.extend(candidate_peaks(
@@ -221,6 +226,8 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         for c in candidates:
             if all(abs(math.log2(c["F"] / d["F"])) >= 1 / 8 or c["source"] != d["source"] for d in deduped):
                 c["branch_share"] = float(np.interp(np.log10(c["F"]), np.log10(freqs), contribution))
+                if c["branch_share"] < 10 ** (-6.0 / 10.0):
+                    continue
                 deduped.append(c)
             if len(deduped) >= 14:
                 break
@@ -684,6 +691,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
+    opt.sync_external_objective(args.baseline, args.target)
     configure_profile(args.profile)
     rng = np.random.default_rng(args.seed)
     freqs, traces = opt.load_measurements()
