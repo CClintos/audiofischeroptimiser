@@ -48,6 +48,8 @@ def main():
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     parser.add_argument("--gate-ms", type=float, default=None,
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
+    parser.add_argument("--sample-rate", type=float, default=96000.0,
+                        help="DSP internal sample rate used for delay writes.")
     args = parser.parse_args()
 
     opt.sync_external_objective(args.baseline, args.target)
@@ -63,6 +65,8 @@ def main():
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    phase_plan = opt.phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
@@ -91,7 +95,7 @@ def main():
         components = component_score(groups)
         file_name = f"candidate_{rank:02d}_objective_{value:.4f}_{source}.afpx"
         path = out_dir / file_name
-        lint = opt.write_candidate(base_xml, path, groups)
+        lint = opt.write_candidate(base_xml, path, groups, phase_plan=phase_plan)
         rows.append({
             "rank": rank,
             "file": file_name,
@@ -121,7 +125,7 @@ def main():
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
-    opt.write_family_aliases(out_dir, family_rows, base_xml)
+    opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
 
     baseline_groups = {group: [] for group in opt.GROUPS}
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
@@ -132,12 +136,12 @@ def main():
         target=args.target,
         validation=validation,
         gate_ms=args.gate_ms,
+        sample_rate=args.sample_rate,
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
     )
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
     opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns,
-                     family_rows=family_rows, crossover_rows=crossover_rows)
+                     family_rows=family_rows, crossover_rows=crossover_rows, phase_plan=phase_plan)
     print("Merged", len(worker_dirs), "workers into", out_dir)
     print("Total worker candidates:", len(items))
     print("Top objective:", rows[0]["objective"])

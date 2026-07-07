@@ -13,6 +13,7 @@ param(
     [double]$MaxPositiveGainPenalty = 0.0,
     [double]$ValidationThreshold = 2.5,
     [double]$GateMs = 0.0,
+    [double]$SampleRate = 96000.0,
     [string]$DataRoot = "",
     [string]$Baseline = "",
     [string]$Target = ""
@@ -107,6 +108,7 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--cma-population", "$CmaPopulation",
         "--max-positive-gain-penalty", "$MaxPositiveGainPenalty",
         "--validation-threshold", "$ValidationThreshold",
+        "--sample-rate", "$SampleRate",
         "--checkpoint-seconds", "60",
         "--seed", "$seed",
         "--resume",

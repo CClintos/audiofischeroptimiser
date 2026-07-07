@@ -637,15 +637,16 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     )
     rows = build_rows(freqs, traces, target, best, component_score)
     family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    phase_plan = opt.phase_write_plan(crossover_rows, args.sample_rate)
     for row in rows:
         path = out_dir / row["file"]
-        row["lint"] = opt.write_candidate(base_xml, path, row["groups"])
+        row["lint"] = opt.write_candidate(base_xml, path, row["groups"], phase_plan=phase_plan)
         row["path"] = str(path)
-    opt.write_family_aliases(out_dir, family_rows, base_xml)
+    opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
     args.trials = args._completed_trials
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
     opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), args,
-                     family_rows=family_rows, crossover_rows=crossover_rows)
+                     family_rows=family_rows, crossover_rows=crossover_rows, phase_plan=phase_plan)
     status = [
         f"checkpoint={checkpoint}",
         f"completed_trials={args._completed_trials}",
@@ -689,6 +690,8 @@ def main():
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     parser.add_argument("--gate-ms", type=float, default=None,
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
+    parser.add_argument("--sample-rate", type=float, default=96000.0,
+                        help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from OUT\\stream_state.json if it exists.")

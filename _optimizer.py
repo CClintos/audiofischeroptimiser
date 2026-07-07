@@ -17,6 +17,7 @@ import csv
 import importlib.util
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -40,10 +41,13 @@ import optuna
 from _make_v3 import (
     add_bands,
     afpx_roundtrip_lint,
+    choose_free_slots,
     decode_afpx,
     encode_afpx,
+    set_attr,
 )
 from _tunefit import (
+    allpass_fil_str,
     audibility_score,
     audibility_weight,
     band_limited_delay_from_phase,
@@ -56,6 +60,7 @@ from _tunefit import (
     interference_audit,
     LOGSTEP,
     phase_linearity_residual,
+    ms_to_samples,
     target_anchor_offset,
     tune_scorecard,
 )
@@ -900,6 +905,114 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
     return rows
 
 
+def trace_channels(trace_name: str) -> Tuple[int, ...]:
+    if trace_name == "Sub":
+        return (6, 7)
+    if trace_name == "Mid Bass Together":
+        if FRONT_LAYOUT == "3way":
+            return (4, 5)
+        return (2, 3)
+    return tuple(ch for ch, name in CH_TRACE.items() if name == trace_name)
+
+
+def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: float) -> List[Dict[str, object]]:
+    """Build deterministic delay/APF edits from crossover diagnostics.
+
+    Delay is written whenever phase-derived relative delay is available. APF is
+    added conservatively when the same row is not full-confidence, so the output
+    remains auditable instead of silently pretending the phase result is perfect.
+    """
+    plan: List[Dict[str, object]] = []
+    for row in crossover_rows:
+        if not row.get("phase_available") or row.get("relative_delay_ms") in ("", None):
+            continue
+        try:
+            delay_ms = float(row["relative_delay_ms"])
+        except (TypeError, ValueError):
+            continue
+        if abs(delay_ms) < 0.02:
+            continue
+
+        name = str(row.get("name", ""))
+        if name == "sub_to_front":
+            a_trace, b_trace = "Sub", "Mid Bass Together"
+        elif name == "left_mid_to_tweeter":
+            a_trace, b_trace = ("FL Mid" if FRONT_LAYOUT == "3way" else "FL Low"), "FL High"
+        elif name == "right_mid_to_tweeter":
+            a_trace, b_trace = ("FR Mid" if FRONT_LAYOUT == "3way" else "FR Low"), "FR High"
+        else:
+            continue
+
+        # If A is later than B, delay B. If A is earlier, delay A.
+        target_trace = b_trace if delay_ms > 0 else a_trace
+        write_delay_ms = abs(delay_ms)
+        channels = trace_channels(target_trace)
+        if not channels:
+            continue
+        phase_full = (
+            row.get("phase_stability") == "trustworthy"
+            and row.get("excess_gd_stability") == "high"
+            and row.get("predicted_sum_match") == "high"
+        )
+        lo, hi = [float(x) for x in str(row["band"]).replace("Hz", "").split("-")[:2]]
+        f0 = math.sqrt(lo * hi)
+        plan.append({
+            "source": row.get("label", name),
+            "kind": "delay_apf" if not phase_full else "delay",
+            "channels": channels,
+            "delay_ms": round(write_delay_ms, 4),
+            "delay_samples": int(round(ms_to_samples(write_delay_ms, sample_rate_hz))),
+            "apf_f": round(f0, 2),
+            "apf_q": 0.7,
+            "apf": not phase_full,
+            "confidence": "full" if phase_full else "warning",
+            "warning": "" if phase_full else (
+                "not full confidence; re-measure this crossover and verify image, centre focus, and summed level"
+            ),
+        })
+    return plan
+
+
+def add_allpass_to_oc(oc: str, f0: float, q: float = 0.7, invert: bool = False) -> str:
+    slot = choose_free_slots(oc, 1)[0]
+    fn = slot_attr(slot, "FN") or "0"
+    df = slot_attr(slot, "dF") or "20000"
+    new = allpass_fil_str(float(f0), float(q), fn, dF=df, invert=invert)
+    return oc.replace(slot, new, 1)
+
+
+def slot_attr(tag: str, key: str) -> str | None:
+    import re
+    m = re.search(r'(?<![A-Za-z])' + re.escape(key) + r'="([^"]*)"', tag)
+    return m.group(1) if m else None
+
+
+def apply_phase_writes(xml: str, phase_plan: List[Dict[str, object]] | None) -> str:
+    if not phase_plan:
+        return xml
+    blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", xml, re.S)]
+    new_blocks = list(blocks)
+    delay_add: Dict[int, int] = {}
+    for edit in phase_plan:
+        channels = tuple(int(ch) for ch in edit.get("channels", ()))
+        for ch in channels:
+            delay_add[ch] = delay_add.get(ch, 0) + int(edit.get("delay_samples", 0))
+            if edit.get("apf") and 0 <= ch < len(new_blocks):
+                new_blocks[ch] = add_allpass_to_oc(new_blocks[ch], float(edit["apf_f"]), float(edit["apf_q"]))
+    out = replace_oc_blocks(xml, new_blocks)
+
+    if delay_add:
+        tags = list(re.finditer(r"<T [^>]*/?>", out))
+        for ch, add_samples in sorted(delay_add.items(), reverse=True):
+            if ch >= len(tags) or add_samples == 0:
+                continue
+            tag = tags[ch].group()
+            current = int(float(slot_attr(tag, "T") or "0"))
+            new_tag = set_attr(tag, "T", str(current + add_samples))
+            out = out[:tags[ch].start()] + new_tag + out[tags[ch].end():]
+    return out
+
+
 def gate_validity_notes(gate_ms: float | None) -> List[str]:
     if gate_ms is None or gate_ms <= 0:
         return ["No impulse/window gate length was supplied; low-frequency phase trust is unknown."]
@@ -1115,9 +1228,8 @@ def replace_oc_blocks(xml: str, blocks: List[str]) -> str:
     return out
 
 
-def write_candidate(base_xml: str, path: Path, groups: GroupBands) -> Dict[str, object]:
-    import re
-
+def write_candidate(base_xml: str, path: Path, groups: GroupBands,
+                    phase_plan: List[Dict[str, object]] | None = None) -> Dict[str, object]:
     blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
     new_blocks = list(blocks)
     for group, bands in groups.items():
@@ -1127,9 +1239,15 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands) -> Dict[str, 
             new_blocks[channel] = add_bands(new_blocks[channel], bands)
 
     new_xml = replace_oc_blocks(base_xml, new_blocks)
+    new_xml = apply_phase_writes(new_xml, phase_plan)
     encode_afpx(new_xml, path)
     written = decode_afpx(path)
-    lint = afpx_roundtrip_lint(base_xml, written, allowed_added_types=("17",))
+    lint = afpx_roundtrip_lint(
+        base_xml,
+        written,
+        allow_delay_changes=bool(phase_plan),
+        allowed_added_types=("17", "20") if phase_plan else ("17",),
+    )
     if not lint["pass"]:
         raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
     return lint
@@ -1361,14 +1479,15 @@ def select_family_rows(rows: List[Dict[str, object]]) -> Dict[str, Dict[str, obj
     return chosen
 
 
-def write_family_aliases(out_dir: Path, rows: List[Dict[str, object]], base_xml: str) -> Dict[str, str]:
+def write_family_aliases(out_dir: Path, rows: List[Dict[str, object]], base_xml: str,
+                         phase_plan: List[Dict[str, object]] | None = None) -> Dict[str, str]:
     picks = select_family_rows(rows)
     aliases = {}
     for old in out_dir.glob("family_*.afpx"):
         old.unlink()
     for role, row in picks.items():
         file_name = f"family_{role}.afpx"
-        write_candidate(base_xml, out_dir / file_name, row["groups"])
+        write_candidate(base_xml, out_dir / file_name, row["groups"], phase_plan=phase_plan)
         aliases[role] = file_name
     return aliases
 
@@ -1403,12 +1522,14 @@ def write_report(
     args: argparse.Namespace,
     family_rows: List[Dict[str, object]] | None = None,
     crossover_rows: List[Dict[str, object]] | None = None,
+    phase_plan: List[Dict[str, object]] | None = None,
 ) -> None:
     md = out_dir / "optimizer_report.md"
     csv_path = out_dir / "optimizer_results.csv"
     family_source = list(family_rows) if family_rows is not None else list(rows)
     family_picks = select_family_rows(family_source)
     crossover_rows = crossover_rows or []
+    phase_plan = phase_plan or []
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -1508,6 +1629,25 @@ def write_report(
         lines.append("- No crossover-band phase diagnostics were available from the supplied measurement set.")
     lines.extend([
         "",
+        "## Written Delay / APF Changes",
+        "",
+    ])
+    if phase_plan:
+        for edit in phase_plan:
+            channels = ", ".join("ch%d" % int(ch) for ch in edit.get("channels", ()))
+            apf = ""
+            if edit.get("apf"):
+                apf = f"; APF T=20 at `{edit.get('apf_f')}` Hz Q`{edit.get('apf_q')}`"
+            warning = edit.get("warning") or "full-confidence phase write"
+            lines.append(
+                f"- {edit.get('source')}: added `{edit.get('delay_ms')}` ms "
+                f"(`{edit.get('delay_samples')}` samples) to {channels}{apf}. Confidence `{edit.get('confidence')}`: {warning}."
+            )
+        lines.append("- After loading the tune, re-measure the affected crossover pairs and confirm centre image, summed level, and that no new hole appeared either side of the crossover.")
+    else:
+        lines.append("- No delay/APF writes were made because phase-valid crossover data was missing or delay was below the write threshold.")
+    lines.extend([
+        "",
         "## Family Picks",
         "",
     ])
@@ -1576,6 +1716,7 @@ def main() -> None:
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--min-total-bands", type=int, default=0)
     parser.add_argument("--gate-ms", type=float, default=None, help="Optional impulse/window gate length in milliseconds for confidence warnings.")
+    parser.add_argument("--sample-rate", type=float, default=96000.0, help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -1594,6 +1735,7 @@ def main() -> None:
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
     crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces)
+    phase_plan = phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
@@ -1651,7 +1793,7 @@ def main() -> None:
         rank = len(ranked_rows) + 1
         file_name = f"candidate_{rank:02d}_objective_{trial.value:.4f}.afpx"
         out_path = out_dir / file_name
-        lint = write_candidate(base_xml, out_path, groups)
+        lint = write_candidate(base_xml, out_path, groups, phase_plan=phase_plan)
         pred = predict_traces(freqs, traces, groups)
         score = tune_scorecard(freqs, pred, target)
         components = component_score(groups)
@@ -1688,8 +1830,9 @@ def main() -> None:
                 pretty += ", ..."
             notes.append(f"{label} destructive-summing audit flagged: {pretty}.")
 
-    write_family_aliases(out_dir, ranked_rows, base_xml)
-    write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows, crossover_rows=crossover_rows)
+    write_family_aliases(out_dir, ranked_rows, base_xml, phase_plan=phase_plan)
+    write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows,
+                 crossover_rows=crossover_rows, phase_plan=phase_plan)
 
     print("Optimizer complete")
     print("Output:", out_dir)

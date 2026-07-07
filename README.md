@@ -4,7 +4,7 @@ This repo is a local AFPX tuning tool for Helix / Audiotec Fischer DSP systems.
 
 It takes your baseline `.afpx` tune plus REW measurement exports, tries many possible PEQ combinations, scores them, and gives you back ranked AFPX tune candidates to test.
 
-The goal is to improve the tune without touching delays, crossovers, polarity, or all-pass filters.
+The goal is to improve the tune conservatively. PEQ is always handled from magnitude data; delay/APF edits are written when phase-valid crossover measurements are present, and the report warns when the phase confidence is not full.
 
 It also includes beta `.pct6` container support for newer DSP PC-Tool 6 tunes, so the repo can inspect or round-trip those files too. That path is less proven than `.afpx`, and should be treated as a careful utility rather than a blindly trusted writer.
 
@@ -24,7 +24,7 @@ The math layer also includes optional confidence and timing helpers for future p
 - band-limited phase-delay estimation around crossover regions
 - gated impulse helpers that estimate how low a time window can be trusted
 
-Those helpers are now used in candidate reports when the measurement exports contain enough data. The optimizer still writes conservative PEQ only, but the report can inspect crossover bands such as sub-to-midbass and mid-to-tweeter for delay, polarity, phase stability, summation quality, and acoustic-sum agreement.
+Those helpers are now used in candidate reports and output writing when the measurement exports contain enough data. The optimizer inspects crossover bands such as sub-to-midbass and mid-to-tweeter for delay, polarity, phase stability, summation quality, and acoustic-sum agreement. It writes the delay/APF changes alongside the PEQ candidates, then explains confidence and re-measure checks in the report.
 
 Supported REW text export rows:
 
@@ -53,7 +53,7 @@ I have attached:
 - optionally my target curve
 
 Please verify the files, run the optimizer locally, merge the results, and give me the best AFPX candidates with a short summary of what improved.
-Do not change delays, crossovers, polarity, or all-pass filters.
+Delay/APF changes may be written when phase-valid measurements support them. Crossovers and polarity are still left alone.
 ```
 
 ## How It Scores
@@ -65,7 +65,8 @@ It does not just chase a flat mono sum. Its scoring is designed to:
 - penalize boosting into destructive nulls
 - penalize unsupported asymmetric EQ
 - penalize unnecessary gain, wasted filters, and deep/narrow corrections
-- leave delays, crossovers, polarity, and all-pass filters alone
+- write delay/APF changes only from crossover-band phase evidence, with warnings when confidence is not full
+- leave crossovers and polarity alone
 
 The optimizer is designed to:
 
@@ -109,12 +110,12 @@ Expected tune file:
 
 This tool is intentionally conservative.
 
-- It optimizes PEQ only.
-- It does not edit delay tags.
+- It optimizes PEQ from magnitude data.
+- It can edit delay tags when phase-valid crossover data is present.
 - It does not change crossovers.
-- It does not write polarity or APF changes.
+- It can add conservative APF filters when the phase report shows residual crossover uncertainty.
 - It treats destructive summing regions as not EQ-fixable.
 
-For `.pct6`, the repo currently provides careful container decode / encode support and inspection helpers, but the optimizer itself is still centered on conservative PEQ work rather than automatic phase/delay writes.
+For `.pct6`, the repo currently provides careful container decode / encode support and inspection helpers. AFPX writing is still the primary automated output path.
 
-That means it is best for tonal work, not for automated phase alignment.
+That means it is primarily a PEQ optimizer, with conservative delay/APF writes only when the measurement exports contain usable phase evidence.
