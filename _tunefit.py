@@ -779,6 +779,53 @@ def octave_smooth_log(freqs, y, oct_frac):
     w = max(1, int(round((1.0 / np.log10(LOGSTEP)) * np.log10(2 ** oct_frac))))
     return np.convolve(y, np.ones(w) / w, mode='same')
 
+def ms_to_samples(delay_ms, sample_rate_hz):
+    return float(delay_ms) * float(sample_rate_hz) / 1000.0
+
+def samples_to_ms(samples, sample_rate_hz):
+    return float(samples) * 1000.0 / float(sample_rate_hz)
+
+def calibrate_solo_levels(freqs, solo_db, together_db, band):
+    freqs = np.asarray(freqs, dtype=float)
+    solo_db = np.asarray(solo_db, dtype=float)
+    together_db = np.asarray(together_db, dtype=float)
+    sel = (freqs >= band[0]) & (freqs <= band[1])
+    if not np.any(sel):
+        raise ValueError('band does not overlap axis')
+    diff = together_db[sel] - solo_db[sel]
+    offset = float(np.median(diff))
+    resid = together_db[sel] - (solo_db[sel] + offset)
+    return {'level_offset_db': round(offset, 2),
+            'residual_rms_db': round(float(np.sqrt(np.mean(resid ** 2))), 2)}
+
+def phase_linearity_residual(freqs, phase_deg, band):
+    freqs = np.asarray(freqs, dtype=float)
+    phase_deg = np.asarray(phase_deg, dtype=float)
+    sel = (freqs >= band[0]) & (freqs <= band[1])
+    if np.sum(sel) < 3:
+        raise ValueError('band does not overlap enough of the axis')
+    ph = np.rad2deg(np.unwrap(np.deg2rad(phase_deg[sel])))
+    f = freqs[sel]
+    slope, intercept = np.polyfit(f, ph, 1)
+    resid = ph - (slope * f + intercept)
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+    return {'rms_residual_deg': round(rms, 1),
+            'trustworthy_for_timing': bool(rms <= 100.0),
+            'grade': ('trustworthy' if rms <= 100.0 else
+                     'marginal' if rms <= 300.0 else 'reflection-dominated (do not use)')}
+
+def complex_vector_average(complex_traces):
+    if len(complex_traces) < 2:
+        raise ValueError('need >=2 position traces to average')
+    return np.mean(np.stack(complex_traces, axis=0), axis=0)
+
+def inert_band_check(target_driver_db, dominant_db, threshold_db=6.0):
+    gap = float(dominant_db) - float(target_driver_db)
+    return {'gap_db': round(gap, 2),
+            'inert': bool(gap >= threshold_db),
+            'note': ('target driver is buried -- this band barely affects the sum'
+                     if gap >= threshold_db else 'target driver has enough level to matter here')}
+
 
 # --------------------------------------------------------------------------
 # 3d) POLARITY/DELAY SEARCH -- added 2026-07-03. Completes the doctrine ladder in
@@ -1249,6 +1296,32 @@ if __name__ == '__main__':
     assert abs(gate22['gate_ms'] - 4.0) < 0.2
     assert conf22[i250] < 0.55 and conf22[i1k] > 0.95
     assert d22['usable'] and d22['polarity'] == 'same' and abs(d22['delay_ms'] - 1.0) < 0.05
+
+    s96 = ms_to_samples(6.52, 96000.0)
+    s48 = ms_to_samples(6.52, 48000.0)
+    print('TEST14c delay conversion: 6.52ms -> %.0f samples @96k, %.0f samples @48k' % (s96, s48))
+    assert abs(samples_to_ms(s96, 96000.0) - 6.52) < 1e-6 and abs(s96 - s48) > 100
+
+    A19 = np.full_like(freqs, 60.0)
+    together19 = A19 + 4.5
+    cal = calibrate_solo_levels(freqs, A19, together19, (200.0, 2000.0))
+    print('TEST14c solo calibration:', cal)
+    assert abs(cal['level_offset_db'] - 4.5) < 0.05
+
+    ph_clean = -0.02 * freqs
+    ph_noisy = ph_clean + 180.0 * np.sin(freqs / 120.0)
+    r_clean = phase_linearity_residual(freqs, ph_clean, (300.0, 3000.0))
+    r_noisy = phase_linearity_residual(freqs, ph_noisy, (300.0, 3000.0))
+    print('TEST14c phase trust:', r_clean, r_noisy)
+    assert r_clean['trustworthy_for_timing'] and not r_noisy['trustworthy_for_timing']
+
+    comb1 = np.exp(-1j * 2 * np.pi * freqs * 0.00020)
+    comb2 = np.exp(-1j * 2 * np.pi * freqs * 0.00021)
+    avg = complex_vector_average([comb1, comb2])
+    buried = inert_band_check(target_driver_db=60.0, dominant_db=75.0)
+    audible = inert_band_check(target_driver_db=72.0, dominant_db=75.0)
+    print('TEST14c vector avg / inert-band:', float(np.median(np.abs(avg))), buried, audible)
+    assert buried['inert'] and not audible['inert']
 
     # ---- TEST15: scorecard + gain rung ---------------------------------------
     tr15 = {'System Sum': tgt_like + 2.0 * np.sin(np.log(freqs)),

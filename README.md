@@ -6,6 +6,8 @@ It takes your baseline `.afpx` tune plus REW measurement exports, tries many pos
 
 The goal is to improve the tune without touching delays, crossovers, polarity, or all-pass filters.
 
+It also includes beta `.pct6` container support for newer DSP PC-Tool 6 tunes, so the repo can inspect or round-trip those files too. That path is less proven than `.afpx`, and should be treated as a careful utility rather than a blindly trusted writer.
+
 Its scoring system is built to reward tunes that are more likely to sound better, not just look flatter on one graph.
 
 It scores candidates by:
@@ -90,6 +92,9 @@ Expected tune file:
 - [merge_guided_stream_results.ps1](./merge_guided_stream_results.ps1): safe merge wrapper
 - [objective_module/afpx_objective.py](./objective_module/afpx_objective.py): independent scalar objective used by the optimizer
 - [objective_module/_tunefit.py](./objective_module/_tunefit.py): DSP/math helpers used by the objective module
+- [afpx.py](./afpx.py): generic `.afpx` inspector and channel-role helper
+- [pct6.py](./pct6.py): beta `.pct6` decode / encode utility for no-password PC-Tool 6 saves
+- [PCT6_SUPPORT.md](./PCT6_SUPPORT.md): caveats and safe usage notes for `.pct6`
 
 ## Safety / Scope
 
@@ -100,5 +105,7 @@ This tool is intentionally conservative.
 - It does not change crossovers.
 - It does not write polarity or APF changes.
 - It treats destructive summing regions as not EQ-fixable.
+
+For `.pct6`, the repo currently provides careful container decode / encode support and inspection helpers, but the optimizer itself is still centered on conservative PEQ work rather than automatic phase/delay writes.
 
 That means it is best for tonal work, not for automated phase alignment.
