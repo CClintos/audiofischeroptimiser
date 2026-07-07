@@ -46,12 +46,16 @@ from _make_v3 import (
 from _tunefit import (
     audibility_score,
     audibility_weight,
+    band_limited_delay_from_phase,
     cascade_db,
     erb_smooth,
     erb_hz,
+    excess_gd_mask,
+    gate_low_frequency_limit,
     headroom_report,
     interference_audit,
     LOGSTEP,
+    phase_linearity_residual,
     target_anchor_offset,
     tune_scorecard,
 )
@@ -350,40 +354,84 @@ REPORT_FREQS = [
 Band = Tuple[float, float, float]
 GroupBands = Dict[str, List[Band]]
 TraceMap = Dict[str, np.ndarray]
+RichTrace = Dict[str, np.ndarray]
+RichTraceMap = Dict[str, RichTrace]
 
 
-def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    freqs: List[float] = []
-    spl: List[float] = []
+def load_rew_export(path: Path) -> RichTrace:
+    """Load REW-style text exports with optional phase/coherence/position columns.
+
+    Accepted numeric layouts:
+      freq, spl
+      freq, spl, phase
+      freq, spl, phase, coherence
+      freq, spl, phase, coherence, position_id
+    """
+    cols: List[List[float]] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         s = line.strip()
         if not s or s.startswith("*") or s[0].isalpha():
             continue
         parts = s.replace(",", " ").split()
-        try:
-            freqs.append(float(parts[0]))
-            spl.append(float(parts[1]))
-        except (IndexError, ValueError):
-            continue
-    if len(freqs) < 16:
+        row: List[float] = []
+        for part in parts[:5]:
+            try:
+                row.append(float(part))
+            except ValueError:
+                break
+        if len(row) >= 2:
+            cols.append(row)
+    if len(cols) < 16:
         raise ValueError(f"No usable frequency/SPL rows found in {path}")
-    return np.asarray(freqs, dtype=float), np.asarray(spl, dtype=float)
+
+    ncols = max(len(row) for row in cols)
+    out = {
+        "freq": np.asarray([row[0] for row in cols], dtype=float),
+        "spl": np.asarray([row[1] for row in cols], dtype=float),
+    }
+    if ncols >= 3 and all(len(row) >= 3 for row in cols):
+        out["phase"] = np.asarray([row[2] for row in cols], dtype=float)
+    if ncols >= 4 and all(len(row) >= 4 for row in cols):
+        out["coherence"] = np.asarray([row[3] for row in cols], dtype=float)
+    if ncols >= 5 and all(len(row) >= 5 for row in cols):
+        out["position_id"] = np.asarray([row[4] for row in cols], dtype=float)
+    return out
 
 
-def load_measurements() -> Tuple[np.ndarray, TraceMap]:
+def interp_rich_trace(trace: RichTrace, freqs: np.ndarray) -> RichTrace:
+    src_f = trace["freq"]
+    log_src = np.log10(src_f)
+    log_dst = np.log10(freqs)
+    out: RichTrace = {"freq": freqs.copy()}
+    for key in ("spl", "phase", "coherence", "position_id"):
+        if key in trace:
+            out[key] = np.interp(log_dst, log_src, trace[key])
+    return out
+
+
+def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    trace = load_rew_export(path)
+    return trace["freq"], trace["spl"]
+
+
+def load_measurements() -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
     missing = [str(p) for p in MEASUREMENT_FILES.values() if not p.exists()]
     if missing:
         raise FileNotFoundError("Missing measurement file(s):\n  " + "\n  ".join(missing))
 
-    base_f, base_spl = load_txt_export(MEASUREMENT_FILES["System Sum"])
+    base_trace = load_rew_export(MEASUREMENT_FILES["System Sum"])
+    base_f = base_trace["freq"]
+    base_spl = base_trace["spl"]
     traces: TraceMap = {"System Sum": base_spl}
+    rich: RichTraceMap = {"System Sum": interp_rich_trace(base_trace, base_f)}
     log_base = np.log10(base_f)
     for name, path in MEASUREMENT_FILES.items():
         if name == "System Sum":
             continue
-        f, spl = load_txt_export(path)
-        traces[name] = np.interp(log_base, np.log10(f), spl)
-    return base_f, traces
+        measurement = load_rew_export(path)
+        traces[name] = np.interp(log_base, np.log10(measurement["freq"]), measurement["spl"])
+        rich[name] = interp_rich_trace(measurement, base_f)
+    return base_f, traces, rich
 
 
 def load_target(path: Path, freqs: np.ndarray) -> np.ndarray:
@@ -689,6 +737,207 @@ def pair_sum_validation(freqs: np.ndarray, traces: TraceMap, threshold: float = 
             "threshold_db": float(threshold),
         })
     return rows
+
+
+def _wrap_deg(deg: np.ndarray) -> np.ndarray:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def _complex_from_rich(trace: RichTrace) -> np.ndarray | None:
+    if "phase" not in trace:
+        return None
+    mag = 10.0 ** (trace["spl"] / 20.0)
+    return mag * np.exp(1j * np.deg2rad(trace["phase"]))
+
+
+def _band_rms(values: np.ndarray, sel: np.ndarray) -> float:
+    ok = sel & np.isfinite(values)
+    if not np.any(ok):
+        return float("inf")
+    return float(np.sqrt(np.mean(values[ok] ** 2)))
+
+
+def _grade_from_rms(rms: float, good: float, medium: float) -> str:
+    if not np.isfinite(rms):
+        return "missing"
+    if rms <= good:
+        return "high"
+    if rms <= medium:
+        return "medium"
+    return "low"
+
+
+def optional_measurement(data_root: Path, aliases: Tuple[str, ...], freqs: np.ndarray) -> RichTrace | None:
+    for alias in aliases:
+        path = data_root / alias
+        if path.exists():
+            return interp_rich_trace(load_rew_export(path), freqs)
+    return None
+
+
+def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, object]]:
+    specs: List[Dict[str, object]] = []
+    sub_front = optional_measurement(DATA_ROOT, (
+        "Sub and Mids.txt", "Sub + Mids.txt", "Sub + Front Mids.txt",
+        "Sub + Front L/R Midbass.txt", "Mids and Sub.txt", "Midbass and Sub.txt",
+    ), freqs)
+    if "Sub" in rich and "Mid Bass Together" in rich:
+        specs.append({
+            "name": "sub_to_front",
+            "label": "Sub to front midbass",
+            "a": "Sub",
+            "b": "Mid Bass Together",
+            "together": sub_front,
+            "band": (50.0, 120.0),
+        })
+    if FRONT_LAYOUT == "3way":
+        mid_left, mid_right = "FL Mid", "FR Mid"
+    else:
+        mid_left, mid_right = "FL Low", "FR Low"
+    for side, mid, high, aliases in (
+        ("left", mid_left, "FL High", ("Front L Mid Tweeter Together.txt", "Front L Mid+Tweeter.txt", "Front L Together.txt")),
+        ("right", mid_right, "FR High", ("Front R Mid Tweeter Together.txt", "Front R Mid+Tweeter.txt", "Front R Together.txt")),
+    ):
+        if mid in rich and high in rich:
+            specs.append({
+                "name": f"{side}_mid_to_tweeter",
+                "label": f"{side.title()} mid to tweeter",
+                "a": mid,
+                "b": high,
+                "together": optional_measurement(DATA_ROOT, aliases, freqs),
+                "band": (1800.0, 4500.0),
+            })
+    return specs
+
+
+def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for spec in crossover_specs(freqs, rich):
+        a_name = str(spec["a"])
+        b_name = str(spec["b"])
+        band = tuple(spec["band"])  # type: ignore[arg-type]
+        sel = (freqs >= band[0]) & (freqs <= band[1])
+        a = rich[a_name]
+        b = rich[b_name]
+        phase_available = "phase" in a and "phase" in b
+        coherence = None
+        if "coherence" in a and "coherence" in b:
+            coherence = np.minimum(a["coherence"], b["coherence"])
+
+        row: Dict[str, object] = {
+            "name": spec["name"],
+            "label": spec["label"],
+            "band": f"{band[0]:.0f}-{band[1]:.0f} Hz",
+            "phase_available": phase_available,
+        }
+        if phase_available:
+            phase_diff = _wrap_deg(a["phase"] - b["phase"])
+            delay = band_limited_delay_from_phase(freqs, phase_diff, band, coherence=coherence)
+            polarity_cos = float(np.median(np.cos(np.deg2rad(phase_diff[sel])))) if np.any(sel) else 0.0
+            phase_stability = phase_linearity_residual(freqs, phase_diff, band)
+            try:
+                _agd, a_eqable = excess_gd_mask(freqs, a["spl"], a["phase"])
+                _bgd, b_eqable = excess_gd_mask(freqs, b["spl"], b["phase"])
+                eqable_pct = 100.0 * np.count_nonzero(a_eqable & b_eqable & sel) / max(np.count_nonzero(sel), 1)
+                egd_grade = "high" if eqable_pct >= 85.0 else "medium" if eqable_pct >= 60.0 else "low"
+            except Exception:
+                eqable_pct = float("nan")
+                egd_grade = "missing"
+            row.update({
+                "relative_delay_ms": delay["delay_ms"],
+                "delay_fit_rms_deg": delay["rms_phase_err_deg"],
+                "delay_usable": delay["usable"],
+                "polarity": "same" if polarity_cos >= 0 else "inverted/rotated",
+                "polarity_cos": round(polarity_cos, 3),
+                "phase_stability": phase_stability["grade"],
+                "phase_rms_residual_deg": phase_stability["rms_residual_deg"],
+                "excess_gd_stability": egd_grade,
+                "minimum_phase_pct": "" if not np.isfinite(eqable_pct) else round(float(eqable_pct), 1),
+            })
+        else:
+            row.update({
+                "relative_delay_ms": "",
+                "delay_fit_rms_deg": "",
+                "delay_usable": False,
+                "polarity": "phase missing",
+                "phase_stability": "missing",
+                "phase_rms_residual_deg": "",
+                "excess_gd_stability": "missing",
+                "minimum_phase_pct": "",
+            })
+
+        together = spec.get("together")
+        try:
+            if together is None:
+                raise ValueError("no measured together trace")
+            audit = interference_audit(freqs, traces[a_name], traces[b_name], together["spl"])
+            interf = audit[2]
+            null_pct = 100.0 * np.count_nonzero(audit[3] & sel) / max(np.count_nonzero(sel), 1)
+            row["summation_quality"] = _grade_from_rms(_band_rms(np.minimum(interf, 0.0), sel), 1.5, 3.0)
+            row["destructive_pct"] = round(float(null_pct), 1)
+        except Exception:
+            row["summation_quality"] = "missing"
+            row["destructive_pct"] = ""
+
+        ca = _complex_from_rich(a)
+        cb = _complex_from_rich(b)
+        if together is not None and ca is not None and cb is not None:
+            predicted = 20.0 * np.log10(np.abs(ca + cb) + 1e-12)
+            err = erb_smooth(freqs, together["spl"] - predicted)
+            rms = _band_rms(err, sel)
+            row["predicted_sum_rms_db"] = round(rms, 2)
+            row["predicted_sum_match"] = _grade_from_rms(rms, 1.5, 2.5)
+        elif together is not None:
+            psum = power_sum_db([traces[a_name], traces[b_name]])
+            err = erb_smooth(freqs, together["spl"] - psum)
+            rms = _band_rms(err, sel)
+            row["predicted_sum_rms_db"] = round(rms, 2)
+            row["predicted_sum_match"] = _grade_from_rms(rms, 2.0, 3.5)
+        else:
+            row["predicted_sum_rms_db"] = ""
+            row["predicted_sum_match"] = "missing together trace"
+        rows.append(row)
+    return rows
+
+
+def gate_validity_notes(gate_ms: float | None) -> List[str]:
+    if gate_ms is None or gate_ms <= 0:
+        return ["No impulse/window gate length was supplied; low-frequency phase trust is unknown."]
+    f_low = gate_low_frequency_limit(gate_ms)
+    return [
+        f"Gate/window `{gate_ms:.2f}` ms implies lowest trustworthy gated frequency around `{f_low:.0f}` Hz.",
+        f"Do not trust gated response below about `{f_low:.0f}` Hz; use ungated or spatially averaged low-frequency measurements there.",
+    ]
+
+
+def trust_meter_lines(row: Dict[str, object], crossover_rows: List[Dict[str, object]], gate_ms: float | None) -> List[str]:
+    sc = row["score"]
+    comp = row.get("components", {})
+    tonal_conf = "high" if float(sc.get("sum_rms_db", 99.0)) <= 3.0 else "medium"
+    balance = float(sc.get("sum_wrms_img_db", 99.0))
+    balance_conf = "high" if balance <= 2.0 else "medium" if balance <= 4.0 else "low"
+    notes = [
+        f"- Tonal improvement: {tonal_conf} confidence",
+        f"- L/R balance improvement: {balance_conf} confidence",
+    ]
+    for item in crossover_rows:
+        label = item["label"]
+        match = item.get("predicted_sum_match", "missing")
+        phase = item.get("phase_stability", "missing")
+        summing = item.get("summation_quality", "missing")
+        notes.append(
+            f"- {label} ({item['band']}): phase `{phase}`, excess-GD `{item.get('excess_gd_stability', 'missing')}`, "
+            f"summation `{summing}`, acoustic-sum match `{match}`"
+        )
+    if gate_ms is None or gate_ms <= 0:
+        notes.append("- 70-95 Hz improvement: low confidence, gate/phase-valid measurement missing")
+    else:
+        f_low = gate_low_frequency_limit(gate_ms)
+        if f_low > 95.0:
+            notes.append(f"- 70-95 Hz improvement: low confidence below gated limit `{f_low:.0f}` Hz")
+    if float(comp.get("unsupported_filter_penalty", comp.get("unsupported_filter_penalty_db", 0.0))) > 0.0:
+        notes.append("- Some asymmetric/deep/narrow EQ was penalized because the solo traces did not justify it")
+    return notes
 
 
 def make_component_scorer(
@@ -1153,11 +1402,13 @@ def write_report(
     interference_notes: List[str],
     args: argparse.Namespace,
     family_rows: List[Dict[str, object]] | None = None,
+    crossover_rows: List[Dict[str, object]] | None = None,
 ) -> None:
     md = out_dir / "optimizer_report.md"
     csv_path = out_dir / "optimizer_results.csv"
     family_source = list(family_rows) if family_rows is not None else list(rows)
     family_picks = select_family_rows(family_source)
+    crossover_rows = crossover_rows or []
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -1239,6 +1490,24 @@ def write_report(
         "- Destructive pair-summing regions are masked from tonal scoring so EQ cannot win by filling phase nulls.",
         "- Delay, all-pass, polarity, and crossover changes require phase-valid fixed-position sweeps.",
         "",
+        "## Crossover Phase Confidence",
+        "",
+    ])
+    for note in gate_validity_notes(getattr(args, "gate_ms", None)):
+        lines.append(f"- {note}")
+    if crossover_rows:
+        for item in crossover_rows:
+            lines.append(
+                f"- {item['label']} `{item['band']}`: delay `{item.get('relative_delay_ms', '')}` ms; "
+                f"polarity `{item.get('polarity', '')}`; phase `{item.get('phase_stability', '')}`; "
+                f"excess-GD `{item.get('excess_gd_stability', '')}` ({item.get('minimum_phase_pct', '')}% minimum-phase bins); "
+                f"summation `{item.get('summation_quality', '')}`; predicted-sum `{item.get('predicted_sum_match', '')}` "
+                f"({item.get('predicted_sum_rms_db', '')} dB RMS)"
+            )
+    else:
+        lines.append("- No crossover-band phase diagnostics were available from the supplied measurement set.")
+    lines.extend([
+        "",
         "## Family Picks",
         "",
     ])
@@ -1258,6 +1527,7 @@ def write_report(
                     f"sum RMS `{sc['sum_rms_db']}` dB; image-weighted `{sc['sum_wrms_img_db']}` dB"
                 ),
                 f"- components: {format_component_summary(comp)}",
+                *trust_meter_lines(row, crossover_rows, getattr(args, "gate_ms", None)),
                 f"- left alone: {row.get('left_alone', '')}",
                 "",
             ])
@@ -1283,6 +1553,7 @@ def write_report(
                 f"image-weighted `{sc['sum_wrms_img_db']}` dB; worst `{sc['worst_dev_db']}` dB"
             ),
             component_line,
+            *trust_meter_lines(row, crossover_rows, getattr(args, "gate_ms", None)),
             f"- left alone: {row.get('left_alone', '')}",
             format_bands(row["groups"]),
             "",
@@ -1304,6 +1575,7 @@ def main() -> None:
     parser.add_argument("--filter-cost-scale", type=float, default=None)
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--min-total-bands", type=int, default=0)
+    parser.add_argument("--gate-ms", type=float, default=None, help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -1316,11 +1588,12 @@ def main() -> None:
     if args.filter_cost_scale is None:
         args.filter_cost_scale = 0.25 if args.profile == "explore" else 1.0
 
-    freqs, traces = load_measurements()
+    freqs, traces, rich_traces = load_measurements()
     raw_target = load_target(args.target, freqs)
     target = raw_target + target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
+    crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces)
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
@@ -1416,7 +1689,7 @@ def main() -> None:
             notes.append(f"{label} destructive-summing audit flagged: {pretty}.")
 
     write_family_aliases(out_dir, ranked_rows, base_xml)
-    write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows)
+    write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows, crossover_rows=crossover_rows)
 
     print("Optimizer complete")
     print("Output:", out_dir)

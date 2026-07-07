@@ -24,7 +24,16 @@ The math layer also includes optional confidence and timing helpers for future p
 - band-limited phase-delay estimation around crossover regions
 - gated impulse helpers that estimate how low a time window can be trusted
 
-Those helpers do not change the current PEQ-only optimizer by themselves. They are there so future loopback / impulse workflows can reuse the same repo instead of bolting phase tooling on later.
+Those helpers are now used in candidate reports when the measurement exports contain enough data. The optimizer still writes conservative PEQ only, but the report can inspect crossover bands such as sub-to-midbass and mid-to-tweeter for delay, polarity, phase stability, summation quality, and acoustic-sum agreement.
+
+Supported REW text export rows:
+
+- `freq spl`
+- `freq spl phase`
+- `freq spl phase coherence`
+- `freq spl phase coherence position_id`
+
+If you know the impulse/window gate length, pass `-GateMs` to the PowerShell launcher or `--gate-ms` to the Python scripts. The report will warn when a gated response should not be trusted below its lowest valid frequency.
 
 It is meant to be used through Claude or Codex:
 

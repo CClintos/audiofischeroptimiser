@@ -12,6 +12,7 @@ param(
     [int]$CmaPopulation = 0,
     [double]$MaxPositiveGainPenalty = 0.0,
     [double]$ValidationThreshold = 2.5,
+    [double]$GateMs = 0.0,
     [string]$DataRoot = "",
     [string]$Baseline = "",
     [string]$Target = ""
@@ -111,6 +112,9 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--resume",
         "--out", $out
     )
+    if ($GateMs -gt 0) {
+        $args += @("--gate-ms", "$GateMs")
+    }
 
     $argLine = Join-Args $args
     $p = Start-Process -FilePath $pythonExe `

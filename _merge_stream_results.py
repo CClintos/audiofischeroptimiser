@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--filter-cost-scale", type=float, default=0.1)
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--validation-threshold", type=float, default=2.5)
+    parser.add_argument("--gate-ms", type=float, default=None,
+                        help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     args = parser.parse_args()
 
     opt.sync_external_objective(args.baseline, args.target)
@@ -56,7 +58,7 @@ def main():
     if not items:
         raise SystemExit("No stream_state.json best candidates found under " + str(args.root))
 
-    freqs, traces = opt.load_measurements()
+    freqs, traces, rich_traces = opt.load_measurements()
     raw_target = opt.load_target(args.target, freqs)
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
@@ -129,10 +131,13 @@ def main():
         baseline=args.baseline,
         target=args.target,
         validation=validation,
+        gate_ms=args.gate_ms,
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
     )
-    opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns, family_rows=family_rows)
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns,
+                     family_rows=family_rows, crossover_rows=crossover_rows)
     print("Merged", len(worker_dirs), "workers into", out_dir)
     print("Total worker candidates:", len(items))
     print("Top objective:", rows[0]["objective"])

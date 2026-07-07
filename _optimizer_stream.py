@@ -627,7 +627,7 @@ def interference_notes(freqs, traces):
     return notes
 
 
-def write_outputs(out_dir, base_xml, freqs, traces, target, best, baseline_score, args,
+def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, baseline_score, args,
                   checkpoint=False, family_entries=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("candidate_*.afpx"):
@@ -643,7 +643,9 @@ def write_outputs(out_dir, base_xml, freqs, traces, target, best, baseline_score
         row["path"] = str(path)
     opt.write_family_aliases(out_dir, family_rows, base_xml)
     args.trials = args._completed_trials
-    opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), args, family_rows=family_rows)
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), args,
+                     family_rows=family_rows, crossover_rows=crossover_rows)
     status = [
         f"checkpoint={checkpoint}",
         f"completed_trials={args._completed_trials}",
@@ -685,6 +687,8 @@ def main():
     parser.add_argument("--max-positive-gain-penalty", type=float, default=0.0,
                         help="Reject candidates above this headroom penalty; 0 disables the hard gate.")
     parser.add_argument("--validation-threshold", type=float, default=2.5)
+    parser.add_argument("--gate-ms", type=float, default=None,
+                        help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from OUT\\stream_state.json if it exists.")
@@ -694,7 +698,7 @@ def main():
     opt.sync_external_objective(args.baseline, args.target)
     configure_profile(args.profile)
     rng = np.random.default_rng(args.seed)
-    freqs, traces = opt.load_measurements()
+    freqs, traces, rich_traces = opt.load_measurements()
     raw_target = opt.load_target(args.target, freqs)
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
@@ -787,6 +791,7 @@ def main():
                 base_xml,
                 freqs,
                 traces,
+                rich_traces,
                 target,
                 output_entries,
                 baseline_score,
@@ -804,7 +809,7 @@ def main():
     family_limit = max(args.top * 10, min(args.archive_size, 200))
     family_entries = combine_unique_entries(best, archive)[:family_limit]
     write_outputs(
-        args.out, base_xml, freqs, traces, target, output_entries, baseline_score, args, family_entries=family_entries
+        args.out, base_xml, freqs, traces, rich_traces, target, output_entries, baseline_score, args, family_entries=family_entries
     )
     print(f"stream optimizer complete: {trials} trials, {args._elapsed_seconds:.1f}s")
     if best:

@@ -4,7 +4,8 @@ param(
     [string]$DataRoot = "",
     [string]$Baseline = "",
     [string]$Target = "",
-    [double]$ValidationThreshold = 2.5
+    [double]$ValidationThreshold = 2.5,
+    [double]$GateMs = 0.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +49,7 @@ $env:AFPX_TARGET = $targetPath
 $args = @("_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"), "--top", "$Top", "--validation-threshold", "$ValidationThreshold")
 if ($Baseline -ne "") { $args += @("--baseline", $baselinePath) }
 if ($Target -ne "") { $args += @("--target", $targetPath) }
+if ($GateMs -gt 0) { $args += @("--gate-ms", "$GateMs") }
 $rootToken = "_merge_stream_results.py " + $Root
 $existing = Get-CimInstance Win32_Process |
     Where-Object {
