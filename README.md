@@ -106,6 +106,25 @@ Expected tune file:
 - [pct6.py](./pct6.py): beta `.pct6` decode / encode utility for no-password PC-Tool 6 saves
 - [PCT6_SUPPORT.md](./PCT6_SUPPORT.md): caveats and safe usage notes for `.pct6`
 
+## Compact Local Summaries
+
+These scripts are for Claude/Codex efficiency. They produce small JSON files so an assistant does not need to read raw logs, every candidate, or full measurement exports.
+
+- Every optimiser run now writes `optimizer_summary.json` beside `optimizer_report.md` and `optimizer_results.csv`.
+- [scripts/make_measurement_manifest.py](./scripts/make_measurement_manifest.py): checks which expected measurements exist, detects 2-way/3-way layout, and notes phase/coherence columns.
+- [scripts/summarise_optimizer_run.py](./scripts/summarise_optimizer_run.py): summarizes an optimizer output folder, preferring `optimizer_summary.json` with CSV fallback.
+- [scripts/summarise_candidate_filters.py](./scripts/summarise_candidate_filters.py): summarizes one candidate's added filters and risk flags.
+- [scripts/verify_written_tune.py](./scripts/verify_written_tune.py): verifies candidate AFPX files only changed intended fields.
+
+Useful examples:
+
+```powershell
+python .\scripts\make_measurement_manifest.py "C:\path\to\measurements"
+python .\scripts\summarise_optimizer_run.py ".\Optimizer_Run\_merged_top"
+python .\scripts\summarise_candidate_filters.py ".\Optimizer_Run\_merged_top\family_balanced.afpx" --baseline "C:\path\to\baseline.afpx"
+python .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_Run\_merged_top\family_balanced.afpx" --allow-delay --allow-apf
+```
+
 ## Safety / Scope
 
 This tool is intentionally conservative.

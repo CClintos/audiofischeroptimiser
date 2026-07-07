@@ -1,10 +1,11 @@
 """Optuna-based safe tuner search for REW TXT exports + Helix AFPX.
 
 This runner is deliberately conservative about what it writes:
-  - magnitude-only REW TXT input;
-  - PEQ cuts only, added in free middle slots;
+  - REW TXT input with optional phase/coherence columns;
+  - PEQ added in free middle slots;
   - per-side front PEQ is allowed so L/R balance can be scored and corrected;
-  - no delay, polarity, crossover, all-pass, shelf, or level writes.
+  - delay/APF writes only when phase-valid crossover evidence supports them;
+  - no polarity, crossover, shelf, or level writes.
 
 The optimizer searches extra filters on top of the supplied baseline tune, writes
 ranked candidate AFPX files, and leaves all input files untouched.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import math
 import os
 import re
@@ -1526,6 +1528,7 @@ def write_report(
 ) -> None:
     md = out_dir / "optimizer_report.md"
     csv_path = out_dir / "optimizer_results.csv"
+    json_path = out_dir / "optimizer_summary.json"
     family_source = list(family_rows) if family_rows is not None else list(rows)
     family_picks = select_family_rows(family_source)
     crossover_rows = crossover_rows or []
@@ -1563,6 +1566,70 @@ def write_report(
                 row["signature"],
             ])
 
+    summary_rows = []
+    for row in rows[:10]:
+        sc = row["score"]
+        comp = row.get("components", {})
+        summary_rows.append({
+            "rank": row["rank"],
+            "file": row["file"],
+            "objective": round(float(row["objective"]), 4),
+            "pareto_rank": row.get("pareto_rank", ""),
+            "family_role": row.get("family_role", ""),
+            "sum_rms_db": sc.get("sum_rms_db", ""),
+            "image_weighted_db": sc.get("sum_wrms_img_db", ""),
+            "worst_dev_db": sc.get("worst_dev_db", ""),
+            "filters": comp.get("filter_count", comp.get("n_front_bands", "")),
+            "headroom_penalty_db": comp.get("positive_gain_penalty_db", comp.get("headroom_peak", "")),
+            "components": {
+                key: comp.get(key, "")
+                for key in (
+                    "objective",
+                    "tonal_error_db",
+                    "sum_tonal_anchor_db",
+                    "presence_error_db",
+                    "balance_penalty_db",
+                    "positive_gain_penalty_db",
+                    "filter_count",
+                    "tonal_masked",
+                    "worst_masked",
+                    "mid_balance",
+                    "tweeter_balance",
+                    "guardrail_penalty",
+                    "unsupported_filter_penalty",
+                    "wasted_band_penalty",
+                    "asymmetric_eq_penalty",
+                )
+                if key in comp
+            },
+            "left_alone": row.get("left_alone", ""),
+        })
+    summary_payload = {
+        "run_folder": str(out_dir),
+        "baseline": str(args.baseline),
+        "target": str(args.target),
+        "trials": getattr(args, "trials", ""),
+        "candidate_count": len(rows),
+        "top_candidates": summary_rows,
+        "family_picks": {
+            role: {
+                "file": row.get("file", ""),
+                "objective": round(float(row.get("objective", 0.0)), 4),
+                "pareto_rank": row.get("pareto_rank", ""),
+            }
+            for role, row in family_picks.items()
+        },
+        "validation": getattr(args, "validation", []),
+        "crossover_phase_confidence": crossover_rows,
+        "written_phase_plan": phase_plan,
+        "generated_files": {
+            "report": str(md),
+            "csv": str(csv_path),
+            "summary_json": str(json_path),
+        },
+    }
+    json_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
     base_comp = baseline_score.get("components", {})
     baseline_line = (
         f"- sum RMS `{baseline_score['sum_rms_db']}` dB, "
@@ -1578,7 +1645,7 @@ def write_report(
         f"- Baseline: `{args.baseline}`",
         f"- Target: `{args.target}`",
         f"- Trials: `{args.trials}`",
-        "- Mode: MMM magnitude PEQ only; per-side front filters allowed; no delay/APF/crossover/shelf/level writes",
+        "- Mode: PEQ from magnitude data; optional delay/APF from phase-valid crossover data; no crossover/polarity/shelf/level writes",
         "- Objective: imported `afpx_objective.score_bands(band_sets)['objective']`; lower is better. Search-space guardrails restrict what candidates are generated, but no extra target-matching term is added.",
         "",
         "## Validation Gate",

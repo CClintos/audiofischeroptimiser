@@ -35,6 +35,12 @@ Optimizer_*/
 *.stdout.log
 *.stderr.log
 
+latest_measurement_manifest.json
+latest_run_summary.json
+latest_candidate_filter_summary.json
+latest_verify_written_tune.json
+TUNE_SESSION.md
+
 optimizer_app_only/
 
 rollout-*.jsonl
