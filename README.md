@@ -16,6 +16,14 @@ It scores candidates by:
 - whether each filter is on a driver that is actually contributing at that frequency
 - whether it avoids wasting filters, using unnecessary gain, or adding deep/narrow one-seat corrections
 
+The math layer also includes optional confidence and timing helpers for future phase-valid measurements:
+
+- coherence weighting, so low-trust bins count less
+- band-limited phase-delay estimation around crossover regions
+- gated impulse helpers that estimate how low a time window can be trusted
+
+Those helpers do not change the current PEQ-only optimizer by themselves. They are there so future loopback / impulse workflows can reuse the same repo instead of bolting phase tooling on later.
+
 It is meant to be used through Claude or Codex:
 
 1. Drag in your REW measurement text exports.

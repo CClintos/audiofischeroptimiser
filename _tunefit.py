@@ -533,6 +533,162 @@ def wrms(values, weights=None):
     den = np.sum(weights[ok] ** 2)
     return float(np.sqrt(np.sum((values[ok] * weights[ok]) ** 2) / den))
 
+def coherence_confidence(coherence, min_usable=0.35, full_trust=0.85, power=1.5):
+    """Map coherence-like confidence data onto a 0..1 trust weight."""
+    c = np.asarray(coherence, dtype=float)
+    if full_trust <= min_usable:
+        raise ValueError('full_trust must be greater than min_usable')
+    w = np.clip((c - min_usable) / (full_trust - min_usable), 0.0, 1.0)
+    return np.power(w, power)
+
+def coherence_weighted_db_average(db_traces, coherence_traces=None, min_usable=0.35):
+    """Average dB traces in linear power, down-weighting low-confidence bins."""
+    mags = np.asarray(db_traces, dtype=float)
+    if mags.ndim == 1:
+        mags = mags[None, :]
+    powers = 10 ** (mags / 10.0)
+    if coherence_traces is None:
+        weights = np.ones_like(powers)
+    else:
+        coh = np.asarray(coherence_traces, dtype=float)
+        if coh.ndim == 1:
+            coh = coh[None, :]
+        weights = coherence_confidence(coh, min_usable=min_usable)
+    den = np.sum(weights, axis=0)
+    den = np.where(den > 1e-12, den, np.nan)
+    avg_power = np.nansum(powers * weights, axis=0) / den
+    return 10.0 * np.log10(np.maximum(avg_power, 1e-12))
+
+def band_limited_delay_from_phase(freqs, phase_diff_deg, band, coherence=None):
+    """Estimate relative delay from phase-vs-frequency slope inside one band."""
+    freqs = np.asarray(freqs, dtype=float)
+    phase = np.unwrap(np.deg2rad(np.asarray(phase_diff_deg, dtype=float)))
+    sel = np.isfinite(freqs) & np.isfinite(phase) & (freqs >= band[0]) & (freqs <= band[1])
+    if coherence is not None:
+        conf = coherence_confidence(coherence)
+        sel &= np.isfinite(conf) & (conf > 0)
+        weights = conf[sel]
+    else:
+        weights = np.ones(np.count_nonzero(sel), dtype=float)
+    if np.count_nonzero(sel) < 3:
+        return {'delay_ms': 0.0, 'rms_phase_err_deg': float('inf'), 'usable': False}
+    x = freqs[sel]
+    y_deg = np.rad2deg(phase[sel])
+    X = np.vstack([x, np.ones_like(x)]).T
+    sw = np.sqrt(np.maximum(weights, 1e-9))
+    beta, *_ = np.linalg.lstsq(X * sw[:, None], y_deg * sw, rcond=None)
+    slope_deg_per_hz, intercept_deg = beta
+    fit = slope_deg_per_hz * x + intercept_deg
+    rms = wrms(y_deg - fit, weights)
+    delay_ms = -slope_deg_per_hz / 360.0 * 1000.0
+    return {'delay_ms': round(float(delay_ms), 4),
+            'rms_phase_err_deg': round(float(rms), 3),
+            'usable': bool(np.isfinite(rms) and rms < 60.0)}
+
+def gate_low_frequency_limit(gate_ms, cycles=1.0):
+    gate_ms = float(gate_ms)
+    if gate_ms <= 0:
+        return float('inf')
+    return float(1000.0 * cycles / gate_ms)
+
+def gate_frequency_confidence(freqs, gate_ms, cycles=1.0, transition_oct=0.5):
+    """Return a soft trust ramp above the gate-limited LF boundary."""
+    freqs = np.asarray(freqs, dtype=float)
+    flo = gate_low_frequency_limit(gate_ms, cycles=cycles)
+    if not np.isfinite(flo) or flo <= 0:
+        return np.zeros_like(freqs)
+    hi = flo * (2 ** transition_oct)
+    conf = np.zeros_like(freqs, dtype=float)
+    conf[freqs >= hi] = 1.0
+    mid = (freqs > flo) & (freqs < hi)
+    if np.any(mid):
+        t = np.log2(freqs[mid] / flo) / max(transition_oct, 1e-6)
+        conf[mid] = 0.5 - 0.5 * np.cos(np.pi * np.clip(t, 0.0, 1.0))
+    return conf
+
+def suggest_gate_from_impulse(impulse, sample_rate_hz, direct_index=None,
+                              ignore_ms=0.35, threshold_db=-12.0, max_ms=50.0):
+    """Suggest a post-direct gate that ends before the first strong reflection."""
+    x = np.abs(np.asarray(impulse, dtype=float))
+    if x.size == 0:
+        return {'gate_ms': 0.0, 'reflection_index': None, 'usable': False}
+    sr = float(sample_rate_hz)
+    direct = int(np.argmax(x) if direct_index is None else direct_index)
+    ignore = int(round(ignore_ms * sr / 1000.0))
+    limit = min(len(x), direct + int(round(max_ms * sr / 1000.0)))
+    thresh = x[direct] * (10 ** (threshold_db / 20.0))
+    refl = None
+    for idx in range(min(len(x) - 1, direct + ignore), limit):
+        if x[idx] >= thresh:
+            refl = idx
+            break
+    if refl is None:
+        gate_samples = max(1, limit - direct)
+    else:
+        gate_samples = max(1, refl - direct)
+    gate_ms = 1000.0 * gate_samples / sr
+    return {'gate_ms': round(float(gate_ms), 3),
+            'reflection_index': refl,
+            'usable': bool(gate_samples > 2)}
+
+def _raised_cosine_bandpass_weights(freqs, band, edge_oct=0.5):
+    freqs = np.asarray(freqs, dtype=float)
+    lo, hi = map(float, band)
+    if lo <= 0 or hi <= lo:
+        raise ValueError('invalid band')
+    floor = 0.0
+    w = np.ones_like(freqs, dtype=float)
+    below = freqs < lo
+    above = freqs > hi
+    w[below] = np.clip(1.0 - np.log2(lo / np.maximum(freqs[below], 1e-9)) / edge_oct, floor, 1.0)
+    w[above] = np.clip(1.0 - np.log2(np.maximum(freqs[above], 1e-9) / hi) / edge_oct, floor, 1.0)
+    return 0.5 - 0.5 * np.cos(np.pi * np.clip(w, 0.0, 1.0))
+
+def bandpass_impulse(impulse, sample_rate_hz, band, edge_oct=0.5):
+    """FFT-domain soft bandpass for impulse-domain timing work."""
+    x = np.asarray(impulse, dtype=float)
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / float(sample_rate_hz))
+    weights = _raised_cosine_bandpass_weights(np.maximum(freqs, 1e-9), band, edge_oct=edge_oct)
+    weights[0] = 0.0
+    return np.fft.irfft(spec * weights, n=len(x))
+
+def band_limited_impulse_delay(impulse_a, impulse_b, sample_rate_hz, band,
+                               max_lag_ms=5.0, gate_ms=None, edge_oct=0.5):
+    """Estimate relative delay and polarity from band-limited impulses."""
+    a = np.asarray(impulse_a, dtype=float)
+    b = np.asarray(impulse_b, dtype=float)
+    n = min(len(a), len(b))
+    if n == 0:
+        return {'delay_ms': 0.0, 'polarity': 'same', 'usable': False}
+    a = a[:n]
+    b = b[:n]
+    max_lag = max(1, int(round(float(max_lag_ms) * sample_rate_hz / 1000.0)))
+    if gate_ms is not None and gate_ms > 0:
+        gate_n = min(n, max(8, int(round(float(gate_ms) * sample_rate_hz / 1000.0))))
+        peak_a = int(np.argmax(np.abs(a)))
+        peak_b = int(np.argmax(np.abs(b)))
+        start = max(0, min(peak_a, peak_b) - max_lag)
+        stop = min(n, start + gate_n)
+        a = a[start:stop]
+        b = b[start:stop]
+    af = bandpass_impulse(a, sample_rate_hz, band, edge_oct=edge_oct)
+    bf = bandpass_impulse(b, sample_rate_hz, band, edge_oct=edge_oct)
+    corr = np.correlate(bf, af, mode='full')
+    lags = np.arange(-len(af) + 1, len(af))
+    keep = np.abs(lags) <= max_lag
+    corr = corr[keep]
+    lags = lags[keep]
+    idx = int(np.argmax(np.abs(corr)))
+    lag = int(lags[idx])
+    peak = float(corr[idx])
+    energy = np.sqrt(np.sum(af ** 2) * np.sum(bf ** 2)) + 1e-12
+    usable = bool(abs(peak) / energy > 0.15)
+    return {'delay_ms': round(float(1000.0 * lag / sample_rate_hz), 4),
+            'polarity': 'inverted' if peak < 0 else 'same',
+            'usable': usable,
+            'corr_norm': round(float(abs(peak) / energy), 4)}
+
 def local_peak_q_proxy(freqs, local_db, min_prom_db=0.5):
     """Approximate how narrow/prominent positive local excess is.
 
@@ -1057,6 +1213,42 @@ if __name__ == '__main__':
           % (r14['rms_err_db'], r14['grade'], r14['level_bias_db'], r14b['rms_err_db'], r14b['grade']))
     assert r14['usable_for_phase_decisions'] and abs(r14['level_bias_db'] + 3.0) < 0.2
     assert not r14b['usable_for_phase_decisions']
+
+    # ---- TEST14b: coherence / gated impulse helpers -------------------------
+    db_bad = np.vstack([np.zeros_like(freqs), np.full_like(freqs, 10.0)])
+    coh14 = np.vstack([np.full_like(freqs, 0.95), np.full_like(freqs, 0.05)])
+    avg14 = coherence_weighted_db_average(db_bad, coh14)
+    print('TEST14b coherence-weighted average @1k: %.2f dB' % avg14[int(np.argmin(np.abs(freqs - 1000)))])
+    assert abs(avg14[int(np.argmin(np.abs(freqs - 1000)))]) < 1.0
+
+    tau_ms = 0.4
+    ph_diff = -360.0 * freqs * (tau_ms / 1000.0)
+    dfit = band_limited_delay_from_phase(freqs, ph_diff, (500.0, 5000.0),
+                                         coherence=np.full_like(freqs, 0.95))
+    print('TEST14b phase-delay fit:', dfit)
+    assert dfit['usable'] and abs(dfit['delay_ms'] - tau_ms) < 0.03
+
+    fs22 = 48000.0
+    n22 = 4096
+    a22 = np.zeros(n22, dtype=float)
+    b22 = np.zeros(n22, dtype=float)
+    a22[1000] = 1.0
+    a22[1192] = 0.35   # first reflection 4 ms later
+    b22[1048] = 1.0    # B is 1 ms later
+    gate22 = suggest_gate_from_impulse(a22, fs22, direct_index=1000, ignore_ms=0.2, threshold_db=-12.0)
+    conf22 = gate_frequency_confidence(freqs, gate22['gate_ms'])
+    a23 = np.zeros(n22, dtype=float)
+    b23 = np.zeros(n22, dtype=float)
+    a23[64] = 1.0
+    b23[112] = 1.0
+    d22 = band_limited_impulse_delay(a23, b23, fs22, (500.0, 5000.0))
+    i250 = int(np.argmin(np.abs(freqs - 250.0)))
+    i1k = int(np.argmin(np.abs(freqs - 1000.0)))
+    print('TEST14b gate/impulse helpers: gate=%sms delay=%sms polarity=%s conf250=%.2f conf1k=%.2f'
+          % (gate22['gate_ms'], d22['delay_ms'], d22['polarity'], conf22[i250], conf22[i1k]))
+    assert abs(gate22['gate_ms'] - 4.0) < 0.2
+    assert conf22[i250] < 0.55 and conf22[i1k] > 0.95
+    assert d22['usable'] and d22['polarity'] == 'same' and abs(d22['delay_ms'] - 1.0) < 0.05
 
     # ---- TEST15: scorecard + gain rung ---------------------------------------
     tr15 = {'System Sum': tgt_like + 2.0 * np.sin(np.log(freqs)),
