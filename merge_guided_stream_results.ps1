@@ -6,7 +6,9 @@ param(
     [string]$Target = "",
     [double]$ValidationThreshold = 2.5,
     [double]$GateMs = 0.0,
-    [double]$SampleRate = 96000.0
+    [double]$SampleRate = 96000.0,
+    [ValidateSet("auto", "off")]
+    [string]$PhaseWrites = "auto"
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +54,7 @@ if ($Baseline -ne "") { $args += @("--baseline", $baselinePath) }
 if ($Target -ne "") { $args += @("--target", $targetPath) }
 if ($GateMs -gt 0) { $args += @("--gate-ms", "$GateMs") }
 $args += @("--sample-rate", "$SampleRate")
+$args += @("--phase-writes", "$PhaseWrites")
 $rootToken = "_merge_stream_results.py " + $Root
 $existing = Get-CimInstance Win32_Process |
     Where-Object {

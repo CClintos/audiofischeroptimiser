@@ -14,6 +14,8 @@ param(
     [double]$ValidationThreshold = 2.5,
     [double]$GateMs = 0.0,
     [double]$SampleRate = 96000.0,
+    [ValidateSet("auto", "off")]
+    [string]$PhaseWrites = "auto",
     [string]$DataRoot = "",
     [string]$Baseline = "",
     [string]$Target = ""
@@ -109,6 +111,7 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--max-positive-gain-penalty", "$MaxPositiveGainPenalty",
         "--validation-threshold", "$ValidationThreshold",
         "--sample-rate", "$SampleRate",
+        "--phase-writes", "$PhaseWrites",
         "--checkpoint-seconds", "60",
         "--seed", "$seed",
         "--resume",

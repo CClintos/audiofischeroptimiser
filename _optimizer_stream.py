@@ -638,7 +638,7 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     rows = build_rows(freqs, traces, target, best, component_score)
     family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
     crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
-    phase_plan = opt.phase_write_plan(crossover_rows, args.sample_rate)
+    phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
     for row in rows:
         path = out_dir / row["file"]
         row["lint"] = opt.write_candidate(base_xml, path, row["groups"], phase_plan=phase_plan)
@@ -692,6 +692,8 @@ def main():
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--sample-rate", type=float, default=96000.0,
                         help="DSP internal sample rate used for delay writes.")
+    parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
+                        help="Use 'off' to report phase diagnostics without writing delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from OUT\\stream_state.json if it exists.")

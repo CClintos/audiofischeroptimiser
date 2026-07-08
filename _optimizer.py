@@ -1784,6 +1784,8 @@ def main() -> None:
     parser.add_argument("--min-total-bands", type=int, default=0)
     parser.add_argument("--gate-ms", type=float, default=None, help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--sample-rate", type=float, default=96000.0, help="DSP internal sample rate used for delay writes.")
+    parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
+                        help="Use 'off' to report phase diagnostics without writing delay/APF changes.")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -1802,7 +1804,7 @@ def main() -> None:
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
     crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces)
-    phase_plan = phase_write_plan(crossover_rows, args.sample_rate)
+    phase_plan = [] if args.phase_writes == "off" else phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
