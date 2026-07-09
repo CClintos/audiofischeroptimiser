@@ -279,11 +279,11 @@ class PhaseSearch:
         return out
 
 
-def random_candidate(rng: random.Random) -> Candidate:
+def random_candidate(rng: random.Random, args: argparse.Namespace) -> Candidate:
     # Delay samples are absolute deltas from the tune that was measured. Negative
     # means the tweeter is advanced; positive means delayed.
-    fl = int(round(rng.triangular(-34, 8, -14)))
-    fr = int(round(rng.triangular(-20, 20, 0)))
+    fl = int(round(rng.triangular(args.fl_min_samples, args.fl_max_samples, args.fl_mode_samples)))
+    fr = int(round(rng.triangular(args.fr_min_samples, args.fr_max_samples, args.fr_mode_samples)))
     fl_apf_f = fl_apf_q = fr_apf_f = fr_apf_q = 0.0
     if rng.random() < 0.28:
         fl_apf_f = float(math.exp(rng.uniform(math.log(1900.0), math.log(4400.0))))
@@ -301,12 +301,33 @@ def random_candidate(rng: random.Random) -> Candidate:
     )
 
 
-def seed_candidates() -> Iterable[Candidate]:
-    for fl in (-22, -18, -16, -15, -14, -13, -12, -10, -8, -6, 0):
-        yield Candidate(fl, 0)
-    yield Candidate(-14, 0, 2600.0, 0.7, 0.0, 0.0)
-    yield Candidate(-14, 0, 3200.0, 0.8, 0.0, 0.0)
-    yield Candidate(-14, 0, 0.0, 0.0, 2600.0, 0.7)
+def seed_candidates(args: argparse.Namespace) -> Iterable[Candidate]:
+    for fl in sorted(set((
+        0,
+        args.fl_mode_samples,
+        args.fl_min_samples,
+        args.fl_max_samples,
+        args.fl_mode_samples - 4,
+        args.fl_mode_samples - 2,
+        args.fl_mode_samples - 1,
+        args.fl_mode_samples + 1,
+        args.fl_mode_samples + 2,
+        args.fl_mode_samples + 4,
+    ))):
+        if args.fl_min_samples <= fl <= args.fl_max_samples:
+            yield Candidate(int(fl), 0)
+    for fr in sorted(set((
+        args.fr_mode_samples - 4,
+        args.fr_mode_samples - 2,
+        args.fr_mode_samples,
+        args.fr_mode_samples + 2,
+        args.fr_mode_samples + 4,
+    ))):
+        if args.fr_min_samples <= fr <= args.fr_max_samples:
+            yield Candidate(0, int(fr))
+    yield Candidate(args.fl_mode_samples, 0, 2600.0, 0.7, 0.0, 0.0)
+    yield Candidate(args.fl_mode_samples, 0, 3200.0, 0.8, 0.0, 0.0)
+    yield Candidate(args.fl_mode_samples, 0, 0.0, 0.0, 2600.0, 0.7)
 
 
 def signature(cand: Candidate) -> Tuple[object, ...]:
@@ -339,12 +360,12 @@ def worker_main(worker_id: int, args: argparse.Namespace, deadline: float) -> No
                 heapq.heapreplace(top, item)
         completed += 1
 
-    for cand in seed_candidates():
+    for cand in seed_candidates(args):
         consider(cand)
 
     last_save = 0.0
     while time.time() < deadline:
-        consider(random_candidate(rng))
+        consider(random_candidate(rng, args))
         now = time.time()
         if now - last_save >= args.checkpoint_seconds:
             save_worker_state(worker_dir / "state.json", top, completed, args, search.diagnostics())
@@ -493,6 +514,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--sample-rate", type=float, default=96000.0)
     parser.add_argument("--seed", type=int, default=260708)
+    parser.add_argument("--fl-min-samples", type=int, default=-34)
+    parser.add_argument("--fl-max-samples", type=int, default=8)
+    parser.add_argument("--fl-mode-samples", type=int, default=-14)
+    parser.add_argument("--fr-min-samples", type=int, default=-20)
+    parser.add_argument("--fr-max-samples", type=int, default=20)
+    parser.add_argument("--fr-mode-samples", type=int, default=0)
     parser.add_argument("--archive-size", type=int, default=500)
     parser.add_argument("--checkpoint-seconds", type=int, default=30)
     parser.add_argument("--top", type=int, default=20)
