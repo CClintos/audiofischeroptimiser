@@ -52,6 +52,8 @@ def main():
                         help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--impulse-root", type=Path, default=None,
                         help="Optional folder containing companion WAV/text impulse exports.")
+    parser.add_argument("--phase-cache", type=Path, default=None,
+                        help="Shared fingerprinted crossover diagnostic cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
@@ -74,7 +76,9 @@ def main():
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
+    crossover_rows, phase_diagnostic_cache = opt.cached_crossover_phase_diagnostics(
+        args.phase_cache, freqs, traces, rich_traces, measurement_session, args.impulse_root
+    )
     opt.apply_session_phase_validity(crossover_rows, measurement_session["audit"])
     phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in validation if not item["pass"]]
@@ -167,6 +171,8 @@ def main():
         level_calibration=args.level_calibration,
         measurement_session=measurement_session,
         phase_peq_rejections=phase_peq_rejections[:20],
+        phase_cache=args.phase_cache,
+        phase_diagnostic_cache=phase_diagnostic_cache,
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
     )

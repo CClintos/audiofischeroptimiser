@@ -2,14 +2,16 @@ param(
     [string]$Root = "Optimizer_Component_20min_70cpu",
     [int]$Workers = 11,
     [int]$Seconds = 1200,
-    [int]$StartSeed = 2026070800,
+    [int]$StartSeed = 20260711,
     [int]$Top = 20,
     [int]$Keep = 80,
     [int]$ArchiveSize = 6000,
-    [ValidateSet("guided", "random", "mixed", "cmaes")]
+    [ValidateSet("guided", "random", "mixed", "cmaes", "beam")]
     [string]$Proposal = "guided",
     [double]$CmaSigma = 0.18,
     [int]$CmaPopulation = 0,
+    [int]$BeamWidth = 24,
+    [int]$BeamPoolLimit = 6,
     [double]$MaxPositiveGainPenalty = 0.0,
     [double]$ValidationThreshold = 2.5,
     [double]$GateMs = 0.0,
@@ -20,7 +22,8 @@ param(
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
     [string]$Baseline = "",
-    [string]$Target = ""
+    [string]$Target = "",
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +41,7 @@ function Join-Args([string[]]$Items) {
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
-$pythonExe = Join-Path $here ".venv\Scripts\python.exe"
+$pythonExe = if ($PythonExe -ne "") { $PythonExe } else { Join-Path $here ".venv\Scripts\python.exe" }
 if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Missing Python runtime at $pythonExe"
 }
@@ -48,6 +51,7 @@ $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPa
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
+$phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
 
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -67,28 +71,19 @@ $env:AFPX_DATA_ROOT = $dataRootPath
 $env:AFPX_BASELINE = $baselinePath
 $env:AFPX_TARGET = $targetPath
 
-$measurementNames = @(
-    @("System Sum.txt", "SYSTEM SUM.txt"),
-    @("Sub.txt", "SUB.txt"),
-    @("Front L High.txt", "Front L Tweeter.txt"),
-    @("Front R High.txt", "Front R Tweeter.txt"),
-    @("Front L Low.txt", "Front L Mid.txt", "Front L MID.txt"),
-    @("Front R Low.txt", "Front R Mid.txt", "Front R MID.txt"),
-    @("Tweeters Together.txt", "Both Tweeters.txt"),
-    @("Mid Bass Together.txt", "Both Mids.txt")
+$cacheArgs = @(
+    "scripts\prepare_phase_cache.py",
+    "--data-root", $dataRootPath,
+    "--baseline", $baselinePath,
+    "--target", $targetPath,
+    "--out", $phaseCachePath,
+    "--validation-threshold", "$ValidationThreshold",
+    "--print-mode", "none"
 )
-foreach ($aliases in $measurementNames) {
-    $found = $false
-    foreach ($name in $aliases) {
-        if (Test-Path -LiteralPath (Join-Path $dataRootPath $name)) {
-            $found = $true
-            break
-        }
-    }
-    if (-not $found) {
-        throw "Missing required measurement file. Tried: $($aliases -join ', ') in $dataRootPath"
-    }
-}
+if ($impulseRootPath -ne "") { $cacheArgs += @("--impulse-root", $impulseRootPath) }
+if ($levelCalibrationPath -ne "") { $cacheArgs += @("--level-calibration", $levelCalibrationPath) }
+& $pythonExe @cacheArgs
+if ($LASTEXITCODE -ne 0) { throw "Phase diagnostic cache preparation failed." }
 
 $started = @()
 for ($i = 1; $i -le $Workers; $i++) {
@@ -112,10 +107,13 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--min-total-bands", "0",
         "--cma-sigma", "$CmaSigma",
         "--cma-population", "$CmaPopulation",
+        "--beam-width", "$BeamWidth",
+        "--beam-pool-limit", "$BeamPoolLimit",
         "--max-positive-gain-penalty", "$MaxPositiveGainPenalty",
         "--validation-threshold", "$ValidationThreshold",
         "--sample-rate", "$SampleRate",
         "--phase-writes", "$PhaseWrites",
+        "--phase-cache", $phaseCachePath,
         "--checkpoint-seconds", "60",
         "--seed", "$seed",
         "--resume",
@@ -173,6 +171,7 @@ if ($failed.Count -gt 0) {
 }
 
 $started | Format-Table -AutoSize
+$started | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root "worker_processes.json") -Encoding UTF8
 Write-Host ""
 Write-Host "Started $Workers guided streaming workers for $Seconds seconds."
 Write-Host "Run this same script again with the same -Root to resume/continue."

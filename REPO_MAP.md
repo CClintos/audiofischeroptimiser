@@ -10,6 +10,7 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 - `_merge_stream_results.py`: merges worker outputs into ranked merged results.
 - `run_guided_stream_workers.ps1`: preferred launcher for long local stream runs.
 - `merge_guided_stream_results.ps1`: preferred merge wrapper after worker runs complete.
+- `run_optimizer.ps1`: one-command bounded run, merge, verification, and compact result path.
 
 ## Core Logic Areas
 
@@ -23,7 +24,9 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 
 - `_benchmark.py`: benchmark/check script for scoring changes.
 - `scripts/make_measurement_manifest.py`: fast measurement inventory and layout detection.
-- `scripts/summarise_optimizer_run.py`: compact run summary, prefers `optimizer_summary.json`.
+- `scripts/summarise_optimizer_run.py`: compact run summary, prefers `assistant_summary.json`.
+- `scripts/prepare_phase_cache.py`: shared fingerprinted crossover audit preparation.
+- `scripts/benchmark_search_methods.py`: equal-budget search architecture comparison.
 - `scripts/summarise_candidate_filters.py`: compact filter/risk summary for one candidate.
 - `scripts/verify_written_tune.py`: verifies that written tune files changed only intended fields.
 

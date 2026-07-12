@@ -46,6 +46,16 @@ After workers finish:
 powershell -ExecutionPolicy Bypass -File .\merge_guided_stream_results.ps1
 ```
 
+## One-Command Run
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_optimizer.ps1 -DataRoot "C:\path\to\measurements"
+```
+
+This validates inputs, chooses a bounded worker count, reuses the fingerprinted
+phase audit, runs/resumes, merges, verifies family AFPX files, and prints only
+the final `assistant_summary.json` path. Beam is the default proposal.
+
 ## Benchmark For Scoring Changes
 
 ```powershell
@@ -53,6 +63,12 @@ py -3 .\_benchmark.py
 ```
 
 Required when changing scoring or candidate selection logic. Record before/after behaviour, not just whether it ran.
+
+For equal-budget architecture comparisons:
+
+```powershell
+py -3 .\scripts\benchmark_search_methods.py --data-root "C:\path\to\measurements" --baseline "C:\path\to\baseline.afpx" --target ".\ResoNix Target Curve 2026.txt"
+```
 
 ## Regression Suite
 

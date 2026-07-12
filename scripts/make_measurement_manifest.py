@@ -17,6 +17,10 @@ LOW_PAIR = ("Mid Bass Together.txt", "Both Midbass.txt", "Both Midbasses.txt", "
 SUB = ("Sub.txt", "SUB.txt", "Subwoofer.txt")
 SYSTEM = ("System Sum.txt", "SYSTEM SUM.txt")
 HIGH_PAIR = ("Tweeters Together.txt", "Both Tweeters.txt")
+POSITION_PREFIXES = {
+    "left": ("Left Ear ", "Left "),
+    "right": ("Right Ear ", "Right "),
+}
 
 
 def first_existing(root: Path, aliases: tuple[str, ...]) -> Path | None:
@@ -24,6 +28,15 @@ def first_existing(root: Path, aliases: tuple[str, ...]) -> Path | None:
         p = root / name
         if p.exists():
             return p
+    return None
+
+
+def first_position_existing(root: Path, prefixes: tuple[str, ...], aliases: tuple[str, ...]) -> Path | None:
+    for prefix in prefixes:
+        for alias in aliases:
+            for path in (root / (prefix + alias), root / prefix.strip() / alias):
+                if path.exists():
+                    return path
     return None
 
 
@@ -130,6 +143,7 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
     position_files: list[str] = []
     metadata: dict[str, dict[str, object]] = {}
     impulse_files: dict[str, str] = {}
+    spatial_bundles: dict[str, dict[str, str]] = {}
 
     for role, aliases in spec.items():
         found = first_existing(root, aliases)
@@ -150,6 +164,19 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
         if info["position_id"]:
             position_files.append(found.name)
 
+    for position, prefixes in POSITION_PREFIXES.items():
+        bundle = {}
+        for role, aliases in spec.items():
+            found = first_position_existing(root, prefixes, aliases)
+            if found is not None:
+                bundle[role] = str(found)
+                if role == "System Sum":
+                    key = f"{position}:System Sum"
+                    resolved[key] = str(found)
+                    metadata[key] = rew_metadata(found)
+        if bundle:
+            spatial_bundles[position] = bundle
+
     baseline_path = baseline or first_existing(root, ("baseline.afpx",))
     target_path = target or first_existing(root, ("ResoNix Target Curve 2026.txt", "target.txt"))
     phase_available = len(phase_files) >= 2
@@ -165,7 +192,11 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
     volumes = sorted({info["source_volume"] for info in metadata.values() if info["source_volume"] is not None})
     if len(volumes) > 1:
         warnings.append("measurement_source_volume_changed")
-    timing_refs = sorted({str(info["timing_reference"]) for info in metadata.values() if info["timing_reference"]})
+    timing_refs = sorted({
+        str(info["timing_reference"])
+        for role, info in metadata.items()
+        if ":" not in role and info["timing_reference"]
+    })
     if len(timing_refs) > 1:
         warnings.append("mixed_timing_references")
     grids = {
@@ -179,8 +210,11 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
         warnings.append("phase_unavailable_impulse_timing_only")
     elif not phase_available:
         warnings.append("phase_unavailable_peq_only")
-    delays = [float(info["delay_ms"]) for info in metadata.values() if info["delay_ms"] is not None]
-
+    delays = [
+        float(info["delay_ms"])
+        for role, info in metadata.items()
+        if ":" not in role and info["delay_ms"] is not None
+    ]
     return {
         "measurement_folder": str(root),
         "baseline_afpx": str(baseline_path) if baseline_path else "",
@@ -195,6 +229,7 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
         "phase_files": sorted(phase_files),
         "coherence_files": sorted(coherence_files),
         "position_id_files": sorted(position_files),
+        "spatial_bundles": spatial_bundles,
         "impulse_files": impulse_files,
         "measurement_metadata": metadata,
         "measurement_conditions": {
@@ -220,6 +255,7 @@ def compact_manifest(manifest: dict[str, object]) -> dict[str, object]:
         "phase_file_count": len(manifest["phase_files"]),
         "coherence_file_count": len(manifest["coherence_files"]),
         "impulse_file_count": len(manifest["impulse_files"]),
+        "spatial_positions": sorted(manifest.get("spatial_bundles", {})),
         "warnings": manifest["warnings"],
     }
 

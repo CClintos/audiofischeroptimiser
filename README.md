@@ -19,6 +19,7 @@ It scores candidates by:
 - whether the tune avoids boosting into destructive cancellation nulls
 - whether each filter is on a driver that is actually contributing at that frequency
 - whether it avoids wasting filters, using unnecessary gain, or adding deep/narrow one-seat corrections
+- whether corrections hold across optional centre/left-ear/right-ear system sums
 
 The math layer also includes confidence and timing helpers for phase-valid measurements:
 
@@ -50,6 +51,11 @@ It is meant to be used through Claude or Codex:
 2. Drag in your baseline `.afpx` tune.
 3. Optionally drag in your target curve text file.
 4. Ask Claude or Codex to use this repo as a local AFPX optimizer and run it.
+
+The normal local entry point is `run_optimizer.ps1`. It validates the session,
+uses a bounded worker count, prepares phase diagnostics once, runs/resumes the
+search, merges and verifies family candidates, then prints only the path to
+`assistant_summary.json`.
 
 Suggested prompt:
 
@@ -106,6 +112,7 @@ Expected tune file:
 
 - [_optimizer.py](./_optimizer.py): core scoring, prediction, AFPX writing, reporting
 - [_optimizer_stream.py](./_optimizer_stream.py): constant-memory multi-worker optimizer
+- [run_optimizer.ps1](./run_optimizer.ps1): one-command validate/run/merge/verify wrapper
 - [_merge_stream_results.py](./_merge_stream_results.py): merges worker archives into final outputs
 - [run_guided_stream_workers.ps1](./run_guided_stream_workers.ps1): launches long local runs
 - [merge_guided_stream_results.ps1](./merge_guided_stream_results.ps1): safe merge wrapper
@@ -128,6 +135,8 @@ These scripts are for Claude/Codex efficiency. They produce small JSON files so 
 - `optimizer_summary.json`, `optimizer_report.md`, and `optimizer_results.csv` retain the full local detail when the compact decision core is insufficient.
 - Console helpers default to compact output while retaining full JSON/Markdown/CSV files locally. Use `--print-mode full` only when the extra detail is needed.
 - [scripts/make_measurement_manifest.py](./scripts/make_measurement_manifest.py): resolves common REW filename aliases, detects 2-way/3-way layout and phase/coherence columns, and warns about inconsistent source level, timing reference, or frequency grids.
+- [scripts/prepare_phase_cache.py](./scripts/prepare_phase_cache.py): fingerprints and prepares the crossover audit once per session.
+- [scripts/benchmark_search_methods.py](./scripts/benchmark_search_methods.py): equal-seed/equal-time guided, beam, and CMA comparison.
 - [scripts/summarise_optimizer_run.py](./scripts/summarise_optimizer_run.py): summarizes an optimizer output folder, preferring `assistant_summary.json`, then the full JSON, with CSV fallback.
 - [scripts/summarise_candidate_filters.py](./scripts/summarise_candidate_filters.py): summarizes one candidate's added filters and risk flags.
 - [scripts/verify_written_tune.py](./scripts/verify_written_tune.py): verifies candidate AFPX files only changed intended fields.

@@ -32,6 +32,11 @@ record.
   grid, and phase is unwrapped before interpolation.
 - Top candidates receive hardware-step coordinate refinement against the same
   named objective.
+- Optional left-ear/right-ear system sums are discovered automatically. The
+  scalar combines centre-weighted median, 80th-percentile, and worst-position
+  error; narrow/asymmetric filters are penalized when they fail at an ear.
+- The one-command runner defaults to deterministic seed-sharded beam search.
+  Guided/CMA remain available for comparisons and fallback runs.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
 - `assistant_summary.json` contains only the decision core; `optimizer_summary.json`
   retains full settings, validation, phase confidence, components, and refinement.
@@ -55,6 +60,9 @@ record.
 - Internal objective values retain full precision; rounding is report-only.
 - A baseline candidate is always retained, so a short run cannot recommend a
   generated PEQ candidate that scores worse than the loaded tune.
+- Immutable baseline cascades, ERB windows, solo references, contribution
+  totals, and hardware-rounded PEQ responses are cached without changing the
+  golden objective.
 
 ## Crossover Ladder
 
@@ -95,6 +103,8 @@ record.
   `Both Mids/Tweeters`, and `Sub/Subwoofer` forms.
 - Source-level changes can still support timing, but not raw level comparison
   unless an explicit role/file dB calibration JSON is supplied.
+- Position bundles use `Left Ear ` / `Right Ear ` filename prefixes or matching
+  subfolders. Centre measurements remain required; spatial bundles are optional.
 - Three-position measurements improve spatial confidence; fixed-position solos
   and together pairs remain necessary for coherent prediction.
 - The manifest reports missing inputs, level/reference changes, phase/coherence,
@@ -111,7 +121,7 @@ record.
 
 ## Verified State
 
-- Seventeen regression tests pass, including objective invariants, session gates,
+- Twenty-three regression tests pass, including objective invariants, session gates,
   crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity
@@ -123,6 +133,11 @@ record.
 - A historical real-data smoke candidate changed only the supported six-sample
   delay; independent verification found no crossover, PEQ, polarity, output,
   time-alignment-attribute, or unknown-field changes.
+- P1 equal-budget benchmark (10 seconds, seed `20260712`): beam `10.530787`,
+  guided/CMA `10.917834`; beam also completed with lower wall time.
+- Repeated exact scoring on the three-position historical set measured about
+  `214.6 scores/s`; the P0 snapshot was about `17.9 scores/s`.
+- The P1 beam candidate passed independent PEQ-only AFPX verification.
 - Historical test results are not assumptions about future measurements.
 
 ## Deliberate Non-Changes
@@ -146,6 +161,8 @@ record.
   usable and memory cannot spiral.
 - Do not reread raw worker logs, every candidate, the whole task, or research
   reports for routine questions.
+- Prefer `run_optimizer.ps1` for validate/run/merge/verify. It prints only the
+  final `assistant_summary.json` path.
 
 ## Working Tree
 

@@ -31,29 +31,29 @@ compute benefit, and token savings. Detailed evidence is in
      family files, phase writes/warnings, and re-measure instructions.
    - Make AI guidance read this file before any full report.
 
-## P1: Largest Audible And Local-Compute Wins
+## P1: Largest Audible And Local-Compute Wins (completed 2026-07-12)
 
-5. **Spatially robust objective**
+5. **Spatially robust objective** - complete
    - Discover optional centre/left/right position bundles.
    - Score centre-weighted median plus high-percentile/worst-position error.
    - Require narrow and asymmetric corrections to hold across positions.
 
-6. **Deterministic beam combinations**
+6. **Deterministic beam combinations** - complete
    - Use the existing guided band pools and exact scalar.
    - Retain the best partial combinations per group, then run existing
      hardware-step coordinate refinement.
    - Compare against guided/CMA at equal wall time and seed.
 
-7. **Cache immutable objective work**
+7. **Cache immutable objective work** - complete
    - Cache baseline cascades, masks, smooth solo references, contribution totals,
      and any reusable guided-band responses.
    - Require score equivalence before/after caching.
 
-8. **Run phase diagnostics once per session**
+8. **Run phase diagnostics once per session** - complete
    - Fingerprint and cache the crossover audit, or apply it only at final merge.
    - Workers should search PEQ, not repeat an identical APF grid at checkpoints.
 
-9. **One-command local run**
+9. **One-command local run** - complete
    - Validate, choose bounded workers, run, merge, verify, and emit only the
      assistant-summary path.
    - Preserve resume/checkpoint behavior and silent long-run mode.

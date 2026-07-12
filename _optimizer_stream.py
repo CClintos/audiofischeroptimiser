@@ -7,6 +7,7 @@ so RAM stays flat: each worker keeps only the best candidates it has seen.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -282,6 +283,52 @@ def guided_groups(rng: np.random.Generator, profile: str, pools) -> GroupBands:
         bands.sort(key=lambda b: b[0])
         groups[group] = bands
     return groups
+
+
+def deterministic_beam_combinations(pools, component_score, beam_width: int = 24,
+                                    pool_limit: int = 6, deadline: float | None = None,
+                                    order_seed: int | None = None):
+    """Build exact guided-band combinations while retaining best partial tunes."""
+    empty = {group: [] for group in opt.GROUPS}
+    beam = [(float(component_score(empty)["objective"]), opt.bands_signature(empty), empty)]
+    evaluations = 1
+    score_cache = {beam[0][1]: beam[0][0]}
+    group_names = list(opt.GROUPS)
+    if order_seed is not None and len(group_names) > 1:
+        order_rng = np.random.default_rng(int(order_seed))
+        group_names = [group_names[index] for index in order_rng.permutation(len(group_names))]
+    for group in group_names:
+        cfg = opt.GROUPS[group]
+        candidates = sorted(pools.get(group, []), key=lambda item: -item["strength"])[:max(0, pool_limit)]
+        bands = [opt.rounded_band(item["F"], item["Q"], item["G"]) for item in candidates]
+        bands = [band for band in bands if band is not None]
+        options = [()]
+        max_active = min(int(cfg["max_bands"]), len(bands), 2)
+        for count in range(1, max_active + 1):
+            options.extend(itertools.combinations(bands, count))
+        expanded = []
+        for _value, _signature, partial in beam:
+            for option in options:
+                if deadline is not None and time.monotonic() >= deadline:
+                    candidates_now = beam + expanded
+                    unique_now = {}
+                    for entry in sorted(candidates_now, key=lambda item: (item[0], item[1])):
+                        unique_now.setdefault(entry[1], entry)
+                    return list(unique_now.values())[:max(1, int(beam_width))], evaluations
+                groups = _copy_groups(partial)
+                groups[group] = sorted(option, key=lambda band: band[0])
+                signature = opt.bands_signature(groups)
+                value = score_cache.get(signature)
+                if value is None:
+                    value = float(component_score(groups)["objective"])
+                    score_cache[signature] = value
+                    evaluations += 1
+                expanded.append((value, signature, groups))
+        unique = {}
+        for entry in sorted(expanded, key=lambda item: (item[0], item[1])):
+            unique.setdefault(entry[1], entry)
+        beam = list(unique.values())[:max(1, int(beam_width))]
+    return beam, evaluations
 
 
 def gain_to_unit(gain: float, cfg: Dict[str, object]) -> float:
@@ -653,8 +700,8 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
     path.parent.mkdir(parents=True, exist_ok=True)
     archive = archive or []
     payload = {
-        "version": 5,
-        "objective": "objective_integrity_peak_balance_session_phase_guard_v5",
+        "version": 6,
+        "objective": "spatial_objective_beam_cached_phase_v6",
         "completed_trials": int(completed_trials),
         "elapsed_seconds": float(elapsed_seconds),
         "seed": int(args.seed),
@@ -683,7 +730,7 @@ def load_state(path: Path, rng: np.random.Generator, component_score=None, archi
     if not path.exists():
         return [], [], {}, 0, 0.0
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("version") not in (4, 5):
+    if payload.get("version") not in (4, 5, 6):
         return [], [], {}, 0, 0.0
     if "rng_state" in payload:
         rng.bit_generator.state = payload["rng_state"]
@@ -812,7 +859,7 @@ def main():
     parser.add_argument("--keep", type=int, default=50)
     parser.add_argument("--seed", type=int, default=20260703)
     parser.add_argument("--profile", choices=("safe", "explore"), default="explore")
-    parser.add_argument("--proposal", choices=("guided", "random", "mixed", "cmaes"), default="guided")
+    parser.add_argument("--proposal", choices=("guided", "random", "mixed", "cmaes", "beam"), default="guided")
     parser.add_argument("--filter-cost-scale", type=float, default=0.1)
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--min-total-bands", type=int, default=0)
@@ -823,6 +870,8 @@ def main():
                         help="Maximum hardware-step coordinate passes per refined candidate.")
     parser.add_argument("--cma-sigma", type=float, default=0.18)
     parser.add_argument("--cma-population", type=int, default=0)
+    parser.add_argument("--beam-width", type=int, default=24)
+    parser.add_argument("--beam-pool-limit", type=int, default=6)
     parser.add_argument("--max-positive-gain-penalty", type=float, default=0.0,
                         help="Reject candidates above this headroom penalty; 0 disables the hard gate.")
     parser.add_argument("--validation-threshold", type=float, default=2.5)
@@ -832,6 +881,8 @@ def main():
                         help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--impulse-root", type=Path, default=None,
                         help="Optional folder containing companion WAV/text impulse exports.")
+    parser.add_argument("--phase-cache", type=Path, default=None,
+                        help="Shared fingerprinted crossover diagnostic cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
@@ -862,7 +913,9 @@ def main():
             for item in failed_validation
         )
         raise SystemExit("Measurement validation gate failed: " + details)
-    args.crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
+    args.crossover_rows, args.phase_diagnostic_cache = opt.cached_crossover_phase_diagnostics(
+        args.phase_cache, freqs, traces, rich_traces, args.measurement_session, args.impulse_root
+    )
     opt.apply_session_phase_validity(args.crossover_rows, args.measurement_session["audit"])
     args.phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(args.crossover_rows, args.sample_rate)
     guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
@@ -918,11 +971,38 @@ def main():
     start = time.monotonic()
     next_checkpoint = start + max(10, args.checkpoint_seconds)
     trials = 0
+    args.beam = None
+    if args.proposal == "beam":
+        beam_order_seed = args.seed + completed_before
+        beam_entries, beam_evaluations = deterministic_beam_combinations(
+            guided_pools,
+            component_score,
+            beam_width=args.beam_width,
+            pool_limit=args.beam_pool_limit,
+            deadline=(start + args.seconds) if args.seconds else None,
+            order_seed=beam_order_seed,
+        )
+        for item in beam_entries:
+            components = component_score(item[2])
+            best = insert_best(best, item, args.keep)
+            archive, archive_scores = insert_archive(
+                archive, archive_scores, item, components, args.archive_size
+            )
+        trials += beam_evaluations
+        args.beam = {
+            "width": args.beam_width,
+            "pool_limit": args.beam_pool_limit,
+            "evaluations": beam_evaluations,
+            "retained": len(beam_entries),
+            "order_seed": beam_order_seed,
+        }
     while True:
         now = time.monotonic()
         if args.seconds and now - start >= args.seconds:
             break
         if args.max_trials and trials >= args.max_trials:
+            break
+        if args.proposal == "beam":
             break
         cma_x = None
         if args.proposal == "cmaes":
@@ -984,6 +1064,15 @@ def main():
         passes=args.refine_passes,
     )
     final_entries = combine_unique_entries(final_entries, refined_entries)
+    save_state(
+        state_path,
+        final_entries[:args.keep],
+        rng,
+        args._completed_trials,
+        args._elapsed_seconds,
+        args,
+        archive=final_entries[:args.archive_size],
+    )
     output_entries = final_entries[: args.top]
     family_limit = max(args.top * 10, min(args.archive_size, 200))
     family_entries = final_entries[:family_limit]

@@ -10,7 +10,8 @@ param(
     [double]$GateMs = 0.0,
     [double]$SampleRate = 96000.0,
     [ValidateSet("auto", "off")]
-    [string]$PhaseWrites = "auto"
+    [string]$PhaseWrites = "auto",
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,7 +27,7 @@ function Join-Args([string[]]$Items) {
     return ($Items | ForEach-Object { Quote-Arg $_ }) -join ' '
 }
 
-$pythonExe = Join-Path $here ".venv\Scripts\python.exe"
+$pythonExe = if ($PythonExe -ne "") { $PythonExe } else { Join-Path $here ".venv\Scripts\python.exe" }
 if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Missing Python runtime at $pythonExe"
 }
@@ -38,6 +39,7 @@ $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPa
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
+$phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
 }
@@ -61,6 +63,7 @@ if ($impulseRootPath -ne "") { $args += @("--impulse-root", $impulseRootPath) }
 if ($levelCalibrationPath -ne "") { $args += @("--level-calibration", $levelCalibrationPath) }
 $args += @("--sample-rate", "$SampleRate")
 $args += @("--phase-writes", "$PhaseWrites")
+if (Test-Path -LiteralPath $phaseCachePath) { $args += @("--phase-cache", $phaseCachePath) }
 $rootToken = "_merge_stream_results.py " + $Root
 $existing = Get-CimInstance Win32_Process |
     Where-Object {

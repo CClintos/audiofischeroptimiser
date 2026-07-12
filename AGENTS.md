@@ -27,6 +27,7 @@ when the current-state checkpoint does not answer it.
 - `_optimizer.py`: main optimiser, scoring, AFPX writing, reports.
 - `_optimizer_stream.py`: constant-memory worker optimiser.
 - `_merge_stream_results.py`: merges worker archives.
+- `run_optimizer.ps1`: preferred one-command local runner.
 - `_benchmark.py`: benchmark/check script.
 - `objective_module/afpx_objective.py`: scalar objective.
 - `objective_module/_tunefit.py`: DSP/math helpers.
@@ -43,6 +44,7 @@ when the current-state checkpoint does not answer it.
 - Use `docs/AUDIO_DSP_RULES.md` before changing scoring logic, delay/APF writing, or PCT6 handling.
 - Use `docs/ai_context/DSP_RULES.md` when you need the short domain version first.
 - Prefer `assistant_summary.json` first, then `optimizer_summary.json` only when its compact decision core is insufficient.
+- Prefer `run_optimizer.ps1` for normal long runs; it bounds workers, reuses the phase cache, merges, verifies, and prints only the compact summary path.
 
 ## Validation Rules
 

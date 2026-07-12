@@ -23,6 +23,7 @@ import os
 import sys
 import zlib
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,7 @@ if not (DATA_ROOT / 'System Sum.txt').exists() and (DATA_ROOT.parent / 'System S
     DATA_ROOT = DATA_ROOT.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DATA_ROOT))
-from _tunefit import peaking_db, erb_smooth, interference_audit, headroom_report
+from _tunefit import peaking_db, erb_smooth, interference_audit, erb_hz, LOGSTEP
 
 # ---- config ---------------------------------------------------------------
 REW_DIR = DATA_ROOT
@@ -96,6 +97,7 @@ W = {
     'null_boost': 0.8,   # per dB of EQ BOOST landing in a masked null bin (the exploit)
     'parsimony': 0.02,   # per active band
     'added_band': 0.05,   # a new filter must beat the one-seat noise floor
+    'spatial_fragility': 1.0,
 }
 BALANCE_RMS_SHARE = 0.65
 BALANCE_ABS_SHARE = 0.35
@@ -217,6 +219,13 @@ _T = {}
 _TGT = None
 _NULL_MASK = None
 _V5 = None
+_GRID_TOKEN = None
+_BASE_CASCADES = []
+_TOTAL_DB = None
+_SMOOTH_T = {}
+_POSITION_TRACES = {}
+_POSITION_BASELINE = {}
+_SMOOTHER = None
 
 
 def _attrs(t):
@@ -232,8 +241,46 @@ def _peqset(xml):
     return out
 
 
+def _position_path(prefixes, aliases):
+    for prefix in prefixes:
+        for alias in aliases:
+            candidates = (
+                REW_DIR / (prefix + alias + '.txt'),
+                REW_DIR / prefix.strip() / (alias + '.txt'),
+            )
+            for path in candidates:
+                if path.exists():
+                    return path
+    return None
+
+
+def _build_smoother(freqs):
+    dlog = np.log(LOGSTEP)
+    starts = []
+    ends = []
+    for i, f in enumerate(freqs):
+        hb = max(1, int(round(np.log(1 + 0.5 * erb_hz(float(f)) / float(f)) / dlog)))
+        starts.append(max(0, i - hb))
+        ends.append(min(len(freqs), i + hb + 1))
+    starts = np.asarray(starts, dtype=int)
+    ends = np.asarray(ends, dtype=int)
+    widths = (ends - starts).astype(float)
+
+    def smooth(values):
+        cumulative = np.empty(len(values) + 1, dtype=float)
+        cumulative[0] = 0.0
+        np.cumsum(values, out=cumulative[1:])
+        return (cumulative[ends] - cumulative[starts]) / widths
+    return smooth
+
+
+def _smooth(values):
+    return _SMOOTHER(values) if _SMOOTHER is not None else erb_smooth(_F, values)
+
+
 def _init():
-    global _F, _T, _TGT, _NULL_MASK, _V5
+    global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
+    global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
     if _F is not None:
         return
     raw = {}
@@ -250,6 +297,8 @@ def _init():
     for key, (source_f, source_s) in raw.items():
         _T[key] = np.interp(log_f, np.log10(source_f), source_s)
     _F = F
+    _GRID_TOKEN = (len(F), float(F[0]), float(F[-1]), hash(F.tobytes()))
+    _SMOOTHER = _build_smoother(F)
     tf, ts = [], []
     with open(TARGET, encoding='utf-8', errors='replace') as handle:
         for line in handle:
@@ -281,6 +330,31 @@ def _init():
         _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
     with open(BASELINE_AFPX, 'rb') as handle:
         _V5 = _peqset(zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace'))
+    _BASE_CASCADES = [_casc_uncached(bands) for bands in _V5]
+    _TOTAL_DB = _system_branch_total_uncached()
+    _SMOOTH_T = {key: _smooth(values) for key, values in _T.items()}
+
+    _POSITION_TRACES = {}
+    position_specs = {
+        'left': ('Left Ear ', 'Left '),
+        'right': ('Right Ear ', 'Right '),
+    }
+    for position, prefixes in position_specs.items():
+        path = _position_path(prefixes, SOLO_FILES['System Sum'])
+        if path is None:
+            continue
+        pf, ps = _load_txt(path)
+        if len(pf) < 16:
+            continue
+        ps = ps + _calibration_offset(position + ':System Sum', path)
+        measured = np.interp(np.log10(_F), np.log10(pf), ps)
+        target = tgt + float(np.median(measured[band] - tgt[band]))
+        _POSITION_TRACES[position] = {'system': measured, 'target': target, 'file': str(path)}
+    keep = (_F >= INBAND[0]) & (_F <= INBAND[1]) & ~_NULL_MASK
+    _POSITION_BASELINE = {
+        name: tonal_components(_F, _smooth(data['system'] - data['target']), keep)['tonal_masked']
+        for name, data in _POSITION_TRACES.items()
+    }
 
 
 def baseline_band_sets():
@@ -289,10 +363,22 @@ def baseline_band_sets():
     return [list(bands) for bands in _V5]
 
 
-def _casc(bands):
+def _casc_uncached(bands):
     d = np.zeros_like(_F)
     for f, q, g in bands:
         d += peaking_db(_F, f, q, g)
+    return d
+
+
+@lru_cache(maxsize=8192)
+def _cached_peaking(grid_token, f, q, g):
+    return peaking_db(_F, f, q, g)
+
+
+def _casc(bands):
+    d = np.zeros_like(_F)
+    for f, q, g in bands:
+        d += _cached_peaking(_GRID_TOKEN, float(f), float(q), float(g))
     return d
 
 
@@ -323,11 +409,15 @@ def _interp_at(values, f):
     return float(np.interp(np.log10(float(f)), np.log10(_F), values))
 
 
-def _system_branch_total_db():
+def _system_branch_total_uncached():
     total = 10 ** (_T['Sub'] / 10)
     for _name, (_left, _right, together, _band_range, _balance) in PAIR_SPECS.items():
         total += 10 ** (_T[together] / 10)
     return 10 * np.log10(np.maximum(total, 1e-30))
+
+
+def _system_branch_total_db():
+    return _TOTAL_DB if _TOTAL_DB is not None else _system_branch_total_uncached()
 
 
 def _driver_share_db(channel_key, f, total_db=None):
@@ -343,7 +433,9 @@ def _driver_share_db(channel_key, f, total_db=None):
 
 def _solo_peak_support(channel_key, f):
     """True when a narrow/deep cut is backed by a real local solo peak."""
-    sm = erb_smooth(_F, _T[channel_key])
+    sm = _SMOOTH_T.get(channel_key)
+    if sm is None:
+        sm = _smooth(_T[channel_key])
     oct_dist = np.abs(np.log2(_F / float(f)))
     window = oct_dist <= (1 / 3)
     center = oct_dist <= (1 / 12)
@@ -360,7 +452,8 @@ def _solo_peak_support(channel_key, f):
 def _delta_channel(i, band_sets):
     candidate = list(band_sets[i]) if i < len(band_sets) else []
     baseline = list(_V5[i]) if i < len(_V5) else []
-    return _casc(candidate) - _casc(baseline)
+    baseline_cascade = _BASE_CASCADES[i] if i < len(_BASE_CASCADES) else _casc(baseline)
+    return _casc(candidate) - baseline_cascade
 
 
 def _asymmetry_penalty(band_sets, total=None):
@@ -372,8 +465,8 @@ def _asymmetry_penalty(band_sets, total=None):
             continue
         li = CH_KEYS.index(left)
         ri = CH_KEYS.index(right)
-        eq_diff = erb_smooth(_F, _delta_channel(li, band_sets) - _delta_channel(ri, band_sets))
-        solo_diff = np.abs(erb_smooth(_F, _T[left] - _T[right]))
+        eq_diff = _smooth(_delta_channel(li, band_sets) - _delta_channel(ri, band_sets))
+        solo_diff = np.abs(_smooth(_T[left] - _T[right]))
         allowed = 0.75 + 0.55 * solo_diff
         active = (_T[together] - total) >= -10.0
         sel = (_F >= balance_band[0]) & (_F <= balance_band[1]) & active
@@ -428,9 +521,10 @@ def _predict(band_sets):
     """band_sets: 8 lists of (F,Q,G). Returns predicted magnitude traces."""
     pr = {}
     for i, k in enumerate(CH_KEYS):
-        pr[k] = _T[k] + (_casc(band_sets[i]) - _casc(_V5[i]))
+        pr[k] = _T[k] + (_casc(band_sets[i]) - _BASE_CASCADES[i])
     if len(band_sets) > 6:
-        pr['Sub'] = _T['Sub'] + (_casc(band_sets[6]) - _casc(_V5[6]))
+        baseline = _BASE_CASCADES[6] if len(_BASE_CASCADES) > 6 else _casc(_V5[6])
+        pr['Sub'] = _T['Sub'] + (_casc(band_sets[6]) - baseline)
     else:
         pr['Sub'] = _T['Sub'].copy()
 
@@ -453,32 +547,102 @@ def _predict(band_sets):
     return pr
 
 
+def _weighted_quantile(values, weights, quantile):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order]
+    cumulative = np.cumsum(weights)
+    return float(values[np.searchsorted(cumulative, quantile * cumulative[-1], side='left')])
+
+
+def _has_fragile_filters(band_sets):
+    added = _added_bands_by_channel(band_sets)
+    if any(q > 2.0 for bands in added.values() for _f, q, _g in bands):
+        return True
+    for _name, (left, right, _together, _band, _balance) in PAIR_SPECS.items():
+        if left not in CH_KEYS or right not in CH_KEYS:
+            continue
+        if np.max(np.abs(_delta_channel(CH_KEYS.index(left), band_sets)
+                         - _delta_channel(CH_KEYS.index(right), band_sets))) > 0.5:
+            return True
+    return False
+
+
+def _spatial_components(pr, band_sets, keep):
+    center_dev = _smooth(pr['System Sum'] - _TGT)
+    center = tonal_components(_F, center_dev, keep)
+    tonal_values = [center['tonal_masked']]
+    peak_values = [center['peak_penalty_db']]
+    worst_values = [float(np.max(np.abs(center_dev[keep & (_F >= 100) & (_F <= 8000)])))]
+    position_tonal = {'center': center['tonal_masked']}
+    system_delta = pr['System Sum'] - _T['System Sum']
+    for name, data in _POSITION_TRACES.items():
+        dev = _smooth(data['system'] + system_delta - data['target'])
+        parts = tonal_components(_F, dev, keep)
+        tonal_values.append(parts['tonal_masked'])
+        peak_values.append(parts['peak_penalty_db'])
+        worst_values.append(float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)]))))
+        position_tonal[name] = parts['tonal_masked']
+    weights = [2.0] + [1.0] * (len(tonal_values) - 1)
+    spatial_tonal = (
+        0.55 * _weighted_quantile(tonal_values, weights, 0.5)
+        + 0.30 * float(np.percentile(tonal_values, 80))
+        + 0.15 * max(tonal_values)
+    )
+    spatial_peak = (
+        0.65 * _weighted_quantile(peak_values, weights, 0.5)
+        + 0.35 * max(peak_values)
+    )
+    spatial_worst = 0.70 * float(np.percentile(worst_values, 80)) + 0.30 * max(worst_values)
+    fragility = 0.0
+    hold_pass = True
+    if _POSITION_TRACES and _has_fragile_filters(band_sets):
+        worsenings = [
+            position_tonal[name] - _POSITION_BASELINE[name]
+            for name in _POSITION_TRACES
+        ]
+        fragility = sum(max(0.0, value - 0.05) for value in worsenings) * 2.0
+        if worsenings and max(worsenings) > 0.10:
+            fragility += 5.0
+            hold_pass = False
+    return {
+        **center,
+        'spatial_tonal_db': float(spatial_tonal),
+        'spatial_peak_db': float(spatial_peak),
+        'spatial_worst_db': float(spatial_worst),
+        'spatial_position_count': len(_POSITION_TRACES) + 1,
+        'spatial_model': 'system_delta' if _POSITION_TRACES else 'centre_only',
+        'spatial_position_tonal_db': position_tonal,
+        'spatial_fragility_penalty': float(fragility),
+        'spatial_hold_pass': hold_pass,
+    }
+
+
 def objective(band_sets):
     """The single scalar the optimizer minimizes, plus named components."""
     _init()
     pr = _predict(band_sets)
-    dev = erb_smooth(_F, pr['System Sum'] - _TGT)
     inb = (_F >= INBAND[0]) & (_F <= INBAND[1])
     keep = inb & ~_NULL_MASK  # nulls MASKED OUT of tonal error + worst-case
 
-    tonal_parts = tonal_components(_F, dev, keep)
-    tonal = tonal_parts['tonal_masked']
-    peak = tonal_parts['peak_penalty_db']
-
-    worst = float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)])))
+    tonal_parts = _spatial_components(pr, band_sets, keep)
+    tonal = tonal_parts['spatial_tonal_db']
+    peak = tonal_parts['spatial_peak_db']
+    worst = tonal_parts['spatial_worst_db']
 
     balances = {}
     for name, (left, right, _together, _band_range, balance_band) in PAIR_SPECS.items():
-        diff = erb_smooth(_F, pr[left] - pr[right])
+        diff = _smooth(pr[left] - pr[right])
         balances[name] = balance_components(_F, diff, balance_band)
 
     # headroom: worst front-channel cascade peak, + boost landing in null bins
     head_peak = 0.0
     null_boost = 0.0
     for i in range(len(CH_KEYS)):
-        r = headroom_report(_F, band_sets[i])
-        head_peak = max(head_peak, r['peak_cascade_gain_db'])
-        b = _casc(band_sets[i])  # this channel's EQ curve; penalize boost in null bins
+        b = _casc(band_sets[i])
+        head_peak = max(head_peak, round(float(np.max(b)), 2))
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
@@ -518,6 +682,7 @@ def objective(band_sets):
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
               + W['null_boost'] * null_boost
               + W['parsimony'] * n_bands
+              + W['spatial_fragility'] * tonal_parts['spatial_fragility_penalty']
               + guard['guardrail_penalty'])
     comp.update(guard)
     comp['balance_penalty_db'] = float(
@@ -530,6 +695,16 @@ def objective(band_sets):
 
 def score_bands(band_sets):
     return objective(band_sets)
+
+
+def cache_stats():
+    info = _cached_peaking.cache_info()
+    return {
+        'peaking_hits': info.hits,
+        'peaking_misses': info.misses,
+        'peaking_entries': info.currsize,
+        'spatial_positions': sorted(_POSITION_TRACES),
+    }
 
 
 def score_afpx(path):
