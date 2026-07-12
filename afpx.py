@@ -99,6 +99,8 @@ def channels(xml):
         if i < len(delays):
             s['delay_samples'] = delays[i].get('T')
             s['polarity_delay_tag_raw'] = {'PM': delays[i].get('PM'), 'P': delays[i].get('P')}
+            if delays[i].get('PM') in ('1', '4'):
+                s['polarity'] = 'inverted' if delays[i].get('PM') == '4' else 'normal'
         s['index'] = i
         out.append(s)
     for i in range(0, len(out) - 1, 2):

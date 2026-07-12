@@ -4,6 +4,12 @@
 
 This repository is a local conservative optimiser for Helix / Audiotec Fischer AFPX tune files.
 
+Read this file first, then `docs/ai_context/CURRENT_STATE.md`. Use `REPO_MAP.md`
+for navigation and deeper docs only when needed. Do not reread the whole task
+history for routine work.
+If a task is broad or underspecified, read `docs/ai_context/PROJECT_MAP.md` only
+when the current-state checkpoint does not answer it.
+
 ## Scope
 
 - Optimise PEQ from REW magnitude measurements.
@@ -29,6 +35,15 @@ This repository is a local conservative optimiser for Helix / Audiotec Fischer A
 - `PCT6_SUPPORT.md`: PCT6 caveats.
 - `scripts/`: compact local summaries and output verification.
 
+## Fast Navigation
+
+- Use `REPO_MAP.md` before broad file searches.
+- Use `docs/ai_context/TASK_TEMPLATE.md` to turn broad asks into bounded work.
+- Use `docs/TEST_COMMANDS.md` when you need run/verify commands.
+- Use `docs/AUDIO_DSP_RULES.md` before changing scoring logic, delay/APF writing, or PCT6 handling.
+- Use `docs/ai_context/DSP_RULES.md` when you need the short domain version first.
+- Prefer `optimizer_summary.json` and scripts in `scripts/` over raw logs or large CSV/manual inspection.
+
 ## Validation Rules
 
 When changing optimiser scoring:
@@ -40,6 +55,11 @@ When changing AFPX/PCT6 writing:
 - Write the new file.
 - Decode the output.
 - Verify only intended fields changed.
+
+When reviewing optimiser output:
+- Start from `optimizer_summary.json`.
+- Use `scripts/summarise_optimizer_run.py` before opening reports or candidate files.
+- Inspect raw measurements only when the compact summaries do not answer the question.
 
 ## Output Style
 

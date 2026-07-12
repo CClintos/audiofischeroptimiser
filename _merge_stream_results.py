@@ -50,8 +50,10 @@ def main():
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--sample-rate", type=float, default=96000.0,
                         help="DSP internal sample rate used for delay writes.")
+    parser.add_argument("--impulse-root", type=Path, default=None,
+                        help="Optional folder containing companion WAV/text impulse exports.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
-                        help="Use 'off' to report phase diagnostics without writing delay/APF changes.")
+                        help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     args = parser.parse_args()
 
     opt.sync_external_objective(args.baseline, args.target)
@@ -67,7 +69,7 @@ def main():
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
     phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in validation if not item["pass"]]
     if failed_validation:

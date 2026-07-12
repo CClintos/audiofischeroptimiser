@@ -1,10 +1,12 @@
 """Phase/time search for verified REW phase sweeps and AFPX tunes.
 
-This runner is intentionally separate from the PEQ optimizer. It searches only
+This runner is intentionally separate from the PEQ optimizer. It searches
 mid/tweeter timing and optional APF moves using complex solo traces that share a
-timing lock. Sub/front changes are reported as skipped unless their solo traces
-are lock-consistent, because cross-lock phase was the trap that created the bad
-sub APF/polarity recommendation.
+timing lock. It also launches the targeted L/R-midbass APF stage after merging,
+so a cancellation below the tweeter crossover is diagnosed instead of silently
+falling outside this runner's score band. Sub/front changes are reported as
+skipped unless their solo traces are lock-consistent, because cross-lock phase
+was the trap that created the bad sub APF/polarity recommendation.
 """
 
 from __future__ import annotations
@@ -482,6 +484,27 @@ def merge_and_write(args: argparse.Namespace) -> Dict[str, object]:
         copied_best = args.copy_best
         shutil.copy2(written[0]["file"], copied_best)
 
+    lr_midbass_summary = None
+    if not args.skip_lr_midbass:
+        from scripts.lr_midbass_phase_search import run as run_lr_midbass
+
+        lr_out = args.out_root / "_lr_midbass_phase"
+        lr_args = argparse.Namespace(
+            data_root=args.data_root,
+            baseline=args.baseline,
+            out_root=lr_out,
+            copy_best=args.lr_midbass_copy_best,
+            points_per_octave=96,
+            validation_threshold=args.validation_threshold,
+            minimum_problem_gap=4.0,
+            max_damage_12=args.lr_midbass_max_damage_12,
+            seed=args.seed + 175,
+        )
+        try:
+            lr_midbass_summary = run_lr_midbass(lr_args)
+        except (FileNotFoundError, ValueError) as exc:
+            lr_midbass_summary = {"status": "skipped", "reason": str(exc)}
+
     summary = {
         "run_root": str(args.out_root),
         "baseline": str(args.baseline),
@@ -493,9 +516,11 @@ def merge_and_write(args: argparse.Namespace) -> Dict[str, object]:
         "written_count": len(written),
         "copied_best": str(copied_best) if copied_best else None,
         "diagnostics": diagnostics,
+        "lr_midbass_phase": lr_midbass_summary,
         "top": written,
         "scope_notes": [
             "Searched front high-channel delay and optional APF for mid/tweeter crossover summation.",
+            "Ran a separate paired-APF search for phase-valid L/R-midbass cancellations.",
             "Sub/front phase writes skipped because the sub solo and both-mids solo timing locks do not agree.",
             "Crossover filter writes are not performed by this runner; crossover changes need export-diff verification before automatic writes.",
         ],
@@ -522,9 +547,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fr-mode-samples", type=int, default=0)
     parser.add_argument("--archive-size", type=int, default=500)
     parser.add_argument("--checkpoint-seconds", type=int, default=30)
+    parser.add_argument("--validation-threshold", type=float, default=2.5)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--copy-best", type=Path, default=None)
+    parser.add_argument("--skip-lr-midbass", action="store_true")
+    parser.add_argument("--lr-midbass-copy-best", type=Path, default=None)
+    parser.add_argument("--lr-midbass-max-damage-12", type=float, default=0.75)
     parser.add_argument("--merge-only", action="store_true")
+    parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact")
     return parser.parse_args()
 
 
@@ -543,21 +573,39 @@ def main() -> None:
             if proc.exitcode != 0:
                 raise SystemExit(f"worker failed with exit code {proc.exitcode}")
     summary = merge_and_write(args)
+    if args.print_mode == "none":
+        return
+    if args.print_mode == "full":
+        print(json.dumps(summary, indent=2))
+        return
+    best = summary["top"][0] if summary["top"] else None
     compact = {
+        "status": "complete",
         "completed_candidates": summary["completed_candidates"],
         "unique_archived_candidates": summary["unique_archived_candidates"],
         "copied_best": summary["copied_best"],
-        "top3": [
-            {
-                "rank": row["rank"],
-                "file": row["file"],
-                "candidate": row["candidate"],
-                "metrics": row["metrics"],
-            }
-            for row in summary["top"][:3]
-        ],
+        "best": None if best is None else {
+            "file": best["file"],
+            "candidate": best["candidate"],
+            "score": best["metrics"].get("score"),
+            "left_gap": best["metrics"].get("left_gap"),
+            "right_gap": best["metrics"].get("right_gap"),
+        },
         "scope_notes": summary["scope_notes"],
-        "diagnostics": summary["diagnostics"],
+        "validation": {
+            "left": summary["diagnostics"].get("left_mid_tweeter_prediction"),
+            "right": summary["diagnostics"].get("right_mid_tweeter_prediction"),
+            "sub": summary["diagnostics"].get("sub_midbass_phase_status"),
+        },
+        "lr_midbass_phase": None if summary["lr_midbass_phase"] is None else {
+            "status": summary["lr_midbass_phase"].get("status"),
+            "problem_frequency_hz": summary["lr_midbass_phase"].get("problem_frequency_hz"),
+            "problem_gap_24_db": summary["lr_midbass_phase"].get("problem_gap_24_db"),
+            "candidate": summary["lr_midbass_phase"].get("candidate"),
+            "copied_best": summary["lr_midbass_phase"].get("copied_best"),
+            "result": summary["lr_midbass_phase"].get("result"),
+        },
+        "summary": str(args.out_root / "phase_time_summary.json"),
     }
     print(json.dumps(compact, indent=2))
 

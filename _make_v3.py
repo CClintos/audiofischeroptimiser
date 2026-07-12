@@ -63,6 +63,22 @@ def delay_tags(xml):
     return [semantic_tag_key(t) for t in re.findall(r'<T [^>]*>', xml)]
 
 
+def delay_values(xml):
+    return [at(tag, 'T') for tag in re.findall(r'<T [^>]*>', xml)]
+
+
+def delay_polarities(xml):
+    return [at(tag, 'PM') for tag in re.findall(r'<T [^>]*>', xml)]
+
+
+def delay_other_attributes(xml):
+    out = []
+    for tag in re.findall(r'<T [^>]*>', xml):
+        attrs = re.findall(r'([A-Za-z]+)="([^"]*)"', tag)
+        out.append(tuple(sorted((key, value) for key, value in attrs if key not in ('T', 'PM'))))
+    return out
+
+
 def semantic_filter_key(fil):
     """Filter identity for round-trip diffing.
     PC-Tool may renumber FN, so ignore FN and compare the acoustic meaning."""
@@ -83,6 +99,24 @@ def channel_filter_inventory(xml):
     return inv
 
 
+def channel_attribute_inventory(xml, exclude=()):
+    out = []
+    excluded = set(exclude)
+    for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S):
+        opening = re.match(r'<OC\b[^>]*>', oc)
+        attrs = re.findall(r'([A-Za-z]+)="([^"]*)"', opening.group() if opening else '')
+        out.append(tuple(sorted((key, value) for key, value in attrs if key not in excluded)))
+    return out
+
+
+def channel_polarities(xml):
+    values = []
+    for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S):
+        opening = re.match(r'<OC\b[^>]*>', oc)
+        values.append(at(opening.group(), 'CINV') if opening else None)
+    return values
+
+
 def multiset_delta(old_items, new_items):
     old_counts, new_counts = {}, {}
     for item in old_items:
@@ -98,7 +132,8 @@ def multiset_delta(old_items, new_items):
 
 
 def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
-                        allow_crossover_changes=False, allowed_added_types=('17', '20')):
+                        allow_crossover_changes=False, allow_polarity_changes=False,
+                        allowed_added_types=('17', '20')):
     old_inv = channel_filter_inventory(old_xml)
     new_inv = channel_filter_inventory(new_xml)
     channel_diffs = []
@@ -118,13 +153,28 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
         if t not in allowed_added_types:
             forbidden.append(item)
 
-    delay_changed = delay_tags(old_xml) != delay_tags(new_xml)
+    delay_changed = delay_values(old_xml) != delay_values(new_xml)
     crossover_changed = crossover_tags(old_xml) != crossover_tags(new_xml)
+    polarity_changed = (
+        delay_polarities(old_xml) != delay_polarities(new_xml)
+        or channel_polarities(old_xml) != channel_polarities(new_xml)
+    )
+    delay_attributes_changed = delay_other_attributes(old_xml) != delay_other_attributes(new_xml)
+    channel_attributes_changed = (
+        channel_attribute_inventory(old_xml, exclude=('CINV',))
+        != channel_attribute_inventory(new_xml, exclude=('CINV',))
+    )
     errors = []
     if delay_changed and not allow_delay_changes:
         errors.append('delay tags changed')
     if crossover_changed and not allow_crossover_changes:
         errors.append('crossover filters changed')
+    if polarity_changed and not allow_polarity_changes:
+        errors.append('output polarity changed')
+    if channel_attributes_changed:
+        errors.append('unrelated output channel attributes changed')
+    if delay_attributes_changed:
+        errors.append('unrelated time alignment attributes changed')
     if forbidden:
         errors.append('forbidden filter type added')
 
@@ -132,6 +182,9 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
             'errors': errors,
             'delay_changed': delay_changed,
             'crossover_changed': crossover_changed,
+            'polarity_changed': polarity_changed,
+            'channel_attributes_changed': channel_attributes_changed,
+            'delay_attributes_changed': delay_attributes_changed,
             'forbidden_added_filters': forbidden,
             'channel_diffs': channel_diffs}
 

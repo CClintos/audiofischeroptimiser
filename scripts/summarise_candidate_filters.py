@@ -113,11 +113,25 @@ def main() -> None:
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--baseline", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=Path("latest_candidate_filter_summary.json"))
+    parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact")
     args = parser.parse_args()
 
     payload = summarise(args.candidate.resolve(), args.baseline.resolve() if args.baseline else None)
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(json.dumps(payload, indent=2))
+    if args.print_mode == "none":
+        return
+    if args.print_mode == "full":
+        print(json.dumps(payload, indent=2))
+        return
+    print(json.dumps({
+        "candidate": payload["candidate"],
+        "baseline": payload["baseline"],
+        "added_filter_count": payload["added_filter_count"],
+        "risk": payload["risk"],
+        "warnings": payload["warnings"],
+        "added_filters": payload["added_filters"],
+        "summary_file": str(args.out.resolve()),
+    }, indent=2))
 
 
 if __name__ == "__main__":

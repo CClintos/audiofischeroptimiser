@@ -424,6 +424,107 @@ def make_group_objective(freqs, traces, target, filter_cost_scale, worst_weight,
     return score
 
 
+def _copy_groups(groups: GroupBands) -> GroupBands:
+    return {name: list(bands) for name, bands in groups.items()}
+
+
+def _band_neighbours(band, cfg: Dict[str, object]):
+    """Yield hardware-rounded one-coordinate moves around an active band."""
+    F, Q, G = band
+    flo, fhi = cfg["range"]
+    qlo, qhi = cfg["q_range"]
+    glo, ghi = cfg["gain_range"]
+    moves = []
+    for octaves in (-1 / 48, -1 / 96, 1 / 96, 1 / 48):
+        moves.append((float(np.clip(F * (2 ** octaves), flo, fhi)), Q, G))
+    for dq in (-0.10, 0.10):
+        moves.append((F, float(np.clip(Q + dq, qlo, qhi)), G))
+    for dg in (-0.25, 0.25):
+        moves.append((F, Q, float(np.clip(G + dg, glo, ghi))))
+    seen = set()
+    for raw in moves:
+        candidate = opt.rounded_band(*raw)
+        if candidate is None or candidate == band or candidate in seen:
+            continue
+        seen.add(candidate)
+        yield candidate
+
+
+def coordinate_refine(groups: GroupBands, component_score, passes: int = 2):
+    """Refine F/Q/G on the authoritative scalar objective only.
+
+    This deliberately uses hardware-sized coordinate moves instead of
+    ``fit_peq``: fit_peq has its own tonal residual objective, while this pass
+    must preserve every null, balance, headroom, and guardrail term returned by
+    ``afpx_objective.score_bands``.
+    """
+    current = _copy_groups(groups)
+    current_components = component_score(current)
+    current_value = float(current_components["objective"])
+    evaluations = 1
+    for _pass in range(max(0, int(passes))):
+        improved_this_pass = False
+        for group in tuple(opt.GROUPS):
+            index = 0
+            while index < len(current.get(group, [])):
+                original = current[group][index]
+                best_groups = current
+                best_components = current_components
+                best_value = current_value
+                variants = list(_band_neighbours(original, opt.GROUPS[group])) + [None]
+                for replacement in variants:
+                    trial = _copy_groups(current)
+                    if replacement is None:
+                        del trial[group][index]
+                    else:
+                        trial[group][index] = replacement
+                    trial[group].sort(key=lambda band: band[0])
+                    components = component_score(trial)
+                    evaluations += 1
+                    value = float(components["objective"])
+                    if value + 1e-12 < best_value:
+                        best_groups = trial
+                        best_components = components
+                        best_value = value
+                if best_groups is not current:
+                    removed = len(best_groups[group]) < len(current[group])
+                    current = best_groups
+                    current_components = best_components
+                    current_value = best_value
+                    improved_this_pass = True
+                    if removed:
+                        continue
+                index += 1
+        if not improved_this_pass:
+            break
+    return current, current_components, evaluations
+
+
+def refine_entries(entries, component_score, top: int, passes: int):
+    refined = []
+    improved = 0
+    evaluations = 0
+    best_before = float(entries[0][0]) if entries else None
+    for value, _signature, groups in entries[:max(0, int(top))]:
+        new_groups, components, used = coordinate_refine(groups, component_score, passes=passes)
+        evaluations += used
+        new_value = float(components["objective"])
+        if new_value + 1e-12 < float(value):
+            improved += 1
+        refined.append((new_value, opt.bands_signature(new_groups), new_groups))
+    best_after = min((float(item[0]) for item in refined), default=best_before)
+    report = {
+        "enabled": bool(top > 0 and passes > 0),
+        "seed_candidates": min(len(entries), max(0, int(top))),
+        "passes": max(0, int(passes)),
+        "evaluations": evaluations,
+        "improved_candidates": improved,
+        "best_before": best_before,
+        "best_after": best_after,
+    }
+    return refined, report
+
+
 ARCHIVE_KEYS = (
     "pareto_tonal_db",
     "peak_penalty_db",
@@ -637,7 +738,7 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     )
     rows = build_rows(freqs, traces, target, best, component_score)
     family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces)
+    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
     phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
     for row in rows:
         path = out_dir / row["file"]
@@ -683,6 +784,10 @@ def main():
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--min-total-bands", type=int, default=0)
     parser.add_argument("--archive-size", type=int, default=4000)
+    parser.add_argument("--refine-top", type=int, default=12,
+                        help="Deterministically refine this many final candidates on the same scalar objective; 0 disables.")
+    parser.add_argument("--refine-passes", type=int, default=2,
+                        help="Maximum hardware-step coordinate passes per refined candidate.")
     parser.add_argument("--cma-sigma", type=float, default=0.18)
     parser.add_argument("--cma-population", type=int, default=0)
     parser.add_argument("--max-positive-gain-penalty", type=float, default=0.0,
@@ -692,11 +797,15 @@ def main():
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--sample-rate", type=float, default=96000.0,
                         help="DSP internal sample rate used for delay writes.")
+    parser.add_argument("--impulse-root", type=Path, default=None,
+                        help="Optional folder containing companion WAV/text impulse exports.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
-                        help="Use 'off' to report phase diagnostics without writing delay/APF changes.")
+                        help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from OUT\\stream_state.json if it exists.")
+    parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact",
+                        help="Console detail only; full reports are always written to disk.")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
@@ -810,17 +919,37 @@ def main():
     args._elapsed_seconds = elapsed_before + (time.monotonic() - start)
     archive, archive_scores = prune_archive(archive, archive_scores, args.archive_size)
     save_state(state_path, best, rng, args._completed_trials, args._elapsed_seconds, args, archive=archive)
-    output_entries = combine_unique_entries(best, archive)[: args.top]
+    final_entries = combine_unique_entries(best, archive)
+    refined_entries, args.refinement = refine_entries(
+        final_entries,
+        component_score,
+        top=args.refine_top,
+        passes=args.refine_passes,
+    )
+    final_entries = combine_unique_entries(final_entries, refined_entries)
+    output_entries = final_entries[: args.top]
     family_limit = max(args.top * 10, min(args.archive_size, 200))
-    family_entries = combine_unique_entries(best, archive)[:family_limit]
+    family_entries = final_entries[:family_limit]
     write_outputs(
         args.out, base_xml, freqs, traces, rich_traces, target, output_entries, baseline_score, args, family_entries=family_entries
     )
-    print(f"stream optimizer complete: {trials} trials, {args._elapsed_seconds:.1f}s")
-    if best:
-        print(f"best objective: {best[0][0]:.6f}")
-        print(opt.format_bands(best[0][2]))
-    print(f"output: {args.out}")
+    if args.print_mode != "none":
+        best_entry = output_entries[0] if output_entries else None
+        compact = {
+            "status": "complete",
+            "trials_this_run": trials,
+            "trials_total": args._completed_trials,
+            "elapsed_seconds": round(float(args._elapsed_seconds), 1),
+            "best_objective": None if best_entry is None else round(float(best_entry[0]), 6),
+            "best_file": None if best_entry is None else str(
+                args.out / ("candidate_01_objective_%.4f.afpx" % best_entry[0])
+            ),
+            "refinement": args.refinement,
+            "summary": str(args.out / "optimizer_summary.json"),
+        }
+        print(json.dumps(compact, indent=2))
+        if args.print_mode == "full" and best_entry is not None:
+            print(opt.format_bands(best_entry[2]))
 
 
 if __name__ == "__main__":

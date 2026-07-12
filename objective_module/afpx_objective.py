@@ -41,17 +41,17 @@ def _has_any(names):
     return any((REW_DIR / (name + '.txt')).exists() for name in names)
 
 
-THREE_WAY = _has_any(('Front L Mid', 'Front L MID', 'Front L Midrange')) and _has_any(('Front R Mid', 'Front R MID', 'Front R Midrange')) and _has_any(('Both Mids', 'Mids Together', 'Midrange Together')) and _has_any(('Front L Low', 'Front L Midbass', 'Front L Mid Bass')) and _has_any(('Front R Low', 'Front R Midbass', 'Front R Mid Bass')) and _has_any(('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
+THREE_WAY = _has_any(('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid')) and _has_any(('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid')) and _has_any(('Both Mids', 'Mids Together', 'Midrange Together')) and _has_any(('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low')) and _has_any(('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low')) and _has_any(('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
 
 if THREE_WAY:
     SOLO_FILES = {
-        'FL High': ('Front L High', 'Front L Tweeter'),
-        'FR High': ('Front R High', 'Front R Tweeter'),
-        'FL Mid': ('Front L Mid', 'Front L MID', 'Front L Midrange'),
-        'FR Mid': ('Front R Mid', 'Front R MID', 'Front R Midrange'),
-        'FL Low': ('Front L Low', 'Front L Midbass', 'Front L Mid Bass'),
-        'FR Low': ('Front R Low', 'Front R Midbass', 'Front R Mid Bass'),
-        'Sub': ('Sub', 'SUB'),
+        'FL High': ('Front L High', 'Front L Tweeter', 'Front Left High', 'Front Left Tweeter'),
+        'FR High': ('Front R High', 'Front R Tweeter', 'Front Right High', 'Front Right Tweeter'),
+        'FL Mid': ('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid'),
+        'FR Mid': ('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid'),
+        'FL Low': ('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low'),
+        'FR Low': ('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low'),
+        'Sub': ('Sub', 'SUB', 'Subwoofer'),
         'System Sum': ('System Sum', 'SYSTEM SUM'),
         'Tweeters Together': ('Tweeters Together', 'Both Tweeters'),
         'Mids Together': ('Both Mids', 'Mids Together', 'Midrange Together'),
@@ -65,11 +65,11 @@ if THREE_WAY:
     }
 else:
     SOLO_FILES = {
-        'FL High': ('Front L High', 'Front L Tweeter'),
-        'FR High': ('Front R High', 'Front R Tweeter'),
-        'FL Low': ('Front L Low', 'Front L Mid', 'Front L MID'),
-        'FR Low': ('Front R Low', 'Front R Mid', 'Front R MID'),
-        'Sub': ('Sub', 'SUB'),
+        'FL High': ('Front L High', 'Front L Tweeter', 'Front Left High', 'Front Left Tweeter'),
+        'FR High': ('Front R High', 'Front R Tweeter', 'Front Right High', 'Front Right Tweeter'),
+        'FL Low': ('Front L Low', 'Front L Mid', 'Front L MID', 'Front Left Mid'),
+        'FR Low': ('Front R Low', 'Front R Mid', 'Front R MID', 'Front Right Mid'),
+        'Sub': ('Sub', 'SUB', 'Subwoofer'),
         'System Sum': ('System Sum', 'SYSTEM SUM'),
         'Tweeters Together': ('Tweeters Together', 'Both Tweeters'),
         'Mid Bass Together': ('Mid Bass Together', 'Both Mids'),
@@ -125,6 +125,26 @@ def _resolve_txt(names):
     return REW_DIR / (names[0] + '.txt')
 
 
+def _optimization_grid(freqs, points_per_octave=96):
+    freqs = np.asarray(freqs, dtype=float)
+    if len(freqs) < 3 or np.any(freqs <= 0.0):
+        return freqs
+    log_f = np.log2(freqs)
+    steps = np.diff(log_f)
+    expected = 1.0 / float(points_per_octave)
+    already_log = (
+        abs(float(np.median(steps)) - expected) <= expected * 0.02
+        and float(np.percentile(np.abs(steps - np.median(steps)), 95)) <= expected * 0.02
+    )
+    if already_log:
+        return freqs
+    first = int(np.ceil(log_f[0] * points_per_octave))
+    last = int(np.floor(log_f[-1] * points_per_octave))
+    if last <= first:
+        return freqs
+    return 2.0 ** (np.arange(first, last + 1, dtype=float) / float(points_per_octave))
+
+
 _F = None
 _T = {}
 _TGT = None
@@ -149,12 +169,17 @@ def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5
     if _F is not None:
         return
+    raw = {}
     F = None
     for key, nm in SOLO_FILES.items():
         f, s = _load_txt(_resolve_txt(nm))
         if F is None:
             F = f
-        _T[key] = s
+        raw[key] = (f, s)
+    F = _optimization_grid(F)
+    log_f = np.log10(F)
+    for key, (source_f, source_s) in raw.items():
+        _T[key] = np.interp(log_f, np.log10(source_f), source_s)
     _F = F
     tf, ts = [], []
     for line in open(TARGET, encoding='utf-8', errors='replace'):

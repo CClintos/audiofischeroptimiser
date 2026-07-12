@@ -17,6 +17,7 @@ param(
     [ValidateSet("auto", "off")]
     [string]$PhaseWrites = "auto",
     [string]$DataRoot = "",
+    [string]$ImpulseRoot = "",
     [string]$Baseline = "",
     [string]$Target = ""
 )
@@ -44,6 +45,7 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
 $dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
+$impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -119,6 +121,9 @@ for ($i = 1; $i -le $Workers; $i++) {
     )
     if ($GateMs -gt 0) {
         $args += @("--gate-ms", "$GateMs")
+    }
+    if ($impulseRootPath -ne "") {
+        $args += @("--impulse-root", $impulseRootPath)
     }
 
     $argLine = Join-Args $args

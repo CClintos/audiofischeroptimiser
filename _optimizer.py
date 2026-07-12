@@ -4,8 +4,8 @@ This runner is deliberately conservative about what it writes:
   - REW TXT input with optional phase/coherence columns;
   - PEQ added in free middle slots;
   - per-side front PEQ is allowed so L/R balance can be scored and corrected;
-  - delay/APF writes only when phase-valid crossover evidence supports them;
-  - no polarity, crossover, shelf, or level writes.
+  - polarity/delay/APF writes only when the crossover ladder clears its gates;
+  - no crossover, shelf, or level writes.
 
 The optimizer searches extra filters on top of the supplied baseline tune, writes
 ranked candidate AFPX files, and leaves all input files untouched.
@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import math
 import os
 import re
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -52,6 +54,7 @@ from _tunefit import (
     allpass_fil_str,
     audibility_score,
     audibility_weight,
+    band_limited_impulse_delay,
     band_limited_delay_from_phase,
     cascade_db,
     erb_smooth,
@@ -63,6 +66,8 @@ from _tunefit import (
     LOGSTEP,
     phase_linearity_residual,
     ms_to_samples,
+    optimize_allpass,
+    polarity_delay_search,
     target_anchor_offset,
     tune_scorecard,
 )
@@ -114,15 +119,15 @@ def sync_external_objective(baseline: Path | None = None, target: Path | None = 
             if hasattr(AFPX_OBJECTIVE, name):
                 setattr(AFPX_OBJECTIVE, name, value)
 
-HIGH_ALIASES_L = ("Front L High.txt", "Front L Tweeter.txt")
-HIGH_ALIASES_R = ("Front R High.txt", "Front R Tweeter.txt")
-MID_ALIASES_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt")
-MID_ALIASES_R = ("Front R Mid.txt", "Front R MID.txt", "Front R Midrange.txt")
-LOW_ALIASES_L = ("Front L Low.txt", "Front L Midbass.txt", "Front L Mid Bass.txt")
-LOW_ALIASES_R = ("Front R Low.txt", "Front R Midbass.txt", "Front R Mid Bass.txt")
+HIGH_ALIASES_L = ("Front L High.txt", "Front L Tweeter.txt", "Front Left High.txt", "Front Left Tweeter.txt")
+HIGH_ALIASES_R = ("Front R High.txt", "Front R Tweeter.txt", "Front Right High.txt", "Front Right Tweeter.txt")
+MID_ALIASES_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt", "Front Left Mid.txt")
+MID_ALIASES_R = ("Front R Mid.txt", "Front R MID.txt", "Front R Midrange.txt", "Front Right Mid.txt")
+LOW_ALIASES_L = ("Front L Low.txt", "Front L Midbass.txt", "Front L Mid Bass.txt", "Front Left Low.txt")
+LOW_ALIASES_R = ("Front R Low.txt", "Front R Midbass.txt", "Front R Mid Bass.txt", "Front Right Low.txt")
 MID_PAIR_ALIASES = ("Both Mids.txt", "Mids Together.txt", "Midrange Together.txt")
 LOW_PAIR_ALIASES = ("Mid Bass Together.txt", "Both Midbass.txt", "Both Midbasses.txt", "Both Mid Bass.txt")
-SUB_ALIASES = ("Sub.txt", "SUB.txt")
+SUB_ALIASES = ("Sub.txt", "SUB.txt", "Subwoofer.txt")
 SYSTEM_ALIASES = ("System Sum.txt", "SYSTEM SUM.txt")
 HIGH_PAIR_ALIASES = ("Tweeters Together.txt", "Both Tweeters.txt")
 
@@ -363,6 +368,7 @@ GroupBands = Dict[str, List[Band]]
 TraceMap = Dict[str, np.ndarray]
 RichTrace = Dict[str, np.ndarray]
 RichTraceMap = Dict[str, RichTrace]
+ImpulseTrace = Dict[str, object]
 
 
 def load_rew_export(path: Path) -> RichTrace:
@@ -412,8 +418,35 @@ def interp_rich_trace(trace: RichTrace, freqs: np.ndarray) -> RichTrace:
     out: RichTrace = {"freq": freqs.copy()}
     for key in ("spl", "phase", "coherence", "position_id"):
         if key in trace:
-            out[key] = np.interp(log_dst, log_src, trace[key])
+            values = trace[key]
+            if key == "phase":
+                # Interpolating wrapped degrees directly invents phase values at
+                # every -180/+180 crossing. Unwrap first; complex conversion and
+                # delay fitting both accept the resulting continuous degrees.
+                values = np.rad2deg(np.unwrap(np.deg2rad(values)))
+            out[key] = np.interp(log_dst, log_src, values)
     return out
+
+
+def optimization_frequency_grid(freqs: np.ndarray, points_per_octave: int = 96) -> np.ndarray:
+    """Normalize dense/linear REW exports to the scorer's logarithmic grid."""
+    freqs = np.asarray(freqs, dtype=float)
+    if len(freqs) < 3 or np.any(freqs <= 0.0):
+        return freqs
+    log_f = np.log2(freqs)
+    steps = np.diff(log_f)
+    expected = 1.0 / float(points_per_octave)
+    already_log = (
+        abs(float(np.median(steps)) - expected) <= expected * 0.02
+        and float(np.percentile(np.abs(steps - np.median(steps)), 95)) <= expected * 0.02
+    )
+    if already_log:
+        return freqs
+    first = int(math.ceil(log_f[0] * points_per_octave))
+    last = int(math.floor(log_f[-1] * points_per_octave))
+    if last <= first:
+        return freqs
+    return 2.0 ** (np.arange(first, last + 1, dtype=float) / float(points_per_octave))
 
 
 def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -427,8 +460,8 @@ def load_measurements() -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
         raise FileNotFoundError("Missing measurement file(s):\n  " + "\n  ".join(missing))
 
     base_trace = load_rew_export(MEASUREMENT_FILES["System Sum"])
-    base_f = base_trace["freq"]
-    base_spl = base_trace["spl"]
+    base_f = optimization_frequency_grid(base_trace["freq"])
+    base_spl = np.interp(np.log10(base_f), np.log10(base_trace["freq"]), base_trace["spl"])
     traces: TraceMap = {"System Sum": base_spl}
     rich: RichTraceMap = {"System Sum": interp_rich_trace(base_trace, base_f)}
     log_base = np.log10(base_f)
@@ -439,6 +472,104 @@ def load_measurements() -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
         traces[name] = np.interp(log_base, np.log10(measurement["freq"]), measurement["spl"])
         rich[name] = interp_rich_trace(measurement, base_f)
     return base_f, traces, rich
+
+
+def _read_pcm_wav(path: Path) -> ImpulseTrace:
+    """Read a mono/stereo PCM WAV impulse without adding a runtime dependency."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            channels = wav.getnchannels()
+            width = wav.getsampwidth()
+            sample_rate = float(wav.getframerate())
+            frames = wav.readframes(wav.getnframes())
+    except wave.Error:
+        # REW may export IEEE-float WAV, which the stdlib wave module rejects.
+        from scipy.io import wavfile
+        sample_rate_raw, raw = wavfile.read(path)
+        data = np.asarray(raw)
+        if data.ndim > 1:
+            data = data[:, 0]
+        if np.issubdtype(data.dtype, np.integer):
+            scale = float(max(abs(np.iinfo(data.dtype).min), np.iinfo(data.dtype).max))
+            data = data.astype(float) / scale
+        else:
+            data = data.astype(float)
+        return {"samples": data, "sample_rate": float(sample_rate_raw), "path": str(path)}
+    if width == 1:
+        data = np.frombuffer(frames, dtype=np.uint8).astype(float) - 128.0
+        scale = 128.0
+    elif width == 2:
+        data = np.frombuffer(frames, dtype="<i2").astype(float)
+        scale = float(2 ** 15)
+    elif width == 3:
+        raw = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3)
+        values = raw[:, 0].astype(np.int32) | (raw[:, 1].astype(np.int32) << 8) | (raw[:, 2].astype(np.int32) << 16)
+        data = np.where(values & 0x800000, values - 0x1000000, values).astype(float)
+        scale = float(2 ** 23)
+    elif width == 4:
+        data = np.frombuffer(frames, dtype="<i4").astype(float)
+        scale = float(2 ** 31)
+    else:
+        raise ValueError(f"Unsupported WAV sample width {width} in {path}")
+    if channels > 1:
+        data = data.reshape(-1, channels)[:, 0]
+    return {"samples": data / scale, "sample_rate": sample_rate, "path": str(path)}
+
+
+def _read_text_impulse(path: Path) -> ImpulseTrace:
+    rows: List[Tuple[float, float]] = []
+    header: List[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parts = s.replace(",", " ").split()
+        try:
+            row = (float(parts[0]), float(parts[1]))
+        except (IndexError, ValueError):
+            header.append(s.lower())
+            continue
+        rows.append(row)
+    if len(rows) < 32:
+        raise ValueError(f"No usable time/amplitude impulse rows found in {path}")
+    time_axis = np.asarray([row[0] for row in rows], dtype=float)
+    samples = np.asarray([row[1] for row in rows], dtype=float)
+    steps = np.diff(time_axis)
+    step = float(np.median(steps[steps > 0])) if np.any(steps > 0) else 0.0
+    if step <= 0.0:
+        raise ValueError(f"Impulse time axis is not increasing in {path}")
+    header_text = " ".join(header[:20])
+    milliseconds = "millisecond" in header_text or re.search(r"\bms\b", header_text) is not None
+    sample_rate = (1000.0 if milliseconds or step >= 0.001 else 1.0) / step
+    if not 4000.0 <= sample_rate <= 768000.0:
+        raise ValueError(f"Implausible impulse sample rate {sample_rate:.1f} Hz in {path}")
+    return {"samples": samples, "sample_rate": sample_rate, "path": str(path)}
+
+
+def _impulse_candidates(measurement_path: Path, root: Path) -> List[Path]:
+    stem = measurement_path.stem
+    names = (
+        f"{stem}.wav", f"{stem} Impulse.wav", f"{stem} IR.wav",
+        f"{stem} Impulse.txt", f"{stem} IR.txt",
+    )
+    folders = (root, root / "impulses", root / "Impulse", root / "IR")
+    return [folder / name for folder in folders for name in names]
+
+
+def load_optional_impulses(root: Path | None = None) -> Dict[str, ImpulseTrace]:
+    """Load companion impulse WAV/text files when supplied; magnitude TXT is untouched."""
+    impulse_root = Path(root) if root is not None else DATA_ROOT
+    found: Dict[str, ImpulseTrace] = {}
+    for trace_name, measurement_path in MEASUREMENT_FILES.items():
+        for path in _impulse_candidates(measurement_path, impulse_root):
+            if not path.exists():
+                continue
+            try:
+                found[trace_name] = _read_pcm_wav(path) if path.suffix.lower() == ".wav" else _read_text_impulse(path)
+            except (ValueError, wave.Error):
+                continue
+            break
+    return found
 
 
 def load_target(path: Path, freqs: np.ndarray) -> np.ndarray:
@@ -802,8 +933,14 @@ def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, obj
     else:
         mid_left, mid_right = "FL Low", "FR Low"
     for side, mid, high, aliases in (
-        ("left", mid_left, "FL High", ("Front L Mid Tweeter Together.txt", "Front L Mid+Tweeter.txt", "Front L Together.txt")),
-        ("right", mid_right, "FR High", ("Front R Mid Tweeter Together.txt", "Front R Mid+Tweeter.txt", "Front R Together.txt")),
+        ("left", mid_left, "FL High", (
+            "Front L Mid Tweeter Together.txt", "Front L Mid+Tweeter.txt", "Front L Mid + Tweeter.txt",
+            "Front Left Mid + Tweeter.txt", "Front L Together.txt",
+        )),
+        ("right", mid_right, "FR High", (
+            "Front R Mid Tweeter Together.txt", "Front R Mid+Tweeter.txt", "Front R Mid + Tweeter.txt",
+            "Front Right Mid + Tweeter.txt", "Front R Together.txt",
+        )),
     ):
         if mid in rich and high in rich:
             specs.append({
@@ -817,7 +954,40 @@ def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, obj
     return specs
 
 
-def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap) -> List[Dict[str, object]]:
+def _impulse_pair_result(a: ImpulseTrace | None, b: ImpulseTrace | None,
+                         band: Tuple[float, float]) -> Dict[str, object]:
+    if a is None or b is None:
+        return {"available": False, "usable": False}
+    fs_a = float(a["sample_rate"])
+    fs_b = float(b["sample_rate"])
+    if abs(fs_a - fs_b) > max(1.0, 0.001 * fs_a):
+        return {
+            "available": True,
+            "usable": False,
+            "warning": f"impulse sample rates differ ({fs_a:.1f} vs {fs_b:.1f} Hz)",
+        }
+    result = band_limited_impulse_delay(
+        np.asarray(a["samples"], dtype=float),
+        np.asarray(b["samples"], dtype=float),
+        fs_a,
+        band,
+    )
+    return {
+        "available": True,
+        "usable": bool(result.get("usable")),
+        "arrival_delay_ms_B": result.get("delay_ms", 0.0),
+        "correction_delay_ms_B": round(-float(result.get("delay_ms", 0.0)), 4),
+        "polarity": result.get("polarity", "unknown"),
+        "corr_norm": result.get("corr_norm", 0.0),
+        "sample_rate": fs_a,
+        "a_file": a.get("path", ""),
+        "b_file": b.get("path", ""),
+    }
+
+
+def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap,
+                                impulse_root: Path | None = None) -> List[Dict[str, object]]:
+    impulses = load_optional_impulses(impulse_root)
     rows: List[Dict[str, object]] = []
     for spec in crossover_specs(freqs, rich):
         a_name = str(spec["a"])
@@ -837,6 +1007,8 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
             "band": f"{band[0]:.0f}-{band[1]:.0f} Hz",
             "phase_available": phase_available,
         }
+        impulse = _impulse_pair_result(impulses.get(a_name), impulses.get(b_name), band)
+        row["impulse"] = impulse
         if phase_available:
             phase_diff = _wrap_deg(a["phase"] - b["phase"])
             delay = band_limited_delay_from_phase(freqs, phase_diff, band, coherence=coherence)
@@ -903,6 +1075,124 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
         else:
             row["predicted_sum_rms_db"] = ""
             row["predicted_sum_match"] = "missing together trace"
+
+        # Active crossover ladder: polarity and delay first. APF only earns a
+        # search when those cheaper corrections leave a meaningful residual.
+        ladder: Dict[str, object] = {
+            "available": False,
+            "write_eligible": False,
+            "source": "none",
+            "reason": "phase and usable impulse timing are unavailable",
+        }
+        reference_valid = row.get("predicted_sum_match") in ("high", "medium")
+        if ca is not None and cb is not None:
+            max_delay_ms = 3.0 if spec["name"] == "sub_to_front" else 0.5
+            pd = polarity_delay_search(freqs, ca, cb, band, max_delay_ms=max_delay_ms)
+            gain = float(pd["score_before"]) - float(pd["score_after"])
+            meaningful = (
+                float(pd["score_before"]) >= 0.75
+                and gain >= 0.25
+                and float(pd["improvement_pct"]) >= 10.0
+            )
+            impulse_delay_agreement = None
+            impulse_polarity_agreement = None
+            if impulse.get("usable"):
+                impulse_delay_agreement = abs(
+                    float(pd["delay_ms_B"]) - float(impulse["correction_delay_ms_B"])
+                ) <= 0.15
+                impulse_polarity_agreement = bool(pd["polarity_flip_B"]) == (impulse.get("polarity") == "inverted")
+            impulse_consistent = impulse_delay_agreement is not False and impulse_polarity_agreement is not False
+            polarity_confident = (
+                not bool(pd["polarity_flip_B"])
+                or float(pd["improvement_pct"]) >= 25.0
+                or impulse_polarity_agreement is True
+            )
+            ladder = {
+                "available": True,
+                "source": "complex_phase",
+                "reference_valid": reference_valid,
+                "score_before": pd["score_before"],
+                "score_after_polarity_delay": pd["score_after"],
+                "improvement_pct": pd["improvement_pct"],
+                "polarity_flip_B": bool(pd["polarity_flip_B"]),
+                "correction_delay_ms_B": float(pd["delay_ms_B"]),
+                "residual_needs_apf": bool(pd["residual_needs_apf"]),
+                "impulse_delay_agreement": impulse_delay_agreement,
+                "impulse_polarity_agreement": impulse_polarity_agreement,
+                "write_eligible": bool(reference_valid and meaningful and impulse_consistent and polarity_confident),
+                "reason": (
+                    "measured together trace supports the complex prediction"
+                    if reference_valid and meaningful and impulse_consistent and polarity_confident else
+                    "reference agreement, predicted improvement, polarity confidence, or impulse agreement did not clear the write gate"
+                ),
+            }
+            if ladder["write_eligible"] and pd["residual_needs_apf"]:
+                sign = -1.0 if pd["polarity_flip_B"] else 1.0
+                b_after = sign * cb * np.exp(-1j * 2.0 * np.pi * freqs * float(pd["delay_ms_B"]) / 1000.0)
+                apf_options = [
+                    optimize_allpass(freqs, ca, b_after, band, apply_to=side, gd_penalty=0.5)
+                    for side in ("A", "B")
+                ]
+                apf = min(apf_options, key=lambda item: float(item["selection_score_after"]))
+                if float(apf["improvement_pct"]) >= 10.0 and float(apf["selection_score_after"]) < float(apf["score_before"]):
+                    ladder["apf"] = apf
+                    ladder["score_after_apf"] = apf["selection_score_after"]
+                    ladder["apf_write_eligible"] = spec["name"] == "sub_to_front"
+                    if not ladder["apf_write_eligible"]:
+                        ladder["apf_note"] = "one-sided APF above 1 kHz is report-only; verify live before keeping"
+                else:
+                    ladder["residual_needs_apf"] = False
+            if not ladder["write_eligible"] and not reference_valid and impulse.get("usable"):
+                corr = float(impulse.get("corr_norm", 0.0))
+                destructive = float(row.get("destructive_pct") or 0.0)
+                impulse_polarity_supported = impulse.get("polarity") != "inverted" or corr >= 0.85
+                impulse_delay_limit = 3.0 if spec["name"] == "sub_to_front" else 0.5
+                impulse_delay_supported = abs(float(impulse.get("correction_delay_ms_B", 0.0))) <= impulse_delay_limit
+                impulse_eligible = (
+                    corr >= 0.75
+                    and destructive >= 10.0
+                    and row.get("summation_quality") in ("low", "medium")
+                    and impulse_polarity_supported
+                    and impulse_delay_supported
+                )
+                if impulse_eligible:
+                    ladder = {
+                        "available": True,
+                        "source": "band_limited_impulse_fallback",
+                        "reference_valid": False,
+                        "polarity_flip_B": bool(impulse.get("polarity") == "inverted" and corr >= 0.85),
+                        "correction_delay_ms_B": float(impulse.get("correction_delay_ms_B", 0.0)),
+                        "residual_needs_apf": False,
+                        "write_eligible": True,
+                        "reason": "invalid complex reference replaced by strong impulse evidence plus measured destructive summation",
+                    }
+        elif impulse.get("usable"):
+            corr = float(impulse.get("corr_norm", 0.0))
+            destructive = float(row.get("destructive_pct") or 0.0)
+            impulse_polarity_supported = impulse.get("polarity") != "inverted" or corr >= 0.85
+            impulse_delay_limit = 3.0 if spec["name"] == "sub_to_front" else 0.5
+            impulse_delay_supported = abs(float(impulse.get("correction_delay_ms_B", 0.0))) <= impulse_delay_limit
+            eligible = (
+                corr >= 0.75
+                and destructive >= 10.0
+                and row.get("summation_quality") in ("low", "medium")
+                and impulse_polarity_supported
+                and impulse_delay_supported
+            )
+            ladder = {
+                "available": True,
+                "source": "band_limited_impulse",
+                "reference_valid": False,
+                "polarity_flip_B": bool(impulse.get("polarity") == "inverted" and corr >= 0.85),
+                "correction_delay_ms_B": float(impulse.get("correction_delay_ms_B", 0.0)),
+                "residual_needs_apf": False,
+                "write_eligible": bool(eligible),
+                "reason": (
+                    "strong impulse correlation plus measured destructive summation"
+                    if eligible else "impulse evidence did not clear the conservative write gate"
+                ),
+            }
+        row["crossover_ladder"] = ladder
         rows.append(row)
     return rows
 
@@ -918,21 +1208,15 @@ def trace_channels(trace_name: str) -> Tuple[int, ...]:
 
 
 def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: float) -> List[Dict[str, object]]:
-    """Build deterministic delay/APF edits from crossover diagnostics.
-
-    Delay is written whenever phase-derived relative delay is available. APF is
-    added conservatively when the same row is not full-confidence, so the output
-    remains auditable instead of silently pretending the phase result is perfect.
-    """
+    """Build writes from the gated polarity -> delay -> residual APF ladder."""
     plan: List[Dict[str, object]] = []
     for row in crossover_rows:
-        if not row.get("phase_available") or row.get("relative_delay_ms") in ("", None):
+        ladder = row.get("crossover_ladder")
+        if not isinstance(ladder, dict) or not ladder.get("write_eligible"):
             continue
         try:
-            delay_ms = float(row["relative_delay_ms"])
+            correction_ms_b = float(ladder.get("correction_delay_ms_B", 0.0))
         except (TypeError, ValueError):
-            continue
-        if abs(delay_ms) < 0.02:
             continue
 
         name = str(row.get("name", ""))
@@ -945,31 +1229,66 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
         else:
             continue
 
-        # If A is later than B, delay B. If A is earlier, delay A.
-        target_trace = b_trace if delay_ms > 0 else a_trace
-        write_delay_ms = abs(delay_ms)
-        channels = trace_channels(target_trace)
-        if not channels:
+        polarity_flip = bool(ladder.get("polarity_flip_B"))
+        if name == "sub_to_front":
+            # Flipping the sub is magnitude-equivalent to flipping the whole
+            # front stage and preserves front-stage absolute polarity.
+            polarity_channels = trace_channels(a_trace) if polarity_flip else ()
+        else:
+            polarity_channels = trace_channels(b_trace) if polarity_flip else ()
+
+        delay_channels: Tuple[int, ...] = ()
+        write_delay_ms = 0.0
+        if abs(correction_ms_b) >= 0.02:
+            if correction_ms_b > 0.0:
+                if name == "sub_to_front":
+                    delay_channels = tuple(range(0, 6 if FRONT_LAYOUT == "3way" else 4))
+                else:
+                    delay_channels = trace_channels(b_trace)
+            else:
+                delay_channels = trace_channels(a_trace)
+            write_delay_ms = abs(correction_ms_b)
+
+        apf = ladder.get("apf") if isinstance(ladder.get("apf"), dict) else None
+        apf_channels: Tuple[int, ...] = ()
+        if apf is not None and ladder.get("apf_write_eligible"):
+            apf_channels = trace_channels(a_trace if apf.get("apply_to") == "A" else b_trace)
+
+        if not polarity_channels and not delay_channels and not apf_channels:
             continue
-        phase_full = (
-            row.get("phase_stability") == "trustworthy"
-            and row.get("excess_gd_stability") == "high"
-            and row.get("predicted_sum_match") == "high"
+
+        impulse = row.get("impulse") if isinstance(row.get("impulse"), dict) else {}
+        impulse_agrees = (
+            ladder.get("impulse_delay_agreement") is True
+            and ladder.get("impulse_polarity_agreement") is True
         )
-        lo, hi = [float(x) for x in str(row["band"]).replace("Hz", "").split("-")[:2]]
-        f0 = math.sqrt(lo * hi)
+        phase_full = bool(
+            row.get("predicted_sum_match") == "high"
+            and (impulse_agrees or (not impulse.get("available") and row.get("phase_stability") == "trustworthy"))
+        )
+        operations = []
+        if polarity_channels:
+            operations.append("polarity")
+        if delay_channels:
+            operations.append("delay")
+        if apf_channels:
+            operations.append("apf")
         plan.append({
             "source": row.get("label", name),
-            "kind": "delay_apf" if not phase_full else "delay",
-            "channels": channels,
+            "kind": "_".join(operations),
+            "ladder_source": ladder.get("source"),
+            "polarity_toggle": polarity_flip,
+            "polarity_channels": polarity_channels,
+            "channels": delay_channels,
             "delay_ms": round(write_delay_ms, 4),
             "delay_samples": int(round(ms_to_samples(write_delay_ms, sample_rate_hz))),
-            "apf_f": round(f0, 2),
-            "apf_q": 0.7,
-            "apf": not phase_full,
+            "apf_channels": apf_channels,
+            "apf_f": None if apf is None else float(apf["F"]),
+            "apf_q": None if apf is None else float(apf["Q"]),
+            "apf": bool(apf_channels),
             "confidence": "full" if phase_full else "warning",
             "warning": "" if phase_full else (
-                "not full confidence; re-measure this crossover and verify image, centre focus, and summed level"
+                "not full confidence; re-measure this crossover and verify polarity, arrival, image, and summed level"
             ),
         })
     return plan
@@ -995,22 +1314,36 @@ def apply_phase_writes(xml: str, phase_plan: List[Dict[str, object]] | None) -> 
     blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", xml, re.S)]
     new_blocks = list(blocks)
     delay_add: Dict[int, int] = {}
+    polarity_toggle: Dict[int, bool] = {}
     for edit in phase_plan:
         channels = tuple(int(ch) for ch in edit.get("channels", ()))
         for ch in channels:
             delay_add[ch] = delay_add.get(ch, 0) + int(edit.get("delay_samples", 0))
-            if edit.get("apf") and 0 <= ch < len(new_blocks):
-                new_blocks[ch] = add_allpass_to_oc(new_blocks[ch], float(edit["apf_f"]), float(edit["apf_q"]))
+        for ch in (int(value) for value in edit.get("polarity_channels", ())):
+            polarity_toggle[ch] = not polarity_toggle.get(ch, False)
+        if edit.get("apf"):
+            for ch in (int(value) for value in edit.get("apf_channels", ())):
+                if 0 <= ch < len(new_blocks):
+                    new_blocks[ch] = add_allpass_to_oc(new_blocks[ch], float(edit["apf_f"]), float(edit["apf_q"]))
     out = replace_oc_blocks(xml, new_blocks)
 
-    if delay_add:
+    if delay_add or polarity_toggle:
         tags = list(re.finditer(r"<T [^>]*/?>", out))
-        for ch, add_samples in sorted(delay_add.items(), reverse=True):
-            if ch >= len(tags) or add_samples == 0:
+        changed_channels = set(delay_add) | {ch for ch, toggle in polarity_toggle.items() if toggle}
+        for ch in sorted(changed_channels, reverse=True):
+            if ch >= len(tags):
                 continue
             tag = tags[ch].group()
-            current = int(float(slot_attr(tag, "T") or "0"))
-            new_tag = set_attr(tag, "T", str(current + add_samples))
+            new_tag = tag
+            add_samples = delay_add.get(ch, 0)
+            if add_samples:
+                current = int(float(slot_attr(new_tag, "T") or "0"))
+                new_tag = set_attr(new_tag, "T", str(current + add_samples))
+            if polarity_toggle.get(ch):
+                pm = slot_attr(new_tag, "PM")
+                if pm not in ("1", "4"):
+                    raise ValueError(f"delay tag {ch} has no confirmed PM=1/4 polarity value")
+                new_tag = set_attr(new_tag, "PM", "1" if pm == "4" else "4")
             out = out[:tags[ch].start()] + new_tag + out[tags[ch].end():]
     return out
 
@@ -1040,9 +1373,11 @@ def trust_meter_lines(row: Dict[str, object], crossover_rows: List[Dict[str, obj
         match = item.get("predicted_sum_match", "missing")
         phase = item.get("phase_stability", "missing")
         summing = item.get("summation_quality", "missing")
+        ladder = item.get("crossover_ladder") if isinstance(item.get("crossover_ladder"), dict) else {}
+        ladder_status = "write" if ladder.get("write_eligible") else "report-only"
         notes.append(
             f"- {label} ({item['band']}): phase `{phase}`, excess-GD `{item.get('excess_gd_stability', 'missing')}`, "
-            f"summation `{summing}`, acoustic-sum match `{match}`"
+            f"summation `{summing}`, acoustic-sum match `{match}`, ladder `{ladder_status}`"
         )
     if gate_ms is None or gate_ms <= 0:
         notes.append("- 70-95 Hz improvement: low confidence, gate/phase-valid measurement missing")
@@ -1244,11 +1579,15 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
     new_xml = apply_phase_writes(new_xml, phase_plan)
     encode_afpx(new_xml, path)
     written = decode_afpx(path)
+    allow_delay = any(int(edit.get("delay_samples", 0)) != 0 for edit in (phase_plan or []))
+    allow_polarity = any(bool(edit.get("polarity_channels")) for edit in (phase_plan or []))
+    allow_apf = any(bool(edit.get("apf_channels")) for edit in (phase_plan or []))
     lint = afpx_roundtrip_lint(
         base_xml,
         written,
-        allow_delay_changes=bool(phase_plan),
-        allowed_added_types=("17", "20") if phase_plan else ("17",),
+        allow_delay_changes=allow_delay,
+        allow_polarity_changes=allow_polarity,
+        allowed_added_types=("17", "20") if allow_apf else ("17",),
     )
     if not lint["pass"]:
         raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
@@ -1516,6 +1855,23 @@ class StaticTrial:
         raise KeyError(name)
 
 
+def file_fingerprint(path: Path) -> Dict[str, object]:
+    path = Path(path)
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "exists": True,
+        "size": stat.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def write_report(
     out_dir: Path,
     rows: List[Dict[str, object]],
@@ -1606,8 +1962,25 @@ def write_report(
         })
     summary_payload = {
         "run_folder": str(out_dir),
+        "data_root": str(DATA_ROOT.resolve()),
+        "front_layout": FRONT_LAYOUT,
         "baseline": str(args.baseline),
         "target": str(args.target),
+        "input_fingerprints": {
+            "baseline": file_fingerprint(args.baseline),
+            "target": file_fingerprint(args.target),
+        },
+        "run_config": {
+            key: (str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key))
+            for key in (
+                "seed", "profile", "sampler", "proposal", "jobs", "seconds",
+                "max_trials", "filter_cost_scale", "worst_weight",
+                "validation_threshold", "gate_ms", "sample_rate", "phase_writes", "impulse_root",
+                "refine_top", "refine_passes",
+            )
+            if hasattr(args, key)
+        },
+        "refinement": getattr(args, "refinement", None),
         "trials": getattr(args, "trials", ""),
         "candidate_count": len(rows),
         "top_candidates": summary_rows,
@@ -1645,7 +2018,7 @@ def write_report(
         f"- Baseline: `{args.baseline}`",
         f"- Target: `{args.target}`",
         f"- Trials: `{args.trials}`",
-        "- Mode: PEQ from magnitude data; optional delay/APF from phase-valid crossover data; no crossover/polarity/shelf/level writes",
+        "- Mode: PEQ from magnitude data; optional polarity/delay/APF from gated crossover evidence; no crossover/shelf/level writes",
         "- Objective: imported `afpx_objective.score_bands(band_sets)['objective']`; lower is better. Search-space guardrails restrict what candidates are generated, but no extra target-matching term is added.",
         "",
         "## Validation Gate",
@@ -1676,7 +2049,7 @@ def write_report(
         lines.append("- No strong L/R destructive-summing regions were flagged by the TXT magnitude audit.")
     lines.extend([
         "- Destructive pair-summing regions are masked from tonal scoring so EQ cannot win by filling phase nulls.",
-        "- Delay, all-pass, polarity, and crossover changes require phase-valid fixed-position sweeps.",
+        "- Polarity, delay, and all-pass writes require validated fixed-position crossover evidence; crossovers remain untouched.",
         "",
         "## Crossover Phase Confidence",
         "",
@@ -1685,34 +2058,55 @@ def write_report(
         lines.append(f"- {note}")
     if crossover_rows:
         for item in crossover_rows:
+            ladder = item.get("crossover_ladder") if isinstance(item.get("crossover_ladder"), dict) else {}
+            ladder_action = (
+                f"flip-B `{ladder.get('polarity_flip_B', False)}`, correction-B "
+                f"`{ladder.get('correction_delay_ms_B', '')}` ms, improvement "
+                f"`{ladder.get('improvement_pct', '')}`%, write `{ladder.get('write_eligible', False)}`"
+            )
+            impulse = item.get("impulse") if isinstance(item.get("impulse"), dict) else {}
+            impulse_text = (
+                f"; impulse correction `{impulse.get('correction_delay_ms_B')}` ms, "
+                f"polarity `{impulse.get('polarity')}`, correlation `{impulse.get('corr_norm')}`"
+                if impulse.get("available") else "; impulse `missing`"
+            )
             lines.append(
-                f"- {item['label']} `{item['band']}`: delay `{item.get('relative_delay_ms', '')}` ms; "
+                f"- {item['label']} `{item['band']}`: phase-slope delay `{item.get('relative_delay_ms', '')}` ms; "
                 f"polarity `{item.get('polarity', '')}`; phase `{item.get('phase_stability', '')}`; "
                 f"excess-GD `{item.get('excess_gd_stability', '')}` ({item.get('minimum_phase_pct', '')}% minimum-phase bins); "
                 f"summation `{item.get('summation_quality', '')}`; predicted-sum `{item.get('predicted_sum_match', '')}` "
-                f"({item.get('predicted_sum_rms_db', '')} dB RMS)"
+                f"({item.get('predicted_sum_rms_db', '')} dB RMS); ladder {ladder_action}{impulse_text}."
             )
     else:
         lines.append("- No crossover-band phase diagnostics were available from the supplied measurement set.")
     lines.extend([
         "",
-        "## Written Delay / APF Changes",
+        "## Written Polarity / Delay / APF Changes",
         "",
     ])
     if phase_plan:
         for edit in phase_plan:
             channels = ", ".join("ch%d" % int(ch) for ch in edit.get("channels", ()))
+            polarity = ""
+            if edit.get("polarity_channels"):
+                polarity_channels = ", ".join("ch%d" % int(ch) for ch in edit.get("polarity_channels", ()))
+                polarity = f"toggled polarity on {polarity_channels}; "
             apf = ""
             if edit.get("apf"):
-                apf = f"; APF T=20 at `{edit.get('apf_f')}` Hz Q`{edit.get('apf_q')}`"
+                apf_channels = ", ".join("ch%d" % int(ch) for ch in edit.get("apf_channels", ()))
+                apf = f"; APF T=20 at `{edit.get('apf_f')}` Hz Q`{edit.get('apf_q')}` on {apf_channels}"
             warning = edit.get("warning") or "full-confidence phase write"
+            delay_text = (
+                f"added `{edit.get('delay_ms')}` ms (`{edit.get('delay_samples')}` samples) to {channels}"
+                if edit.get("channels") else "no delay change"
+            )
             lines.append(
-                f"- {edit.get('source')}: added `{edit.get('delay_ms')}` ms "
-                f"(`{edit.get('delay_samples')}` samples) to {channels}{apf}. Confidence `{edit.get('confidence')}`: {warning}."
+                f"- {edit.get('source')}: {polarity}{delay_text}{apf}. "
+                f"Confidence `{edit.get('confidence')}`: {warning}."
             )
         lines.append("- After loading the tune, re-measure the affected crossover pairs and confirm centre image, summed level, and that no new hole appeared either side of the crossover.")
     else:
-        lines.append("- No delay/APF writes were made because phase-valid crossover data was missing or delay was below the write threshold.")
+        lines.append("- No polarity/delay/APF writes cleared the crossover-ladder confidence and improvement gates.")
     lines.extend([
         "",
         "## Family Picks",
@@ -1784,8 +2178,10 @@ def main() -> None:
     parser.add_argument("--min-total-bands", type=int, default=0)
     parser.add_argument("--gate-ms", type=float, default=None, help="Optional impulse/window gate length in milliseconds for confidence warnings.")
     parser.add_argument("--sample-rate", type=float, default=96000.0, help="DSP internal sample rate used for delay writes.")
+    parser.add_argument("--impulse-root", type=Path, default=None,
+                        help="Optional folder containing companion WAV/text impulse exports; defaults to the measurement folder.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
-                        help="Use 'off' to report phase diagnostics without writing delay/APF changes.")
+                        help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -1803,7 +2199,7 @@ def main() -> None:
     target = raw_target + target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
-    crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces)
+    crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
     phase_plan = [] if args.phase_writes == "off" else phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:

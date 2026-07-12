@@ -74,11 +74,26 @@ def main() -> None:
     parser.add_argument("run_folder", type=Path)
     parser.add_argument("--top", type=int, default=5)
     parser.add_argument("--out", type=Path, default=Path("latest_run_summary.json"))
+    parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact")
     args = parser.parse_args()
 
     payload = summarise(args.run_folder.resolve(), args.top)
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(json.dumps(payload, indent=2))
+    if args.print_mode == "none":
+        return
+    if args.print_mode == "full":
+        print(json.dumps(payload, indent=2))
+        return
+    top = payload.get("top_candidates", [])
+    best = top[0] if top else None
+    print(json.dumps({
+        "run_folder": payload.get("run_folder"),
+        "candidate_count": payload.get("candidate_count"),
+        "best": best,
+        "family_picks": payload.get("family_picks", payload.get("family_files", [])),
+        "warning_count": len(payload.get("warnings", [])),
+        "summary_file": str(args.out.resolve()),
+    }, indent=2))
 
 
 if __name__ == "__main__":

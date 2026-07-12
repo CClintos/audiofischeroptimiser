@@ -2,9 +2,11 @@
 
 This repo is a local AFPX tuning tool for Helix / Audiotec Fischer DSP systems.
 
+For AI-assisted work, start with `AGENTS.md` and `docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md` to open only the relevant files.
+
 It takes your baseline `.afpx` tune plus REW measurement exports, tries many possible PEQ combinations, scores them, and gives you back ranked AFPX tune candidates to test.
 
-The goal is to improve the tune conservatively. PEQ is always handled from magnitude data; delay/APF edits are written when phase-valid crossover measurements are present, and the report warns when the phase confidence is not full.
+The goal is to improve the tune conservatively. PEQ is handled from magnitude data. Crossover correction follows a gated polarity -> delay -> residual APF ladder, and the report warns when confidence is not full.
 
 It also includes beta `.pct6` container support for newer DSP PC-Tool 6 tunes, so the repo can inspect or round-trip those files too. That path is less proven than `.afpx`, and should be treated as a careful utility rather than a blindly trusted writer.
 
@@ -18,13 +20,15 @@ It scores candidates by:
 - whether each filter is on a driver that is actually contributing at that frequency
 - whether it avoids wasting filters, using unnecessary gain, or adding deep/narrow one-seat corrections
 
-The math layer also includes optional confidence and timing helpers for future phase-valid measurements:
+The math layer also includes confidence and timing helpers for phase-valid measurements:
 
 - coherence weighting, so low-trust bins count less
 - band-limited phase-delay estimation around crossover regions
 - gated impulse helpers that estimate how low a time window can be trusted
 
-Those helpers are now used in candidate reports and output writing when the measurement exports contain enough data. The optimizer inspects crossover bands such as sub-to-midbass and mid-to-tweeter for delay, polarity, phase stability, summation quality, and acoustic-sum agreement. It writes the delay/APF changes alongside the PEQ candidates, then explains confidence and re-measure checks in the report.
+The optimizer first proves that the solo complex responses reproduce the measured together trace. It then tests polarity and delay, and searches an APF only if a meaningful residual remains. Invalid reference locks, weak predicted improvements, ambiguous polarity, and conflicting impulse evidence block automatic writes. Written AFPX candidates are linted so only the intended PEQ, `PM` polarity, delay values, and APF slots may change.
+
+Optional companion impulse exports can be WAV or two-column time/amplitude text. Put them beside the measurements, or in an `impulses` folder, using the measurement stem, for example `Front L High.wav`, `Front L High Impulse.wav`, or `Front L High IR.txt`. Use `--impulse-root` / `-ImpulseRoot` when they live elsewhere. Band-limited cross-correlation supplies arrival and polarity evidence; disagreement with the complex-phase solution vetoes the write.
 
 Supported REW text export rows:
 
@@ -53,7 +57,7 @@ I have attached:
 - optionally my target curve
 
 Please verify the files, run the optimizer locally, merge the results, and give me the best AFPX candidates with a short summary of what improved.
-Delay/APF changes may be written when phase-valid measurements support them. Crossovers and polarity are still left alone.
+Polarity/delay/APF changes may be written only when the crossover ladder clears its evidence gates. Crossovers remain untouched.
 ```
 
 ## How It Scores
@@ -65,15 +69,15 @@ It does not just chase a flat mono sum. Its scoring is designed to:
 - penalize boosting into destructive nulls
 - penalize unsupported asymmetric EQ
 - penalize unnecessary gain, wasted filters, and deep/narrow corrections
-- write delay/APF changes only from crossover-band phase evidence, with warnings when confidence is not full
-- leave crossovers and polarity alone
+- write polarity/delay/APF changes only from gated crossover evidence, with warnings when confidence is not full
+- leave crossovers alone
 
 The optimizer is designed to:
 
 - improve tonal accuracy
 - improve left/right balance
 - avoid boosting into destructive nulls
-- keep the tune conservative and PEQ-only
+- keep PEQ conservative and phase writes independently auditable
 - prefer fewer, wider, symmetric, shallower filters unless the solo measurements justify otherwise
 
 Expected measurement files:
@@ -106,12 +110,18 @@ Expected tune file:
 - [pct6.py](./pct6.py): beta `.pct6` decode / encode utility for no-password PC-Tool 6 saves
 - [PCT6_SUPPORT.md](./PCT6_SUPPORT.md): caveats and safe usage notes for `.pct6`
 
+The optimizer normalizes REW exports to the 96-points-per-octave grid used by its
+ERB and perceptual scoring math. The streaming search then applies a small
+hardware-step coordinate refinement to its best candidates using the same named
+scalar objective; it does not add a second flatness target.
+
 ## Compact Local Summaries
 
 These scripts are for Claude/Codex efficiency. They produce small JSON files so an assistant does not need to read raw logs, every candidate, or full measurement exports.
 
-- Every optimiser run now writes `optimizer_summary.json` beside `optimizer_report.md` and `optimizer_results.csv`.
-- [scripts/make_measurement_manifest.py](./scripts/make_measurement_manifest.py): checks which expected measurements exist, detects 2-way/3-way layout, and notes phase/coherence columns.
+- Every optimiser run writes `optimizer_summary.json` beside `optimizer_report.md` and `optimizer_results.csv`. It includes input file hashes, run settings, validation, phase confidence, named score components, and refinement results.
+- Console helpers default to compact output while retaining full JSON/Markdown/CSV files locally. Use `--print-mode full` only when the extra detail is needed.
+- [scripts/make_measurement_manifest.py](./scripts/make_measurement_manifest.py): resolves common REW filename aliases, detects 2-way/3-way layout and phase/coherence columns, and warns about inconsistent source level, timing reference, or frequency grids.
 - [scripts/summarise_optimizer_run.py](./scripts/summarise_optimizer_run.py): summarizes an optimizer output folder, preferring `optimizer_summary.json` with CSV fallback.
 - [scripts/summarise_candidate_filters.py](./scripts/summarise_candidate_filters.py): summarizes one candidate's added filters and risk flags.
 - [scripts/verify_written_tune.py](./scripts/verify_written_tune.py): verifies candidate AFPX files only changed intended fields.
@@ -130,11 +140,11 @@ python .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_
 This tool is intentionally conservative.
 
 - It optimizes PEQ from magnitude data.
-- It can edit delay tags when phase-valid crossover data is present.
+- It can edit polarity, delay tags, and residual APFs when the crossover ladder clears its gates.
 - It does not change crossovers.
 - It can add conservative APF filters when the phase report shows residual crossover uncertainty.
 - It treats destructive summing regions as not EQ-fixable.
 
 For `.pct6`, the repo currently provides careful container decode / encode support and inspection helpers. AFPX writing is still the primary automated output path.
 
-That means it is primarily a PEQ optimizer, with conservative delay/APF writes only when the measurement exports contain usable phase evidence.
+That means it is primarily a PEQ optimizer, with conservative polarity/delay/APF writes only when crossover evidence clears the active ladder gates.

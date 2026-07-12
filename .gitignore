@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 *.afpx
+*.pct6
+*.mdat
+*.wav
 baseline.afpx
 Front L High.txt
 Front L Tweeter.txt

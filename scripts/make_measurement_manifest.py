@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
-HIGH_L = ("Front L High.txt", "Front L Tweeter.txt")
-HIGH_R = ("Front R High.txt", "Front R Tweeter.txt")
-MID_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt")
-MID_R = ("Front R Mid.txt", "Front R MID.txt", "Front R Midrange.txt")
-LOW_L = ("Front L Low.txt", "Front L Midbass.txt", "Front L Mid Bass.txt")
-LOW_R = ("Front R Low.txt", "Front R Midbass.txt", "Front R Mid Bass.txt")
+HIGH_L = ("Front L High.txt", "Front L Tweeter.txt", "Front Left High.txt", "Front Left Tweeter.txt")
+HIGH_R = ("Front R High.txt", "Front R Tweeter.txt", "Front Right High.txt", "Front Right Tweeter.txt")
+MID_L = ("Front L Mid.txt", "Front L MID.txt", "Front L Midrange.txt", "Front Left Mid.txt")
+MID_R = ("Front R Mid.txt", "Front R MID.txt", "Front R Midrange.txt", "Front Right Mid.txt")
+LOW_L = ("Front L Low.txt", "Front L Midbass.txt", "Front L Mid Bass.txt", "Front Left Low.txt")
+LOW_R = ("Front R Low.txt", "Front R Midbass.txt", "Front R Mid Bass.txt", "Front Right Low.txt")
 MID_PAIR = ("Both Mids.txt", "Mids Together.txt", "Midrange Together.txt")
 LOW_PAIR = ("Mid Bass Together.txt", "Both Midbass.txt", "Both Midbasses.txt", "Both Mid Bass.txt")
-SUB = ("Sub.txt", "SUB.txt")
+SUB = ("Sub.txt", "SUB.txt", "Subwoofer.txt")
 SYSTEM = ("System Sum.txt", "SYSTEM SUM.txt")
 HIGH_PAIR = ("Tweeters Together.txt", "Both Tweeters.txt")
 
@@ -26,23 +27,64 @@ def first_existing(root: Path, aliases: tuple[str, ...]) -> Path | None:
     return None
 
 
-def has_numeric_column(path: Path, min_cols: int) -> bool:
-    try:
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = line.strip()
-            if not s or s.startswith("*") or s[0].isalpha():
-                continue
-            vals = []
-            for part in s.replace(",", " ").split()[:min_cols]:
-                try:
-                    vals.append(float(part))
-                except ValueError:
-                    break
-            if len(vals) >= min_cols:
-                return True
-    except OSError:
-        return False
-    return False
+def companion_impulse(root: Path, measurement: Path) -> Path | None:
+    stem = measurement.stem
+    names = (
+        f"{stem}.wav", f"{stem} Impulse.wav", f"{stem} IR.wav",
+        f"{stem} Impulse.txt", f"{stem} IR.txt",
+    )
+    for folder in (root, root / "impulses", root / "Impulse", root / "IR"):
+        for name in names:
+            path = folder / name
+            if path.exists():
+                return path
+    return None
+
+
+def rew_metadata(path: Path) -> dict[str, object]:
+    """Read one export once and return only compact trust/provenance fields."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    number = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))"
+    delay = re.search(r"\bDelay\s+" + number + r"\s+ms", text[:3000])
+    volume = re.search(r"\bvolume:\s*" + number, text[:3000], re.I)
+    sweep = re.search(r"\b(?:sweep|sweeps)\s+at\s+" + number + r"\s+dBFS", text[:3000], re.I)
+    timing = re.search(r"reference played from\s+([^\r\n]+?)(?:\s+with|$)", text[:3000], re.I | re.M)
+    rows = 0
+    columns = 0
+    first_frequency = None
+    last_frequency = None
+    for line in text.splitlines():
+        value = line.strip()
+        if not value or value.startswith("*"):
+            continue
+        numeric = []
+        for part in value.replace(",", " ").split():
+            try:
+                numeric.append(float(part))
+            except ValueError:
+                break
+        if len(numeric) < 2:
+            continue
+        rows += 1
+        columns = max(columns, len(numeric))
+        if first_frequency is None:
+            first_frequency = numeric[0]
+        last_frequency = numeric[0]
+    return {
+        "file": path.name,
+        "bytes": path.stat().st_size,
+        "rows": rows,
+        "columns": columns,
+        "start_hz": first_frequency,
+        "end_hz": last_frequency,
+        "phase": columns >= 3,
+        "coherence": columns >= 4,
+        "position_id": columns >= 5,
+        "delay_ms": float(delay.group(1)) if delay else None,
+        "source_volume": float(volume.group(1)) if volume else None,
+        "sweep_dbfs": float(sweep.group(1)) if sweep else None,
+        "timing_reference": timing.group(1).strip() if timing else "",
+    }
 
 
 def measurement_spec(layout: str) -> dict[str, tuple[str, ...]]:
@@ -85,6 +127,9 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
     resolved: dict[str, str] = {}
     phase_files: list[str] = []
     coherence_files: list[str] = []
+    position_files: list[str] = []
+    metadata: dict[str, dict[str, object]] = {}
+    impulse_files: dict[str, str] = {}
 
     for role, aliases in spec.items():
         found = first_existing(root, aliases)
@@ -93,14 +138,48 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
             continue
         present.append(found.name)
         resolved[role] = str(found)
-        if has_numeric_column(found, 3):
+        info = rew_metadata(found)
+        metadata[role] = info
+        impulse = companion_impulse(root, found)
+        if impulse is not None:
+            impulse_files[role] = str(impulse)
+        if info["phase"]:
             phase_files.append(found.name)
-        if has_numeric_column(found, 4):
+        if info["coherence"]:
             coherence_files.append(found.name)
+        if info["position_id"]:
+            position_files.append(found.name)
 
     baseline_path = baseline or first_existing(root, ("baseline.afpx",))
     target_path = target or first_existing(root, ("ResoNix Target Curve 2026.txt", "target.txt"))
     phase_available = len(phase_files) >= 2
+    impulse_available = len(impulse_files) >= 2
+
+    warnings: list[str] = []
+    if missing:
+        warnings.append(f"missing_required_measurements:{len(missing)}")
+    if not baseline_path or not baseline_path.exists():
+        warnings.append("baseline_missing")
+    if not target_path or not target_path.exists():
+        warnings.append("target_missing")
+    volumes = sorted({info["source_volume"] for info in metadata.values() if info["source_volume"] is not None})
+    if len(volumes) > 1:
+        warnings.append("measurement_source_volume_changed")
+    timing_refs = sorted({str(info["timing_reference"]) for info in metadata.values() if info["timing_reference"]})
+    if len(timing_refs) > 1:
+        warnings.append("mixed_timing_references")
+    grids = {
+        (round(float(info["start_hz"]), 3), round(float(info["end_hz"]), 3), int(info["rows"]))
+        for info in metadata.values()
+        if info["start_hz"] is not None and info["end_hz"] is not None
+    }
+    if len(grids) > 1:
+        warnings.append("measurement_frequency_grids_differ")
+    if not phase_available and impulse_available:
+        warnings.append("phase_unavailable_impulse_timing_only")
+    elif not phase_available:
+        warnings.append("phase_unavailable_peq_only")
+    delays = [float(info["delay_ms"]) for info in metadata.values() if info["delay_ms"] is not None]
 
     return {
         "measurement_folder": str(root),
@@ -115,7 +194,33 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
         "phase_available": phase_available,
         "phase_files": sorted(phase_files),
         "coherence_files": sorted(coherence_files),
-        "safe_mode": "phase_delay_apf_available" if phase_available else "magnitude_only_peq",
+        "position_id_files": sorted(position_files),
+        "impulse_files": impulse_files,
+        "measurement_metadata": metadata,
+        "measurement_conditions": {
+            "source_volumes": volumes,
+            "timing_references": timing_refs,
+            "phase_delay_range_ms": [] if not delays else [round(min(delays), 4), round(max(delays), 4)],
+            "frequency_grid_count": len(grids),
+        },
+        "warnings": warnings,
+        "safe_mode": "crossover_ladder_available" if phase_available or impulse_available else "magnitude_only_peq",
+    }
+
+
+def compact_manifest(manifest: dict[str, object]) -> dict[str, object]:
+    return {
+        "measurement_folder": manifest["measurement_folder"],
+        "detected_layout": manifest["detected_layout"],
+        "safe_mode": manifest["safe_mode"],
+        "baseline_afpx": manifest["baseline_afpx"],
+        "target_curve": manifest["target_curve"],
+        "measurement_count": len(manifest["measurements_present"]),
+        "missing": manifest["measurements_missing"],
+        "phase_file_count": len(manifest["phase_files"]),
+        "coherence_file_count": len(manifest["coherence_files"]),
+        "impulse_file_count": len(manifest["impulse_files"]),
+        "warnings": manifest["warnings"],
     }
 
 
@@ -125,11 +230,14 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path, default=None)
     parser.add_argument("--target", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=Path("latest_measurement_manifest.json"))
+    parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact")
     args = parser.parse_args()
 
     manifest = build_manifest(args.root.resolve(), args.baseline, args.target)
     args.out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(json.dumps(manifest, indent=2))
+    if args.print_mode != "none":
+        payload = manifest if args.print_mode == "full" else compact_manifest(manifest)
+        print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

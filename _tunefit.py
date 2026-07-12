@@ -297,7 +297,8 @@ def interference_audit(freqs, solo_a_db, solo_b_db, together_db, flag_db=2.0,
 #   T=19 1st-order ALL-PASS (G=0, Q written as 1 placeholder; MIDDLE slots OK)
 #        [CONFIRMED 2026-07-03: PC-Tool screenshot, Band 20 middle slot,
 #         "Q: N/A for 1st order", "1. Order" active]
-#   T=20 2nd-order ALL-PASS (G=0, Q meaningful 0.5-2)       [VERIFIED 2026-07-02]
+#   T=20 2nd-order ALL-PASS (G=0, Q meaningful and frequency-limited)
+#        [TYPE VERIFIED 2026-07-02; Q range corrected 2026-07-10]
 # The I attribute (present on EVERY <Fil>) = the INVERT flag, 0/1 -- VERIFIED
 # 2026-07-03 by export-diff: pressing 'invert' on the T=19 APF flipped exactly
 # I="0" -> I="1" and nothing else in the whole file. (It was previously
@@ -311,7 +312,10 @@ def allpass_fil_str(F, Q, FN, dF='20000', invert=False):
     """2nd-order all-pass (T=20). G always "0" -- that's what makes it an APF.
     Middle slots allowed (verified via the T=19 sighting + AF docs), but default
     stays the end slot for consistency with the verified example."""
-    assert 0.5 <= Q <= 2.0, 'APF Q must be 0.5-2 (hardware range, AF PC-Tool 4 spec)'
+    # Audiotec Fischer documents Q3 examples and states that the actual maximum
+    # depends on corner frequency. AFPX stores Q directly; PC-Tool/device
+    # acceptance must therefore be checked for high-Q, low-frequency filters.
+    assert 0.1 <= Q <= 15.0, 'APF Q must be 0.1-15 before the device-specific frequency limit'
     return '<Fil G="0" FN="%s" F="%.2f" T="20" I="%s" dF="%s" Q="%s"/>' % (FN, F, '1' if invert else '0', dF, Q)
 
 def allpass1_fil_str(F, FN, dF, invert=False):
@@ -838,8 +842,8 @@ def polarity_delay_search(freqs, driver_a, driver_b, band, max_delay_ms=1.5,
                           steps=121, damage_band=(60.0, 16000.0), damage_free_db=0.5):
     """Search polarity (binary, on B) x local delay (on B, +ve = B later) for the
     best summed response in `band`. Candidate finder, not a finalizer: apply the
-    winning polarity/delay in PC-Tool (delay via the TA UI -- Python still never
-    writes <T> tags), then re-measure the together trace to confirm.
+    winning polarity/delay for the caller to write or test, then re-measure the
+    together trace to confirm.
     SIGN NOTE: delay_ms_B < 0 means B must arrive EARLIER, which hardware can't
     do -- apply +|delay| to the OTHER branch instead (keep its pair's internal
     offsets intact), exactly like the doc's negative-delay TA rule."""

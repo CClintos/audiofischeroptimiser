@@ -29,6 +29,39 @@ def delay_tags(xml: str) -> list[tuple[tuple[str, str], ...]]:
     return [tuple(sorted(attrs(t).items())) for t in re.findall(r"<T [^>]*/?>", xml)]
 
 
+def delay_values(xml: str) -> list[str | None]:
+    return [attrs(tag).get("T") for tag in re.findall(r"<T [^>]*/?>", xml)]
+
+
+def delay_polarities(xml: str) -> list[str | None]:
+    return [attrs(tag).get("PM") for tag in re.findall(r"<T [^>]*/?>", xml)]
+
+
+def delay_other_attributes(xml: str) -> list[tuple[tuple[str, str], ...]]:
+    rows = []
+    for tag in re.findall(r"<T [^>]*/?>", xml):
+        rows.append(tuple(sorted((key, value) for key, value in attrs(tag).items() if key not in {"T", "PM"})))
+    return rows
+
+
+def output_attributes(xml: str, exclude: set[str] | None = None) -> list[tuple[tuple[str, str], ...]]:
+    excluded = exclude or set()
+    rows = []
+    for block in re.findall(r"<OC\b.*?</OC>", xml, re.S):
+        opening = re.match(r"<OC\b[^>]*>", block)
+        values = attrs(opening.group()) if opening else {}
+        rows.append(tuple(sorted((key, value) for key, value in values.items() if key not in excluded)))
+    return rows
+
+
+def output_polarities(xml: str) -> list[str | None]:
+    values = []
+    for block in re.findall(r"<OC\b.*?</OC>", xml, re.S):
+        opening = re.match(r"<OC\b[^>]*>", block)
+        values.append(attrs(opening.group()).get("CINV") if opening else None)
+    return values
+
+
 def filter_key(tag: str) -> tuple[tuple[str, str | None], ...]:
     a = attrs(tag)
     return tuple((k, a.get(k)) for k in ("T", "F", "Q", "G", "dF", "I", "FilBy"))
@@ -59,7 +92,8 @@ def multiset_delta(old_items: list[object], new_items: list[object]) -> tuple[li
     return added, removed
 
 
-def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool) -> dict[str, object]:
+def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
+           allow_polarity: bool = False) -> dict[str, object]:
     old_xml = decode_afpx(baseline)
     new_xml = decode_afpx(candidate)
     old_all = filter_keys(old_xml)
@@ -69,7 +103,13 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool) 
     removed_types = sorted({dict(item).get("T", "") for item in removed})
     removed_nonfree = [item for item in removed if dict(item).get("T") != "1"]
 
-    delay_changed = delay_tags(old_xml) != delay_tags(new_xml)
+    delay_changed = delay_values(old_xml) != delay_values(new_xml)
+    polarity_changed = (
+        delay_polarities(old_xml) != delay_polarities(new_xml)
+        or output_polarities(old_xml) != output_polarities(new_xml)
+    )
+    delay_attributes_changed = delay_other_attributes(old_xml) != delay_other_attributes(new_xml)
+    output_attributes_changed = output_attributes(old_xml, {"CINV"}) != output_attributes(new_xml, {"CINV"})
     crossover_changed = filter_keys(old_xml, {"15", "16", "9"}) != filter_keys(new_xml, {"15", "16", "9"})
     apf_added = any(dict(item).get("T") in ("19", "20") for item in added)
     forbidden_added = [
@@ -79,6 +119,12 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool) 
     errors = []
     if delay_changed and not allow_delay:
         errors.append("delay_changed")
+    if polarity_changed and not allow_polarity:
+        errors.append("polarity_changed")
+    if output_attributes_changed:
+        errors.append("unrelated_output_attributes_changed")
+    if delay_attributes_changed:
+        errors.append("unrelated_time_alignment_attributes_changed")
     if crossover_changed:
         errors.append("crossover_changed")
     if apf_added and not allow_apf:
@@ -95,6 +141,9 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool) 
         "errors": errors,
         "peq_only": not delay_changed and not crossover_changed and not apf_added and not forbidden_added and not removed_nonfree,
         "delay_changed": delay_changed,
+        "polarity_changed": polarity_changed,
+        "output_attributes_changed": output_attributes_changed,
+        "time_alignment_attributes_changed": delay_attributes_changed,
         "crossover_changed": crossover_changed,
         "apf_changed": apf_added,
         "added_filter_types": added_types,
@@ -112,10 +161,14 @@ def main() -> None:
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--allow-delay", action="store_true")
     parser.add_argument("--allow-apf", action="store_true")
+    parser.add_argument("--allow-polarity", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("latest_verify_written_tune.json"))
     args = parser.parse_args()
 
-    payload = verify(args.baseline.resolve(), args.candidate.resolve(), args.allow_delay, args.allow_apf)
+    payload = verify(
+        args.baseline.resolve(), args.candidate.resolve(), args.allow_delay,
+        args.allow_apf, args.allow_polarity,
+    )
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(payload, indent=2))
 

@@ -839,8 +839,8 @@ def polarity_delay_search(freqs, driver_a, driver_b, band, max_delay_ms=1.5,
                           steps=121, damage_band=(60.0, 16000.0), damage_free_db=0.5):
     """Search polarity (binary, on B) x local delay (on B, +ve = B later) for the
     best summed response in `band`. Candidate finder, not a finalizer: apply the
-    winning polarity/delay in PC-Tool (delay via the TA UI -- Python still never
-    writes <T> tags), then re-measure the together trace to confirm.
+    winning polarity/delay for the caller to write or test, then re-measure the
+    together trace to confirm.
     SIGN NOTE: delay_ms_B < 0 means B must arrive EARLIER, which hardware can't
     do -- apply +|delay| to the OTHER branch instead (keep its pair's internal
     offsets intact), exactly like the doc's negative-delay TA rule."""

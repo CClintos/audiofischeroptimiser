@@ -2,6 +2,7 @@ param(
     [string]$Root = "Optimizer_Component_20min_70cpu",
     [int]$Top = 20,
     [string]$DataRoot = "",
+    [string]$ImpulseRoot = "",
     [string]$Baseline = "",
     [string]$Target = "",
     [double]$ValidationThreshold = 2.5,
@@ -34,6 +35,7 @@ if (-not (Test-Path -LiteralPath $Root)) {
 $dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
+$impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
 }
@@ -53,6 +55,7 @@ $args = @("_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_
 if ($Baseline -ne "") { $args += @("--baseline", $baselinePath) }
 if ($Target -ne "") { $args += @("--target", $targetPath) }
 if ($GateMs -gt 0) { $args += @("--gate-ms", "$GateMs") }
+if ($impulseRootPath -ne "") { $args += @("--impulse-root", $impulseRootPath) }
 $args += @("--sample-rate", "$SampleRate")
 $args += @("--phase-writes", "$PhaseWrites")
 $rootToken = "_merge_stream_results.py " + $Root
