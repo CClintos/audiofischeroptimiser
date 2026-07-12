@@ -11,3 +11,5 @@ Important repo decisions that should not be rediscovered every session.
 - PCT6 support is useful but still more fragile than AFPX and must be treated carefully.
 - Candidate-file output is preferred over overwriting baselines.
 - Short-term product focus is measurement import, validation, optimisation, and review; live capture is a later phase, not the default direction.
+- Fix active-objective integrity and spatial robustness before adding more APF sophistication or optimizer libraries.
+- Numerical optimization stays local; do not spend model/API credits on candidate evaluation.

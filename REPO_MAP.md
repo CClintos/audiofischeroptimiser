@@ -31,6 +31,8 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 
 - `AGENTS.md`: repo behaviour, scope, validation rules, output style.
 - `README.md`: user-facing usage and repo overview.
+- `docs/AUDIT_2026-07-12.md`: evidence-backed audible/efficiency audit.
+- `docs/ROADMAP.md`: ranked implementation order from that audit.
 - `docs/TEST_COMMANDS.md`: exact run/validation commands.
 - `docs/AUDIO_DSP_RULES.md`: DSP-domain guardrails and safe-change rules.
 - `PCT6_SUPPORT.md`: PCT6 caveats and round-trip safety notes.

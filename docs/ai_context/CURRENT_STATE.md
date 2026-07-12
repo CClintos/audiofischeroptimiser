@@ -38,9 +38,9 @@ record.
 
 ## Objective And Guardrails
 
-- Perceptually weighted tonal error with extra vocal/presence importance.
-- L/R balance from solo traces, not only the mono system sum.
-- Peaks cost more than dips; destructive summation/nulls earn no tonal reward.
+- Perceptually weighted tonal error has extra vocal/presence importance.
+- L/R evidence comes from solo traces, not only the mono system sum.
+- Destructive summation/nulls earn no tonal reward.
 - Penalize positive gain/headroom, wasted or inert filters, unsupported
   asymmetry, deep/narrow corrections, and filter count.
 - EQ only inside a driver's useful passband. Leave crossover skirts and physical
@@ -49,6 +49,11 @@ record.
   are intentionally tighter.
 - The proposed special `+4..5 dB` broad-LF boost exception was rejected. Do not
   add it unless the user reverses that decision.
+
+Audit correction: the active external objective still lacks a distinct
+peak-vs-dip term, reduces L/R balance to a signed median, and aliases one tonal
+value into several report component names. These are P0 roadmap defects, not
+capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
 
 ## Crossover Ladder
 
