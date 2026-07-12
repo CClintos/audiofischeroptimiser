@@ -26,6 +26,10 @@ def risk_for(row: dict[str, str]) -> str:
 
 
 def summarise(run_folder: Path, top: int) -> dict[str, object]:
+    assistant_summary = run_folder / "assistant_summary.json"
+    if assistant_summary.exists():
+        return json.loads(assistant_summary.read_text(encoding="utf-8"))
+
     native_summary = run_folder / "optimizer_summary.json"
     if native_summary.exists():
         payload = json.loads(native_summary.read_text(encoding="utf-8"))
@@ -85,12 +89,12 @@ def main() -> None:
         print(json.dumps(payload, indent=2))
         return
     top = payload.get("top_candidates", [])
-    best = top[0] if top else None
+    best = payload.get("best", top[0] if top else None)
     print(json.dumps({
         "run_folder": payload.get("run_folder"),
         "candidate_count": payload.get("candidate_count"),
         "best": best,
-        "family_picks": payload.get("family_picks", payload.get("family_files", [])),
+        "family_picks": payload.get("families", payload.get("family_picks", payload.get("family_files", []))),
         "warning_count": len(payload.get("warnings", [])),
         "summary_file": str(args.out.resolve()),
     }, indent=2))

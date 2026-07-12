@@ -81,19 +81,24 @@ else:
     }
 TARGET = Path(os.environ.get('AFPX_TARGET', str(DATA_ROOT / 'ResoNix Target Curve 2026.txt')))
 BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'baseline.afpx')))
+LEVEL_CALIBRATION = {}
 ANCHOR_BAND = (300.0, 3000.0)
 
 # ---- objective weights (tunable; defaults encode the reviewed priorities) --
 W = {
     'tonal': 1.0,        # null-masked, vocal-weighted sum RMS  (primary)
-    'mid_balance': 0.6,  # |FL Low - FR Low| median, image band  (imaging)
-    'tw_balance': 0.2,   # |FL High - FR High| median
+    'peak': 0.35,        # positive deviations are more audible than equal dips
+    'mid_balance': 0.6,  # weighted RMS FL/FR mismatch in the image band
+    'tw_balance': 0.2,   # weighted RMS tweeter mismatch
+    'balance_bias': 0.12, # broad signed image pull, separate from mismatch RMS
     'worst': 0.15,       # masked worst-case deviation
     'headroom': 0.4,     # per dB of cascade boost above SOFT_CAP
     'null_boost': 0.8,   # per dB of EQ BOOST landing in a masked null bin (the exploit)
     'parsimony': 0.02,   # per active band
     'added_band': 0.05,   # a new filter must beat the one-seat noise floor
 }
+BALANCE_RMS_SHARE = 0.65
+BALANCE_ABS_SHARE = 0.35
 SOFT_CAP_DB = 3.0        # cascade boost above this starts costing
 VOCAL_BAND = (200.0, 6000.0)
 VOCAL_WEIGHT = 1.8
@@ -103,15 +108,16 @@ INBAND = (60.0, 16000.0)
 # ---- load measured data + target (once) -----------------------------------
 def _load_txt(path):
     f, s = [], []
-    for line in open(path, encoding='utf-8', errors='replace'):
-        line = line.strip()
-        if not line or line.startswith('*'):
-            continue
-        p = line.split()
-        try:
-            f.append(float(p[0])); s.append(float(p[1]))
-        except Exception:
-            continue
+    with open(path, encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith('*'):
+                continue
+            p = line.split()
+            try:
+                f.append(float(p[0])); s.append(float(p[1]))
+            except Exception:
+                continue
     return np.array(f), np.array(s)
 
 
@@ -123,6 +129,13 @@ def _resolve_txt(names):
         if path.exists():
             return path
     return REW_DIR / (names[0] + '.txt')
+
+
+def _calibration_offset(role, path):
+    for key in (role, path.name, path.stem, str(path)):
+        if key in LEVEL_CALIBRATION:
+            return float(LEVEL_CALIBRATION[key])
+    return 0.0
 
 
 def _optimization_grid(freqs, points_per_octave=96):
@@ -143,6 +156,60 @@ def _optimization_grid(freqs, points_per_octave=96):
     if last <= first:
         return freqs
     return 2.0 ** (np.arange(first, last + 1, dtype=float) / float(points_per_octave))
+
+
+def _weighted_rms(values, weights, mask):
+    selected = np.asarray(mask, dtype=bool) & np.isfinite(values) & np.isfinite(weights)
+    if not np.any(selected):
+        return float('inf')
+    weighted = np.asarray(values, dtype=float)[selected] * np.asarray(weights, dtype=float)[selected]
+    den = float(np.sum(np.asarray(weights, dtype=float)[selected] ** 2))
+    return float(np.sqrt(np.sum(weighted ** 2) / max(den, 1e-30)))
+
+
+def tonal_components(freqs, deviation_db, valid_mask):
+    """Return distinct full-band, presence, and positive-peak metrics."""
+    freqs = np.asarray(freqs, dtype=float)
+    dev = np.asarray(deviation_db, dtype=float)
+    valid = np.asarray(valid_mask, dtype=bool)
+    vocal = (freqs >= VOCAL_BAND[0]) & (freqs <= VOCAL_BAND[1])
+    weights = np.ones_like(freqs)
+    weights[vocal] = VOCAL_WEIGHT
+    tonal = _weighted_rms(dev, weights, valid)
+    anchor = _weighted_rms(dev, np.ones_like(freqs), valid)
+    presence = _weighted_rms(dev, np.ones_like(freqs), valid & vocal)
+    peak = _weighted_rms(np.maximum(dev, 0.0), weights, valid)
+    return {
+        'tonal_masked': tonal,
+        'sum_tonal_anchor_db': anchor,
+        'presence_error_db': presence,
+        'peak_penalty_db': peak,
+    }
+
+
+def balance_components(freqs, difference_db, band):
+    """Return broad signed bias and non-cancelling weighted L/R mismatch."""
+    freqs = np.asarray(freqs, dtype=float)
+    diff = np.asarray(difference_db, dtype=float)
+    selected = (freqs >= band[0]) & (freqs <= band[1]) & np.isfinite(diff)
+    if not np.any(selected):
+        return {'bias_db': 0.0, 'mismatch_rms_db': 0.0, 'mismatch_abs_db': 0.0}
+    weights = np.ones_like(freqs)
+    weights[(freqs >= 700.0) & (freqs <= 5000.0)] = 1.8
+    w = weights[selected]
+    d = diff[selected]
+    return {
+        'bias_db': float(np.median(d)),
+        'mismatch_rms_db': float(np.sqrt(np.sum((d * w) ** 2) / max(np.sum(w ** 2), 1e-30))),
+        'mismatch_abs_db': float(np.sum(np.abs(d) * w) / max(np.sum(w), 1e-30)),
+    }
+
+
+def _balance_mismatch(parts):
+    return (
+        BALANCE_RMS_SHARE * parts.get('mismatch_rms_db', 0.0)
+        + BALANCE_ABS_SHARE * parts.get('mismatch_abs_db', 0.0)
+    )
 
 
 _F = None
@@ -172,7 +239,9 @@ def _init():
     raw = {}
     F = None
     for key, nm in SOLO_FILES.items():
-        f, s = _load_txt(_resolve_txt(nm))
+        path = _resolve_txt(nm)
+        f, s = _load_txt(path)
+        s = s + _calibration_offset(key, path)
         if F is None:
             F = f
         raw[key] = (f, s)
@@ -182,15 +251,16 @@ def _init():
         _T[key] = np.interp(log_f, np.log10(source_f), source_s)
     _F = F
     tf, ts = [], []
-    for line in open(TARGET, encoding='utf-8', errors='replace'):
-        line = line.strip()
-        if not line or line[0].isalpha() or line.startswith('*'):
-            continue
-        p = line.replace(',', ' ').split()
-        try:
-            tf.append(float(p[0])); ts.append(float(p[1]))
-        except Exception:
-            continue
+    with open(TARGET, encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line[0].isalpha() or line.startswith('*'):
+                continue
+            p = line.replace(',', ' ').split()
+            try:
+                tf.append(float(p[0])); ts.append(float(p[1]))
+            except Exception:
+                continue
     tgt = np.interp(np.log10(F), np.log10(np.array(tf)), np.array(ts))
     band = (F >= ANCHOR_BAND[0]) & (F <= ANCHOR_BAND[1])
     _TGT = tgt + float(np.median(_T['System Sum'][band] - tgt[band]))
@@ -209,7 +279,8 @@ def _init():
     _NULL_MASK = np.zeros_like(F, dtype=bool)
     for _name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
         _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
-    _V5 = _peqset(zlib.decompress(open(BASELINE_AFPX, 'rb').read()[4:]).decode('utf-8', 'replace'))
+    with open(BASELINE_AFPX, 'rb') as handle:
+        _V5 = _peqset(zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace'))
 
 
 def baseline_band_sets():
@@ -341,15 +412,15 @@ def _guardrail_score(band_sets):
     parsimony = W['added_band'] * n_added
     total = shape + unsupported + wasted + boost_q + asym + parsimony
     return {
-        'guardrail_penalty': round(total, 3),
-        'shape_penalty': round(shape, 3),
-        'unsupported_filter_penalty': round(unsupported, 3),
-        'wasted_band_penalty': round(wasted, 3),
-        'asymmetric_eq_penalty': round(asym, 3),
-        'high_q_boost_penalty': round(boost_q, 3),
-        'added_band_penalty': round(parsimony, 3),
+        'guardrail_penalty': float(total),
+        'shape_penalty': float(shape),
+        'unsupported_filter_penalty': float(unsupported),
+        'wasted_band_penalty': float(wasted),
+        'asymmetric_eq_penalty': float(asym),
+        'high_q_boost_penalty': float(boost_q),
+        'added_band_penalty': float(parsimony),
         'n_added_front_bands': n_added,
-        'worst_driver_share_db': round(worst_share if worst_share is not None else 0.0, 2),
+        'worst_driver_share_db': float(worst_share if worst_share is not None else 0.0),
     }
 
 
@@ -390,17 +461,16 @@ def objective(band_sets):
     inb = (_F >= INBAND[0]) & (_F <= INBAND[1])
     keep = inb & ~_NULL_MASK  # nulls MASKED OUT of tonal error + worst-case
 
-    w = np.ones_like(_F)
-    w[(_F >= VOCAL_BAND[0]) & (_F <= VOCAL_BAND[1])] = VOCAL_WEIGHT
-    tonal = float(np.sqrt(np.sum((dev[keep] * w[keep]) ** 2) / np.sum(w[keep] ** 2)))
+    tonal_parts = tonal_components(_F, dev, keep)
+    tonal = tonal_parts['tonal_masked']
+    peak = tonal_parts['peak_penalty_db']
 
     worst = float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)])))
 
     balances = {}
     for name, (left, right, _together, _band_range, balance_band) in PAIR_SPECS.items():
         diff = erb_smooth(_F, pr[left] - pr[right])
-        sel = (_F >= balance_band[0]) & (_F <= balance_band[1])
-        balances[name] = float(np.median(diff[sel])) if np.any(sel) else 0.0
+        balances[name] = balance_components(_F, diff, balance_band)
 
     # headroom: worst front-channel cascade peak, + boost landing in null bins
     head_peak = 0.0
@@ -415,24 +485,34 @@ def objective(band_sets):
     guard = _guardrail_score(band_sets)
 
     comp = {
-        'tonal_masked': round(tonal, 3),
-        'worst_masked': round(worst, 2),
-        'headroom_peak': round(head_peak, 2),
-        'null_boost_avg': round(null_boost, 2),
+        **tonal_parts,
+        'worst_masked': worst,
+        'headroom_peak': head_peak,
+        'null_boost_avg': null_boost,
         'n_front_bands': n_bands,
     }
     if 'low' in balances:
-        comp['low_balance'] = round(balances['low'], 2)
+        comp['low_balance'] = balances['low']['bias_db']
+        comp['low_balance_rms_db'] = balances['low']['mismatch_rms_db']
+        comp['low_balance_abs_db'] = balances['low']['mismatch_abs_db']
     if 'mid' in balances:
-        comp['mid_balance'] = round(balances['mid'], 2)
+        comp['mid_balance'] = balances['mid']['bias_db']
+        comp['mid_balance_rms_db'] = balances['mid']['mismatch_rms_db']
+        comp['mid_balance_abs_db'] = balances['mid']['mismatch_abs_db']
     if 'high' in balances:
-        comp['tweeter_balance'] = round(balances['high'], 2)
+        comp['tweeter_balance'] = balances['high']['bias_db']
+        comp['tweeter_balance_rms_db'] = balances['high']['mismatch_rms_db']
+        comp['tweeter_balance_abs_db'] = balances['high']['mismatch_abs_db']
+    primary = balances.get('mid', balances.get('low', {}))
+    high = balances.get('high', {})
     balance_term = (
-        W['mid_balance'] * abs(balances.get('mid', balances.get('low', 0.0)))
-        + W['tw_balance'] * abs(balances.get('high', 0.0))
-        + (0.25 * abs(balances.get('low', 0.0)) if 'mid' in balances else 0.0)
+        W['mid_balance'] * _balance_mismatch(primary)
+        + W['tw_balance'] * _balance_mismatch(high)
+        + W['balance_bias'] * abs(primary.get('bias_db', 0.0))
+        + (0.25 * _balance_mismatch(balances['low']) if 'mid' in balances else 0.0)
     )
     scalar = (W['tonal'] * tonal
+              + W['peak'] * peak
               + balance_term
               + W['worst'] * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
@@ -440,7 +520,11 @@ def objective(band_sets):
               + W['parsimony'] * n_bands
               + guard['guardrail_penalty'])
     comp.update(guard)
-    comp['objective'] = round(scalar, 3)
+    comp['balance_penalty_db'] = float(
+        np.sqrt(np.mean([_balance_mismatch(item) ** 2 for item in balances.values()]))
+        if balances else 0.0
+    )
+    comp['objective'] = float(scalar)
     return comp
 
 

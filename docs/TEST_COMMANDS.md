@@ -54,6 +54,15 @@ py -3 .\_benchmark.py
 
 Required when changing scoring or candidate selection logic. Record before/after behaviour, not just whether it ran.
 
+## Regression Suite
+
+```powershell
+py -3 -m unittest discover -s tests -v
+```
+
+This includes objective invariants, measurement-session gates, PEQ/phase
+conflict protection, AFPX write safety, and the modern TXT/AFPX golden fixture.
+
 ## Summarise Completed Runs
 
 ```powershell
@@ -61,6 +70,7 @@ py -3 .\scripts\summarise_optimizer_run.py ".\Optimizer_Run\_merged_top"
 ```
 
 Start here before opening large reports or CSVs.
+The helper reads `assistant_summary.json` first.
 
 ## Summarise One Candidate
 

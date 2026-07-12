@@ -14,8 +14,8 @@ Its scoring system is built to reward tunes that are more likely to sound better
 
 It scores candidates by:
 
-- how close the full system response is to the target, with extra weight through the vocal and midrange region
-- how well left and right match each other, using the individual driver measurements
+- how close the full system response is to the target, with distinct tonal and vocal/presence terms and extra cost for peaks
+- how well left and right match each other, using signed bias plus weighted absolute/RMS mismatch from the solo drivers
 - whether the tune avoids boosting into destructive cancellation nulls
 - whether each filter is on a driver that is actually contributing at that frequency
 - whether it avoids wasting filters, using unnecessary gain, or adding deep/narrow one-seat corrections
@@ -38,6 +38,11 @@ Supported REW text export rows:
 - `freq spl phase coherence position_id`
 
 If you know the impulse/window gate length, pass `-GateMs` to the PowerShell launcher or `--gate-ms` to the Python scripts. The report will warn when a gated response should not be trusted below its lowest valid frequency.
+
+The measurement-session gate checks REW source volume, sweep level, and timing
+reference metadata. Mixed or missing level provenance requires an explicit JSON
+map of role/file names to dB corrections; phase writes require one shared timing
+reference plus measured-together validation.
 
 It is meant to be used through Claude or Codex:
 
@@ -119,10 +124,11 @@ scalar objective; it does not add a second flatness target.
 
 These scripts are for Claude/Codex efficiency. They produce small JSON files so an assistant does not need to read raw logs, every candidate, or full measurement exports.
 
-- Every optimiser run writes `optimizer_summary.json` beside `optimizer_report.md` and `optimizer_results.csv`. It includes input file hashes, run settings, validation, phase confidence, named score components, and refinement results.
+- Every optimiser run writes `assistant_summary.json` as the first file for Claude/Codex to read. It contains fingerprints, gates, baseline/best component deltas, family files, phase actions, rejected PEQ/phase conflicts, warnings, and re-measure instructions.
+- `optimizer_summary.json`, `optimizer_report.md`, and `optimizer_results.csv` retain the full local detail when the compact decision core is insufficient.
 - Console helpers default to compact output while retaining full JSON/Markdown/CSV files locally. Use `--print-mode full` only when the extra detail is needed.
 - [scripts/make_measurement_manifest.py](./scripts/make_measurement_manifest.py): resolves common REW filename aliases, detects 2-way/3-way layout and phase/coherence columns, and warns about inconsistent source level, timing reference, or frequency grids.
-- [scripts/summarise_optimizer_run.py](./scripts/summarise_optimizer_run.py): summarizes an optimizer output folder, preferring `optimizer_summary.json` with CSV fallback.
+- [scripts/summarise_optimizer_run.py](./scripts/summarise_optimizer_run.py): summarizes an optimizer output folder, preferring `assistant_summary.json`, then the full JSON, with CSV fallback.
 - [scripts/summarise_candidate_filters.py](./scripts/summarise_candidate_filters.py): summarizes one candidate's added filters and risk flags.
 - [scripts/verify_written_tune.py](./scripts/verify_written_tune.py): verifies candidate AFPX files only changed intended fields.
 

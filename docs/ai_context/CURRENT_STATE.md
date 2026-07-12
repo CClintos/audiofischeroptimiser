@@ -18,7 +18,7 @@ record.
 
 1. Read `AGENTS.md` and this file.
 2. Use `REPO_MAP.md` to locate only the relevant implementation.
-3. Read `optimizer_summary.json` or a compact summarizer before raw reports.
+3. Read `assistant_summary.json` before the full summary or raw reports.
 4. Open deeper docs, measurements, logs, or task history only when a compact
    source leaves a real ambiguity.
 
@@ -33,13 +33,15 @@ record.
 - Top candidates receive hardware-step coordinate refinement against the same
   named objective.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
-- `optimizer_summary.json` includes input hashes, settings, validation, phase
-  confidence, named score components, and refinement results.
+- `assistant_summary.json` contains only the decision core; `optimizer_summary.json`
+  retains full settings, validation, phase confidence, components, and refinement.
 
 ## Objective And Guardrails
 
-- Perceptually weighted tonal error has extra vocal/presence importance.
-- L/R evidence comes from solo traces, not only the mono system sum.
+- Perceptually weighted tonal error reports distinct tonal, presence, and
+  positive-peak components; peaks carry extra objective cost.
+- L/R evidence comes from solo traces and combines signed bias with weighted
+  absolute/RMS mismatch, so opposite errors cannot cancel in the score.
 - Destructive summation/nulls earn no tonal reward.
 - Penalize positive gain/headroom, wasted or inert filters, unsupported
   asymmetry, deep/narrow corrections, and filter count.
@@ -50,10 +52,9 @@ record.
 - The proposed special `+4..5 dB` broad-LF boost exception was rejected. Do not
   add it unless the user reverses that decision.
 
-Audit correction: the active external objective still lacks a distinct
-peak-vs-dip term, reduces L/R balance to a signed median, and aliases one tonal
-value into several report component names. These are P0 roadmap defects, not
-capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
+- Internal objective values retain full precision; rounding is report-only.
+- A baseline candidate is always retained, so a short run cannot recommend a
+  generated PEQ candidate that scores worse than the loaded tune.
 
 ## Crossover Ladder
 
@@ -69,6 +70,8 @@ capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
 - AFPX polarity uses `<T PM="1|4">`; delay uses `<T T="samples">`. Do not
   substitute `CINV` in the normal writer.
 - Candidate writers never overwrite the baseline.
+- If a candidate also writes polarity/delay/APF, PEQ changing that crossover by
+  at least 0.5 dB is vetoed and the rejected filter is reported.
 - Lint and external verification independently check PEQ, PM polarity, delay,
   APF, crossover, output attributes, and other time-alignment attributes.
 
@@ -91,7 +94,7 @@ capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
 - Aliases cover common `Front L/R`, `Front Left/Right`, Mid/Low/Tweeter,
   `Both Mids/Tweeters`, and `Sub/Subwoofer` forms.
 - Source-level changes can still support timing, but not raw level comparison
-  unless normalized.
+  unless an explicit role/file dB calibration JSON is supplied.
 - Three-position measurements improve spatial confidence; fixed-position solos
   and together pairs remain necessary for coherent prediction.
 - The manifest reports missing inputs, level/reference changes, phase/coherence,
@@ -108,7 +111,8 @@ capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
 
 ## Verified State
 
-- Four crossover-ladder regression tests pass.
+- Seventeen regression tests pass, including objective invariants, session gates,
+  crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity
   flip and an ambiguous left polarity result; it allowed only a warning-level
@@ -116,6 +120,9 @@ capabilities to assume are already solved. See `docs/AUDIT_2026-07-12.md`.
 - A synthetic inverted impulse arriving `0.500 ms` late was recovered correctly.
 - A controlled AFPX polarity-plus-delay write changed only PM polarity and the
   intended delay value.
+- A historical real-data smoke candidate changed only the supported six-sample
+  delay; independent verification found no crossover, PEQ, polarity, output,
+  time-alignment-attribute, or unknown-field changes.
 - Historical test results are not assumptions about future measurements.
 
 ## Deliberate Non-Changes

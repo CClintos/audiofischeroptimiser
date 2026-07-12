@@ -42,7 +42,7 @@ when the current-state checkpoint does not answer it.
 - Use `docs/TEST_COMMANDS.md` when you need run/verify commands.
 - Use `docs/AUDIO_DSP_RULES.md` before changing scoring logic, delay/APF writing, or PCT6 handling.
 - Use `docs/ai_context/DSP_RULES.md` when you need the short domain version first.
-- Prefer `optimizer_summary.json` and scripts in `scripts/` over raw logs or large CSV/manual inspection.
+- Prefer `assistant_summary.json` first, then `optimizer_summary.json` only when its compact decision core is insufficient.
 
 ## Validation Rules
 
@@ -57,7 +57,7 @@ When changing AFPX/PCT6 writing:
 - Verify only intended fields changed.
 
 When reviewing optimiser output:
-- Start from `optimizer_summary.json`.
+- Start from `assistant_summary.json`.
 - Use `scripts/summarise_optimizer_run.py` before opening reports or candidate files.
 - Inspect raw measurements only when the compact summaries do not answer the question.
 

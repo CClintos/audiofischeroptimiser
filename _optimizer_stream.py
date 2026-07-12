@@ -653,8 +653,8 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
     path.parent.mkdir(parents=True, exist_ok=True)
     archive = archive or []
     payload = {
-        "version": 4,
-        "objective": "component_tonal_anchor_presence_balance_peak_null_headroom_v4",
+        "version": 5,
+        "objective": "objective_integrity_peak_balance_session_phase_guard_v5",
         "completed_trials": int(completed_trials),
         "elapsed_seconds": float(elapsed_seconds),
         "seed": int(args.seed),
@@ -683,7 +683,7 @@ def load_state(path: Path, rng: np.random.Generator, component_score=None, archi
     if not path.exists():
         return [], [], {}, 0, 0.0
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("version") != 4:
+    if payload.get("version") not in (4, 5):
         return [], [], {}, 0, 0.0
     if "rng_state" in payload:
         rng.bit_generator.state = payload["rng_state"]
@@ -691,14 +691,22 @@ def load_state(path: Path, rng: np.random.Generator, component_score=None, archi
     for item in payload.get("best", []):
         groups = groups_from_json(item.get("groups", {}))
         signature = opt.bands_signature(groups)
-        best.append((float(item["objective"]), signature, groups))
+        value = (
+            float(component_score(groups)["objective"])
+            if component_score is not None else float(item["objective"])
+        )
+        best.append((value, signature, groups))
     best.sort(key=lambda x: x[0])
     archive = []
     score_map = {}
     for item in payload.get("archive", []):
         groups = groups_from_json(item.get("groups", {}))
         signature = opt.bands_signature(groups)
-        entry = (float(item["objective"]), signature, groups)
+        value = (
+            float(component_score(groups)["objective"])
+            if component_score is not None else float(item["objective"])
+        )
+        entry = (value, signature, groups)
         archive.append(entry)
         if component_score is not None:
             score_map[signature] = component_score(groups)
@@ -733,13 +741,38 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("candidate_*.afpx"):
         old.unlink()
-    component_score = opt.make_component_scorer(
-        freqs, traces, target, args.filter_cost_scale, args.worst_weight
+    phase_plan = getattr(args, "phase_plan", [])
+    crossover_rows = getattr(args, "crossover_rows", [])
+    def safe_entries(entries):
+        kept = []
+        for entry in entries or []:
+            conflicts = opt.phase_peq_conflicts(freqs, entry[2], phase_plan)
+            if conflicts:
+                args.phase_peq_rejections.extend(conflicts)
+            else:
+                kept.append(entry)
+        return kept
+    best = safe_entries(best)
+    family_entries = safe_entries(family_entries)
+    component_score = opt.phase_safe_component_scorer(
+        opt.make_component_scorer(
+            freqs, traces, target, args.filter_cost_scale, args.worst_weight
+        ),
+        freqs,
+        phase_plan,
     )
     rows = build_rows(freqs, traces, target, best, component_score)
     family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
-    crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
-    phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
+    unique_rejections = {}
+    for item in args.phase_peq_rejections:
+        key = (
+            str(item.get("source")), str(item.get("group")),
+            float(item.get("filter", {}).get("F", 0.0)),
+            float(item.get("filter", {}).get("Q", 0.0)),
+            float(item.get("filter", {}).get("G", 0.0)),
+        )
+        unique_rejections.setdefault(key, item)
+    args.phase_peq_rejections = list(unique_rejections.values())[:20]
     for row in rows:
         path = out_dir / row["file"]
         row["lint"] = opt.write_candidate(base_xml, path, row["groups"], phase_plan=phase_plan)
@@ -799,6 +832,8 @@ def main():
                         help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--impulse-root", type=Path, default=None,
                         help="Optional folder containing companion WAV/text impulse exports.")
+    parser.add_argument("--level-calibration", type=Path, default=None,
+                        help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
@@ -809,10 +844,13 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    opt.sync_external_objective(args.baseline, args.target)
+    args.measurement_session, level_calibration = opt.prepare_measurement_session(
+        args.baseline, args.target, args.level_calibration
+    )
+    opt.sync_external_objective(args.baseline, args.target, level_calibration)
     configure_profile(args.profile)
     rng = np.random.default_rng(args.seed)
-    freqs, traces, rich_traces = opt.load_measurements()
+    freqs, traces, rich_traces = opt.load_measurements(level_calibration)
     raw_target = opt.load_target(args.target, freqs)
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
@@ -824,6 +862,9 @@ def main():
             for item in failed_validation
         )
         raise SystemExit("Measurement validation gate failed: " + details)
+    args.crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
+    opt.apply_session_phase_validity(args.crossover_rows, args.measurement_session["audit"])
+    args.phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(args.crossover_rows, args.sample_rate)
     guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
     cma_proposal = None
     if args.proposal == "cmaes":
@@ -839,9 +880,14 @@ def main():
     baseline_groups: GroupBands = {group: [] for group in opt.GROUPS}
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
     baseline_score = opt.tune_scorecard(freqs, baseline_pred, target)
-    component_score = opt.make_component_scorer(
-        freqs, traces, target, args.filter_cost_scale, args.worst_weight
+    component_score = opt.phase_safe_component_scorer(
+        opt.make_component_scorer(
+            freqs, traces, target, args.filter_cost_scale, args.worst_weight
+        ),
+        freqs,
+        args.phase_plan,
     )
+    args.phase_peq_rejections = []
     baseline_score["components"] = component_score(baseline_groups)
     score_groups = make_group_objective(
         freqs,
@@ -859,6 +905,15 @@ def main():
         )
     else:
         best, archive, archive_scores, completed_before, elapsed_before = [], [], {}, 0, 0.0
+    baseline_item = (
+        float(baseline_score["components"]["objective"]),
+        opt.bands_signature(baseline_groups),
+        baseline_groups,
+    )
+    best = insert_best(best, baseline_item, args.keep)
+    archive, archive_scores = insert_archive(
+        archive, archive_scores, baseline_item, baseline_score["components"], args.archive_size
+    )
 
     start = time.monotonic()
     next_checkpoint = start + max(10, args.checkpoint_seconds)
@@ -879,6 +934,8 @@ def main():
         else:
             groups = guided_groups(rng, args.profile, guided_pools)
         components = component_score(groups)
+        if components.get("phase_peq_conflict_count", 0.0) > 0.0:
+            args.phase_peq_rejections.extend(opt.phase_peq_conflicts(freqs, groups, args.phase_plan))
         value = float(components["objective"])
         if args.max_positive_gain_penalty > 0 and components["positive_gain_penalty_db"] > args.max_positive_gain_penalty:
             value = 1e6 + float(components["positive_gain_penalty_db"])
@@ -945,7 +1002,7 @@ def main():
                 args.out / ("candidate_01_objective_%.4f.afpx" % best_entry[0])
             ),
             "refinement": args.refinement,
-            "summary": str(args.out / "optimizer_summary.json"),
+            "assistant_summary": str(args.out / "assistant_summary.json"),
         }
         print(json.dumps(compact, indent=2))
         if args.print_mode == "full" and best_entry is not None:

@@ -18,6 +18,7 @@ param(
     [string]$PhaseWrites = "auto",
     [string]$DataRoot = "",
     [string]$ImpulseRoot = "",
+    [string]$LevelCalibration = "",
     [string]$Baseline = "",
     [string]$Target = ""
 )
@@ -46,6 +47,7 @@ $dataRootPath = if ($DataRoot -ne "") { $DataRoot } else { $here }
 $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPath "baseline.afpx" }
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
+$levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
 
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -124,6 +126,9 @@ for ($i = 1; $i -le $Workers; $i++) {
     }
     if ($impulseRootPath -ne "") {
         $args += @("--impulse-root", $impulseRootPath)
+    }
+    if ($levelCalibrationPath -ne "") {
+        $args += @("--level-calibration", $levelCalibrationPath)
     }
 
     $argLine = Join-Args $args

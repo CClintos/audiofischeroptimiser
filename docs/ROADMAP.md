@@ -4,9 +4,9 @@ Implementation order is based on audible leverage, correctness risk, local
 compute benefit, and token savings. Detailed evidence is in
 `docs/AUDIT_2026-07-12.md`.
 
-## P0: Fix Before Adding Features
+## P0: Fix Before Adding Features (completed 2026-07-12)
 
-1. **Objective integrity release**
+1. **Objective integrity release** - complete
    - Add a real positive-deviation/peak term.
    - Replace signed-median-only L/R scoring with signed bias plus weighted
      absolute/RMS mismatch.
@@ -14,19 +14,19 @@ compute benefit, and token savings. Detailed evidence is in
    - Keep full internal objective precision; round only reports.
    - Add synthetic invariants and a modern TXT/AFPX golden benchmark.
 
-2. **Protect combined PEQ and phase candidates**
+2. **Protect combined PEQ and phase candidates** - complete
    - Initially veto candidate PEQ that materially changes a crossover band when
      a polarity/delay/APF write is attached.
    - Report the rejected filter and affected crossover.
    - Replace the veto later only when full complex biquad prediction is tested.
 
-3. **Enforce measurement-session validity**
+3. **Enforce measurement-session validity** - complete
    - Feed manifest metadata into the optimizer.
    - Tonal mode: require consistent source level or explicit calibration.
    - Phase mode: permit level-normalized solos but require timing/reference and
      measured-together validation.
 
-4. **Emit `assistant_summary.json`**
+4. **Emit `assistant_summary.json`** - complete
    - Bound it to the decision core: fingerprints, gates, baseline/best deltas,
      family files, phase writes/warnings, and re-measure instructions.
    - Make AI guidance read this file before any full report.

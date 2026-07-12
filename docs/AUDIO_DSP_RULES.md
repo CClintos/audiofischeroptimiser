@@ -29,7 +29,7 @@ These rules are meant to make Codex faster and more accurate, not more timid.
 
 ## Review Rules
 
-- Start from compact summaries such as `optimizer_summary.json` before reading large reports, CSVs, or every candidate file.
+- Start from `assistant_summary.json` before reading the full summary, reports, CSVs, or candidate files.
 - Explain audible trade-offs, not just score deltas.
 - Distinguish the safest candidate from the strongest correction candidate.
 

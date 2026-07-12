@@ -10,6 +10,7 @@ This repository is a local AFPX optimisation engine for Helix / Audiotec Fischer
 - If the task is broad, read `docs/ai_context/PROJECT_MAP.md` before opening code.
 - Use `docs/ai_context/TASK_TEMPLATE.md` to turn broad asks into bounded work.
 - Prefer generated JSON summaries over raw logs.
+- Read `assistant_summary.json` before `optimizer_summary.json` or the Markdown report.
 - Do not inspect every candidate AFPX unless verification fails or the user asks for a deep review.
 - Do not rerun long optimisation unless explicitly asked.
 - Do not change optimiser scoring without a benchmark or before/after score comparison.

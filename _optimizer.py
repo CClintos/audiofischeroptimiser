@@ -22,6 +22,7 @@ import math
 import os
 import re
 import wave
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -41,6 +42,7 @@ for _var in (
 
 import numpy as np
 import optuna
+from scripts.make_measurement_manifest import build_manifest
 
 from _make_v3 import (
     add_bands,
@@ -65,6 +67,7 @@ from _tunefit import (
     interference_audit,
     LOGSTEP,
     phase_linearity_residual,
+    peaking_db,
     ms_to_samples,
     optimize_allpass,
     polarity_delay_search,
@@ -94,7 +97,8 @@ def _load_external_objective():
 AFPX_OBJECTIVE = _load_external_objective()
 
 
-def sync_external_objective(baseline: Path | None = None, target: Path | None = None) -> None:
+def sync_external_objective(baseline: Path | None = None, target: Path | None = None,
+                            level_calibration: Dict[str, float] | None = None) -> None:
     """Keep the imported objective pointed at this run's actual files.
 
     The worker scripts usually pass AFPX_* environment variables before Python
@@ -113,6 +117,11 @@ def sync_external_objective(baseline: Path | None = None, target: Path | None = 
         new_target = Path(target)
         if Path(getattr(AFPX_OBJECTIVE, "TARGET")) != new_target:
             setattr(AFPX_OBJECTIVE, "TARGET", new_target)
+            changed = True
+    if level_calibration is not None and hasattr(AFPX_OBJECTIVE, "LEVEL_CALIBRATION"):
+        normalized = {str(key): float(value) for key, value in level_calibration.items()}
+        if dict(getattr(AFPX_OBJECTIVE, "LEVEL_CALIBRATION", {})) != normalized:
+            setattr(AFPX_OBJECTIVE, "LEVEL_CALIBRATION", normalized)
             changed = True
     if changed:
         for name, value in (("_F", None), ("_T", {}), ("_TGT", None), ("_NULL_MASK", None), ("_V5", None)):
@@ -371,6 +380,80 @@ RichTraceMap = Dict[str, RichTrace]
 ImpulseTrace = Dict[str, object]
 
 
+def load_level_calibration(path: Path | None) -> Dict[str, float]:
+    if path is None:
+        return {}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Level calibration must be a JSON object of role/file -> dB offset")
+    return {str(key): float(value) for key, value in payload.items()}
+
+
+def calibration_offset(calibration: Dict[str, float], role: str, path: Path) -> float:
+    for key in (role, path.name, path.stem, str(path)):
+        if key in calibration:
+            return float(calibration[key])
+    return 0.0
+
+
+def measurement_session_audit(manifest: Dict[str, object], calibration: Dict[str, float]) -> Dict[str, object]:
+    metadata = dict(manifest.get("measurement_metadata", {}))
+    signatures: Dict[str, Tuple[float | None, float | None]] = {}
+    for role, raw in metadata.items():
+        info = dict(raw)
+        signatures[str(role)] = (
+            None if info.get("source_volume") is None else float(info["source_volume"]),
+            None if info.get("sweep_dbfs") is None else float(info["sweep_dbfs"]),
+        )
+    known = [sig for sig in signatures.values() if sig != (None, None)]
+    reference = Counter(known).most_common(1)[0][0] if known else (None, None)
+    outlier_roles = sorted(role for role, sig in signatures.items() if sig != (None, None) and sig != reference)
+    unknown_roles = sorted(role for role, sig in signatures.items() if sig == (None, None))
+    resolved = dict(manifest.get("resolved_roles", {}))
+    missing_calibration = []
+    for role in sorted(set(outlier_roles + unknown_roles)):
+        path = Path(str(resolved.get(role, role)))
+        if not any(key in calibration for key in (role, path.name, path.stem, str(path))):
+            missing_calibration.append(role)
+    tonal_valid = not manifest.get("measurements_missing") and not missing_calibration
+    timing_references = list(dict(manifest.get("measurement_conditions", {})).get("timing_references", []))
+    phase_valid = bool(tonal_valid and manifest.get("phase_available") and len(timing_references) == 1)
+    warnings = list(manifest.get("warnings", []))
+    if missing_calibration:
+        warnings.append("uncalibrated_level_mismatch:" + ",".join(missing_calibration))
+    if unknown_roles:
+        warnings.append("source_level_metadata_missing:" + ",".join(unknown_roles))
+    if len(timing_references) > 1:
+        warnings.append("phase_writes_disabled_mixed_timing_references")
+    elif not timing_references:
+        warnings.append("phase_writes_disabled_timing_reference_missing")
+    return {
+        "tonal_valid": bool(tonal_valid),
+        "phase_valid": phase_valid,
+        "reference_level_signature": list(reference),
+        "level_outlier_roles": outlier_roles,
+        "unknown_level_roles": unknown_roles,
+        "calibrated_roles": sorted(set(outlier_roles) - set(missing_calibration)),
+        "missing_calibration_roles": missing_calibration,
+        "timing_references": timing_references,
+        "warnings": sorted(set(warnings)),
+    }
+
+
+def prepare_measurement_session(baseline: Path, target: Path,
+                                level_calibration_path: Path | None = None) -> Tuple[Dict[str, object], Dict[str, float]]:
+    calibration = load_level_calibration(level_calibration_path)
+    manifest = build_manifest(DATA_ROOT.resolve(), baseline, target)
+    audit = measurement_session_audit(manifest, calibration)
+    if not audit["tonal_valid"]:
+        missing = ", ".join(audit["missing_calibration_roles"])
+        raise SystemExit(
+            "Measurement session gate failed: missing or inconsistent source/sweep levels require explicit dB calibration"
+            + (" for " + missing if missing else "")
+        )
+    return {"manifest": manifest, "audit": audit}, calibration
+
+
 def load_rew_export(path: Path) -> RichTrace:
     """Load REW-style text exports with optional phase/coherence/position columns.
 
@@ -454,13 +537,17 @@ def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return trace["freq"], trace["spl"]
 
 
-def load_measurements() -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
+def load_measurements(level_calibration: Dict[str, float] | None = None) -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
+    level_calibration = level_calibration or {}
     missing = [str(p) for p in MEASUREMENT_FILES.values() if not p.exists()]
     if missing:
         raise FileNotFoundError("Missing measurement file(s):\n  " + "\n  ".join(missing))
 
     base_trace = load_rew_export(MEASUREMENT_FILES["System Sum"])
     base_f = optimization_frequency_grid(base_trace["freq"])
+    base_trace["spl"] = base_trace["spl"] + calibration_offset(
+        level_calibration, "System Sum", MEASUREMENT_FILES["System Sum"]
+    )
     base_spl = np.interp(np.log10(base_f), np.log10(base_trace["freq"]), base_trace["spl"])
     traces: TraceMap = {"System Sum": base_spl}
     rich: RichTraceMap = {"System Sum": interp_rich_trace(base_trace, base_f)}
@@ -469,6 +556,7 @@ def load_measurements() -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
         if name == "System Sum":
             continue
         measurement = load_rew_export(path)
+        measurement["spl"] = measurement["spl"] + calibration_offset(level_calibration, name, path)
         traces[name] = np.interp(log_base, np.log10(measurement["freq"]), measurement["spl"])
         rich[name] = interp_rich_trace(measurement, base_f)
     return base_f, traces, rich
@@ -1197,6 +1285,21 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
     return rows
 
 
+def apply_session_phase_validity(crossover_rows: List[Dict[str, object]],
+                                 session_audit: Dict[str, object]) -> None:
+    valid = bool(session_audit.get("phase_valid"))
+    for row in crossover_rows:
+        row["session_phase_valid"] = valid
+        if valid:
+            continue
+        ladder = row.get("crossover_ladder")
+        if isinstance(ladder, dict):
+            ladder["write_eligible"] = False
+            ladder["reason"] = "phase session invalid: " + "; ".join(
+                str(item) for item in session_audit.get("warnings", [])
+            )
+
+
 def trace_channels(trace_name: str) -> Tuple[int, ...]:
     if trace_name == "Sub":
         return (6, 7)
@@ -1211,6 +1314,8 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
     """Build writes from the gated polarity -> delay -> residual APF ladder."""
     plan: List[Dict[str, object]] = []
     for row in crossover_rows:
+        if row.get("session_phase_valid") is False:
+            continue
         ladder = row.get("crossover_ladder")
         if not isinstance(ladder, dict) or not ladder.get("write_eligible"):
             continue
@@ -1286,12 +1391,69 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
             "apf_f": None if apf is None else float(apf["F"]),
             "apf_q": None if apf is None else float(apf["Q"]),
             "apf": bool(apf_channels),
+            "crossover_channels": tuple(sorted(set(trace_channels(a_trace) + trace_channels(b_trace)))),
+            "crossover_band": tuple(
+                float(value) for value in str(row.get("band", "")).replace("Hz", "").split("-")[:2]
+            ),
             "confidence": "full" if phase_full else "warning",
             "warning": "" if phase_full else (
                 "not full confidence; re-measure this crossover and verify polarity, arrival, image, and summed level"
             ),
         })
     return plan
+
+
+def phase_peq_conflicts(freqs: np.ndarray, groups: GroupBands,
+                        phase_plan: List[Dict[str, object]] | None,
+                        threshold_db: float = 0.5) -> List[Dict[str, object]]:
+    conflicts: List[Dict[str, object]] = []
+    if not phase_plan:
+        return conflicts
+    for edit in phase_plan:
+        try:
+            lo, hi = (float(value) for value in edit.get("crossover_band", ()))
+        except (TypeError, ValueError):
+            continue
+        selected = (freqs >= lo) & (freqs <= hi)
+        if not np.any(selected):
+            continue
+        crossover_channels = {int(value) for value in edit.get("crossover_channels", ())}
+        for group, bands in groups.items():
+            group_channels = {int(value) for value in GROUPS.get(group, {}).get("channels", ())}
+            affected = sorted(crossover_channels & group_channels)
+            if not affected:
+                continue
+            for F, Q, G in bands:
+                response = peaking_db(freqs, F, Q, G)
+                maximum = float(np.max(np.abs(response[selected])))
+                if maximum + 1e-12 < float(threshold_db):
+                    continue
+                conflicts.append({
+                    "source": edit.get("source", "crossover"),
+                    "crossover_band": [lo, hi],
+                    "group": group,
+                    "channels": affected,
+                    "filter": {"F": float(F), "Q": float(Q), "G": float(G)},
+                    "max_change_db": maximum,
+                    "threshold_db": float(threshold_db),
+                })
+    return conflicts
+
+
+def phase_safe_component_scorer(component_score, freqs: np.ndarray,
+                                phase_plan: List[Dict[str, object]] | None,
+                                threshold_db: float = 0.5):
+    def score(groups: GroupBands) -> Dict[str, float]:
+        comp = dict(component_score(groups))
+        conflicts = phase_peq_conflicts(freqs, groups, phase_plan, threshold_db)
+        comp["phase_peq_conflict_count"] = float(len(conflicts))
+        comp["phase_peq_conflict_max_db"] = max(
+            (float(item["max_change_db"]) for item in conflicts), default=0.0
+        )
+        if conflicts:
+            comp["objective"] = 1e6 + 1000.0 * len(conflicts) + comp["phase_peq_conflict_max_db"]
+        return comp
+    return score
 
 
 def add_allpass_to_oc(oc: str, f0: float, q: float = 0.7, invert: bool = False) -> str:
@@ -1401,24 +1563,34 @@ def make_component_scorer(
         def external_score(groups: GroupBands) -> Dict[str, float]:
             comp = dict(AFPX_OBJECTIVE.score_bands(groups_to_band_sets(groups)))
             tonal = float(comp.get("tonal_masked", 0.0))
+            tonal_anchor = float(comp.get("sum_tonal_anchor_db", tonal))
+            presence = float(comp.get("presence_error_db", tonal))
+            peak = float(comp.get("peak_penalty_db", 0.0))
             worst = float(comp.get("worst_masked", 0.0))
-            low_balance = abs(float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0)))
-            mid_balance = abs(float(comp.get("mid_balance", 0.0)))
-            tweeter_balance = abs(float(comp.get("tweeter_balance", 0.0)))
+            low_bias = float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0))
+            mid_bias = float(comp.get("mid_balance", 0.0))
+            tweeter_bias = float(comp.get("tweeter_balance", 0.0))
+            low_balance = float(comp.get(
+                "low_balance_rms_db",
+                comp.get("mid_balance_rms_db", abs(low_bias)) if FRONT_LAYOUT != "3way" else abs(low_bias),
+            ))
+            mid_balance = float(comp.get("mid_balance_rms_db", abs(mid_bias)))
+            tweeter_balance = float(comp.get("tweeter_balance_rms_db", abs(tweeter_bias)))
             balance_terms = [tweeter_balance]
             if FRONT_LAYOUT == "3way":
                 balance_terms.extend([low_balance, mid_balance])
             else:
-                balance_terms.append(mid_balance)
-            balance = math.sqrt(sum(x * x for x in balance_terms) / max(len(balance_terms), 1))
+                balance_terms.append(low_balance)
+            reported_balance = math.sqrt(sum(x * x for x in balance_terms) / max(len(balance_terms), 1))
+            balance = float(comp.get("balance_penalty_db", reported_balance))
             headroom = float(comp.get("headroom_peak", 0.0)) + float(comp.get("null_boost_avg", 0.0))
             comp.update({
                 "objective": float(comp["objective"]),
                 "tonal_error_db": tonal,
-                "sum_tonal_anchor_db": tonal,
-                "presence_error_db": tonal,
-                "pareto_tonal_db": tonal,
-                "peak_penalty_db": worst,
+                "sum_tonal_anchor_db": tonal_anchor,
+                "presence_error_db": presence,
+                "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
+                "peak_penalty_db": peak,
                 "balance_penalty_db": balance,
                 "worst_presence_dev_db": worst,
                 "positive_gain_penalty_db": headroom,
@@ -1432,12 +1604,12 @@ def make_component_scorer(
                 "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
                 "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
                 "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
-                "low_balance_rms_db": low_balance if FRONT_LAYOUT == "3way" else mid_balance,
+                "low_balance_rms_db": low_balance,
                 "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
                 "high_balance_rms_db": tweeter_balance,
-                "low_balance_median_db": float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0)),
-                "mid_balance_median_db": float(comp.get("mid_balance", 0.0)) if FRONT_LAYOUT == "3way" else 0.0,
-                "high_balance_median_db": float(comp.get("tweeter_balance", 0.0)),
+                "low_balance_median_db": low_bias,
+                "mid_balance_median_db": mid_bias if FRONT_LAYOUT == "3way" else 0.0,
+                "high_balance_median_db": tweeter_bias,
             })
             return comp
 
@@ -1541,8 +1713,13 @@ def make_objective(
     filter_cost_scale: float = 1.0,
     worst_weight: float = 0.018,
     min_total_bands: int = 0,
+    phase_plan: List[Dict[str, object]] | None = None,
 ):
-    component_score = make_component_scorer(freqs, traces, target, filter_cost_scale, worst_weight)
+    component_score = phase_safe_component_scorer(
+        make_component_scorer(freqs, traces, target, filter_cost_scale, worst_weight),
+        freqs,
+        phase_plan,
+    )
 
     def objective(trial: optuna.Trial) -> float:
         groups = trial_bands(trial)
@@ -1567,6 +1744,15 @@ def replace_oc_blocks(xml: str, blocks: List[str]) -> str:
 
 def write_candidate(base_xml: str, path: Path, groups: GroupBands,
                     phase_plan: List[Dict[str, object]] | None = None) -> Dict[str, object]:
+    conflicts = phase_peq_conflicts(
+        np.geomspace(20.0, 20000.0, 2048), groups, phase_plan, threshold_db=0.5
+    )
+    if conflicts:
+        first = conflicts[0]
+        raise ValueError(
+            "PEQ/phase crossover conflict: %s %s changes %s by %.2f dB"
+            % (first["group"], first["filter"], first["source"], first["max_change_db"])
+        )
     blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
     new_blocks = list(blocks)
     for group, bands in groups.items():
@@ -1660,8 +1846,11 @@ def format_component_summary(comp: Dict[str, float]) -> str:
     if "tonal_masked" in comp:
         return (
             f"objective `{comp.get('objective', 0.0):.3f}`, tonal_masked `{comp.get('tonal_masked', 0.0):.3f}`, "
-            f"worst_masked `{comp.get('worst_masked', 0.0):.2f}`, mid_balance `{comp.get('mid_balance', 0.0):+.2f}`, "
-            f"tweeter_balance `{comp.get('tweeter_balance', 0.0):+.2f}`, headroom_peak `{comp.get('headroom_peak', 0.0):.2f}`, "
+            f"anchor `{comp.get('sum_tonal_anchor_db', 0.0):.3f}`, presence `{comp.get('presence_error_db', 0.0):.3f}`, "
+            f"peak `{comp.get('peak_penalty_db', 0.0):.3f}`, worst_masked `{comp.get('worst_masked', 0.0):.2f}`, "
+            f"mid-bias `{comp.get('mid_balance', 0.0):+.2f}`, mid-RMS `{comp.get('mid_balance_rms_db', comp.get('low_balance_rms_db', 0.0)):.2f}`, "
+            f"tweeter-bias `{comp.get('tweeter_balance', 0.0):+.2f}`, tweeter-RMS `{comp.get('tweeter_balance_rms_db', 0.0):.2f}`, "
+            f"headroom_peak `{comp.get('headroom_peak', 0.0):.2f}`, "
             f"null_boost_avg `{comp.get('null_boost_avg', 0.0):.2f}`, guardrail `{comp.get('guardrail_penalty', 0.0):.3f}`, "
             f"unsupported `{comp.get('unsupported_filter_penalty', 0.0):.3f}`, wasted `{comp.get('wasted_band_penalty', 0.0):.3f}`, "
             f"asym `{comp.get('asymmetric_eq_penalty', 0.0):.3f}`, added_bands `{comp.get('n_added_front_bands', 0.0):.0f}`"
@@ -1885,6 +2074,7 @@ def write_report(
     md = out_dir / "optimizer_report.md"
     csv_path = out_dir / "optimizer_results.csv"
     json_path = out_dir / "optimizer_summary.json"
+    assistant_path = out_dir / "assistant_summary.json"
     family_source = list(family_rows) if family_rows is not None else list(rows)
     family_picks = select_family_rows(family_source)
     crossover_rows = crossover_rows or []
@@ -1944,6 +2134,7 @@ def write_report(
                     "tonal_error_db",
                     "sum_tonal_anchor_db",
                     "presence_error_db",
+                    "peak_penalty_db",
                     "balance_penalty_db",
                     "positive_gain_penalty_db",
                     "filter_count",
@@ -1951,6 +2142,9 @@ def write_report(
                     "worst_masked",
                     "mid_balance",
                     "tweeter_balance",
+                    "low_balance_rms_db",
+                    "mid_balance_rms_db",
+                    "tweeter_balance_rms_db",
                     "guardrail_penalty",
                     "unsupported_filter_penalty",
                     "wasted_band_penalty",
@@ -1969,6 +2163,10 @@ def write_report(
         "input_fingerprints": {
             "baseline": file_fingerprint(args.baseline),
             "target": file_fingerprint(args.target),
+            "level_calibration": (
+                file_fingerprint(args.level_calibration)
+                if getattr(args, "level_calibration", None) else None
+            ),
         },
         "run_config": {
             key: (str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key))
@@ -1976,6 +2174,7 @@ def write_report(
                 "seed", "profile", "sampler", "proposal", "jobs", "seconds",
                 "max_trials", "filter_cost_scale", "worst_weight",
                 "validation_threshold", "gate_ms", "sample_rate", "phase_writes", "impulse_root",
+                "level_calibration",
                 "refine_top", "refine_passes",
             )
             if hasattr(args, key)
@@ -1993,15 +2192,121 @@ def write_report(
             for role, row in family_picks.items()
         },
         "validation": getattr(args, "validation", []),
+        "measurement_session": getattr(args, "measurement_session", {}),
         "crossover_phase_confidence": crossover_rows,
         "written_phase_plan": phase_plan,
+        "phase_peq_rejections": getattr(args, "phase_peq_rejections", [])[:20],
         "generated_files": {
             "report": str(md),
             "csv": str(csv_path),
             "summary_json": str(json_path),
+            "assistant_summary_json": str(assistant_path),
         },
     }
     json_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+    component_keys = (
+        "objective", "tonal_error_db", "sum_tonal_anchor_db", "presence_error_db",
+        "peak_penalty_db", "balance_penalty_db", "low_balance_rms_db",
+        "mid_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
+        "filter_count", "guardrail_penalty",
+    )
+    base_components = dict(baseline_score.get("components", {}))
+    best_row = rows[0] if rows else None
+    best_components = dict(best_row.get("components", {})) if best_row else {}
+    def compact_components(values):
+        return {
+            key: round(float(values[key]), 4)
+            for key in component_keys
+            if key in values and isinstance(values[key], (int, float, np.integer, np.floating))
+        }
+    baseline_core = compact_components(base_components)
+    best_core = compact_components(best_components)
+    deltas = {
+        key: round(float(best_core[key]) - float(baseline_core[key]), 4)
+        for key in sorted(best_core.keys() & baseline_core.keys())
+    }
+    assistant_warnings = list(
+        dict(getattr(args, "measurement_session", {})).get("audit", {}).get("warnings", [])
+    )
+    assistant_warnings.extend(
+        str(edit.get("warning")) for edit in phase_plan if edit.get("warning")
+    )
+    compact_inputs = {}
+    for name, fingerprint in summary_payload["input_fingerprints"].items():
+        if fingerprint:
+            compact_inputs[name] = {
+                "file": Path(str(fingerprint.get("path", ""))).name,
+                "sha256": fingerprint.get("sha256", ""),
+            }
+        else:
+            compact_inputs[name] = None
+    session_audit = dict(getattr(args, "measurement_session", {})).get("audit", {})
+    compact_session = {
+        key: session_audit.get(key)
+        for key in (
+            "tonal_valid", "phase_valid", "reference_level_signature",
+            "missing_calibration_roles", "timing_references", "warnings",
+        )
+        if key in session_audit
+    }
+    compact_phase_actions = [{
+        key: edit.get(key)
+        for key in (
+            "source", "kind", "polarity_channels", "channels", "delay_samples",
+            "apf_channels", "apf_f", "apf_q", "crossover_band", "confidence", "warning",
+        )
+        if edit.get(key) not in (None, "", [], (), False)
+    } for edit in phase_plan]
+    rejection_source = getattr(args, "phase_peq_rejections", [])
+    compact_rejections = [{
+        "source": item.get("source"),
+        "band_hz": item.get("crossover_band"),
+        "group": item.get("group"),
+        "filter": item.get("filter"),
+        "change_db": round(float(item.get("max_change_db", 0.0)), 3),
+    } for item in rejection_source[:3]]
+    assistant_payload = {
+        "schema": "audiofischer-assistant-summary-v1",
+        "run_folder": str(out_dir),
+        "candidate_count": len(rows),
+        "inputs": compact_inputs,
+        "gates": {
+            "measurement_session": compact_session,
+            "pair_validation": getattr(args, "validation", []),
+        },
+        "baseline": baseline_core,
+        "best": None if best_row is None else {
+            "file": best_row.get("file"),
+            "objective": round(float(best_row.get("objective", 0.0)), 6),
+            "components": best_core,
+            "delta_vs_baseline": deltas,
+            "left_alone": best_row.get("left_alone", ""),
+        },
+        "families": {
+            role: {
+                "file": f"family_{role}.afpx",
+                "objective": round(float(row.get("objective", 0.0)), 6),
+            }
+            for role, row in family_picks.items()
+        },
+        "phase_actions": compact_phase_actions,
+        "phase_peq_rejections": {
+            "reported_count": len(rejection_source),
+            "may_be_truncated": len(rejection_source) >= 20,
+            "examples": compact_rejections,
+        },
+        "warnings": list(dict.fromkeys(assistant_warnings))[:12],
+        "remeasure": (
+            ["Re-measure every crossover pair changed by polarity, delay, or APF and verify summed level and image focus."]
+            if phase_plan else []
+        ),
+        "details": {
+            "optimizer_summary": json_path.name,
+            "report": md.name,
+        },
+    }
+    assistant_path.write_text(json.dumps(assistant_payload, indent=2), encoding="utf-8")
 
     base_comp = baseline_score.get("components", {})
     baseline_line = (
@@ -2034,6 +2339,16 @@ def write_report(
             )
     else:
         lines.append("- Solo/together validation was not provided for this run.")
+    session_audit = dict(getattr(args, "measurement_session", {})).get("audit", {})
+    if session_audit:
+        lines.append(
+            "- Measurement session: tonal `%s`; phase `%s`; warnings `%s`"
+            % (
+                "PASS" if session_audit.get("tonal_valid") else "FAIL",
+                "PASS" if session_audit.get("phase_valid") else "DISABLED",
+                ", ".join(session_audit.get("warnings", [])) or "none",
+            )
+        )
     lines.extend([
         "",
         "## Baseline Score",
@@ -2107,6 +2422,18 @@ def write_report(
         lines.append("- After loading the tune, re-measure the affected crossover pairs and confirm centre image, summed level, and that no new hole appeared either side of the crossover.")
     else:
         lines.append("- No polarity/delay/APF writes cleared the crossover-ladder confidence and improvement gates.")
+    lines.extend(["", "## Rejected PEQ / Phase Interactions", ""])
+    phase_rejections = getattr(args, "phase_peq_rejections", [])
+    if phase_rejections:
+        for item in phase_rejections[:20]:
+            fil = item.get("filter", {})
+            lines.append(
+                f"- Rejected `{item.get('group')}` filter `{fil.get('F')} Hz Q{fil.get('Q')} {fil.get('G'):+} dB`: "
+                f"it changes `{item.get('source')}` by `{item.get('max_change_db'):.2f}` dB "
+                f"inside `{item.get('crossover_band')}` (limit `{item.get('threshold_db')}` dB)."
+            )
+    else:
+        lines.append("- No candidate PEQ conflicted with an attached polarity/delay/APF correction.")
     lines.extend([
         "",
         "## Family Picks",
@@ -2180,6 +2507,8 @@ def main() -> None:
     parser.add_argument("--sample-rate", type=float, default=96000.0, help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--impulse-root", type=Path, default=None,
                         help="Optional folder containing companion WAV/text impulse exports; defaults to the measurement folder.")
+    parser.add_argument("--level-calibration", type=Path, default=None,
+                        help="JSON object mapping measurement role/file names to dB offsets for mixed-level sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
@@ -2187,19 +2516,23 @@ def main() -> None:
     args = parser.parse_args()
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    sync_external_objective(args.baseline, args.target)
+    args.measurement_session, level_calibration = prepare_measurement_session(
+        args.baseline, args.target, args.level_calibration
+    )
+    sync_external_objective(args.baseline, args.target, level_calibration)
 
     global GROUPS
     GROUPS = {k: dict(v) for k, v in (EXPLORE_GROUPS if args.profile == "explore" else SAFE_GROUPS).items()}
     if args.filter_cost_scale is None:
         args.filter_cost_scale = 0.25 if args.profile == "explore" else 1.0
 
-    freqs, traces, rich_traces = load_measurements()
+    freqs, traces, rich_traces = load_measurements(level_calibration)
     raw_target = load_target(args.target, freqs)
     target = raw_target + target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
     crossover_rows = crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
+    apply_session_phase_validity(crossover_rows, args.measurement_session["audit"])
     phase_plan = [] if args.phase_writes == "off" else phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:
@@ -2212,12 +2545,16 @@ def main() -> None:
     baseline_groups: GroupBands = {group: [] for group in GROUPS}
     baseline_pred = predict_traces(freqs, traces, baseline_groups)
     baseline_score = tune_scorecard(freqs, baseline_pred, target)
-    component_score = make_component_scorer(
+    component_score = phase_safe_component_scorer(
+        make_component_scorer(
+            freqs,
+            traces,
+            target,
+            filter_cost_scale=args.filter_cost_scale,
+            worst_weight=args.worst_weight,
+        ),
         freqs,
-        traces,
-        target,
-        filter_cost_scale=args.filter_cost_scale,
-        worst_weight=args.worst_weight,
+        phase_plan,
     )
     baseline_score["components"] = component_score(baseline_groups)
     objective = make_objective(
@@ -2227,6 +2564,7 @@ def main() -> None:
         filter_cost_scale=args.filter_cost_scale,
         worst_weight=args.worst_weight,
         min_total_bands=args.min_total_bands,
+        phase_plan=phase_plan,
     )
     baseline_objective = objective(StaticTrial(baseline_groups))
 
@@ -2247,16 +2585,26 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ranked_rows: List[Dict[str, object]] = []
+    args.phase_peq_rejections = []
     seen = set()
     complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    for trial in sorted(complete, key=lambda t: t.value if t.value is not None else float("inf")):
-        groups = trial_bands(trial)
+    candidate_groups = [(float(baseline_objective), baseline_groups)]
+    candidate_groups.extend(
+        (float(trial.value), trial_bands(trial))
+        for trial in complete
+        if trial.value is not None
+    )
+    for candidate_value, groups in sorted(candidate_groups, key=lambda item: item[0]):
         sig = bands_signature(groups)
         if sig in seen:
             continue
         seen.add(sig)
+        conflicts = phase_peq_conflicts(freqs, groups, phase_plan)
+        if conflicts:
+            args.phase_peq_rejections.extend(conflicts)
+            continue
         rank = len(ranked_rows) + 1
-        file_name = f"candidate_{rank:02d}_objective_{trial.value:.4f}.afpx"
+        file_name = f"candidate_{rank:02d}_objective_{candidate_value:.4f}.afpx"
         out_path = out_dir / file_name
         lint = write_candidate(base_xml, out_path, groups, phase_plan=phase_plan)
         pred = predict_traces(freqs, traces, groups)
@@ -2269,7 +2617,7 @@ def main() -> None:
             "rank": rank,
             "file": file_name,
             "path": str(out_path),
-            "objective": float(trial.value),
+            "objective": candidate_value,
             "score": score,
             "components": components,
             "groups": groups,
@@ -2280,6 +2628,7 @@ def main() -> None:
         })
         if len(ranked_rows) >= args.top:
             break
+    args.phase_peq_rejections = args.phase_peq_rejections[:20]
 
     low_audit = interference_audit(freqs, traces["FL Low"], traces["FR Low"], traces["Mid Bass Together"])
     tw_audit = interference_audit(freqs, traces["FL High"], traces["FR High"], traces["Tweeters Together"])

@@ -52,11 +52,16 @@ def main():
                         help="DSP internal sample rate used for delay writes.")
     parser.add_argument("--impulse-root", type=Path, default=None,
                         help="Optional folder containing companion WAV/text impulse exports.")
+    parser.add_argument("--level-calibration", type=Path, default=None,
+                        help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     args = parser.parse_args()
 
-    opt.sync_external_objective(args.baseline, args.target)
+    measurement_session, level_calibration = opt.prepare_measurement_session(
+        args.baseline, args.target, args.level_calibration
+    )
+    opt.sync_external_objective(args.baseline, args.target, level_calibration)
     worker_dirs = sorted(p for p in args.root.glob("worker_*") if p.is_dir())
     items = []
     for worker in worker_dirs:
@@ -64,12 +69,13 @@ def main():
     if not items:
         raise SystemExit("No stream_state.json best candidates found under " + str(args.root))
 
-    freqs, traces, rich_traces = opt.load_measurements()
+    freqs, traces, rich_traces = opt.load_measurements(level_calibration)
     raw_target = opt.load_target(args.target, freqs)
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
     crossover_rows = opt.crossover_phase_diagnostics(freqs, traces, rich_traces, args.impulse_root)
+    opt.apply_session_phase_validity(crossover_rows, measurement_session["audit"])
     phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
     failed_validation = [item for item in validation if not item["pass"]]
     if failed_validation:
@@ -78,13 +84,31 @@ def main():
             for item in failed_validation
         )
         raise SystemExit("Measurement validation gate failed: " + details)
-    component_score = opt.make_component_scorer(
-        freqs, traces, target, args.filter_cost_scale, args.worst_weight
+    component_score = opt.phase_safe_component_scorer(
+        opt.make_component_scorer(
+            freqs, traces, target, args.filter_cost_scale, args.worst_weight
+        ),
+        freqs,
+        phase_plan,
     )
+    baseline_groups = {group: [] for group in opt.GROUPS}
+    items.append((
+        float(component_score(baseline_groups)["objective"]),
+        opt.bands_signature(baseline_groups),
+        baseline_groups,
+        "baseline",
+    ))
 
     rescored_items = []
+    phase_peq_rejections = []
     for _stored_value, sig, groups, source in items:
+        conflicts = opt.phase_peq_conflicts(freqs, groups, phase_plan)
+        if conflicts:
+            phase_peq_rejections.extend(conflicts)
+            continue
         rescored_items.append((component_score(groups)["objective"], sig, groups, source))
+    if not rescored_items:
+        raise SystemExit("Every stored candidate conflicts with an attached crossover phase write")
     family_pool = unique_best(rescored_items, max(args.top * 10, 200))
     best = family_pool[: args.top]
     out_dir = args.out or (args.root / "_merged_top")
@@ -131,7 +155,6 @@ def main():
         })
     opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
 
-    baseline_groups = {group: [] for group in opt.GROUPS}
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
     baseline_score = opt.tune_scorecard(freqs, baseline_pred, target)
     baseline_score["components"] = component_score(baseline_groups)
@@ -141,6 +164,9 @@ def main():
         validation=validation,
         gate_ms=args.gate_ms,
         sample_rate=args.sample_rate,
+        level_calibration=args.level_calibration,
+        measurement_session=measurement_session,
+        phase_peq_rejections=phase_peq_rejections[:20],
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
     )
