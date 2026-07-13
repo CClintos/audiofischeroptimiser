@@ -40,6 +40,9 @@ record.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
 - `assistant_summary.json` contains only the decision core; `optimizer_summary.json`
   retains full settings, validation, phase confidence, components, and refinement.
+- Optional P2 choices are explicit: sub blend is recommendation-only and needs
+  calibrated level plus declared headroom; voicing files are generated only on
+  request and never identify a preferred tonal balance.
 
 ## Objective And Guardrails
 
@@ -78,8 +81,9 @@ record.
 - AFPX polarity uses `<T PM="1|4">`; delay uses `<T T="samples">`. Do not
   substitute `CINV` in the normal writer.
 - Candidate writers never overwrite the baseline.
-- If a candidate also writes polarity/delay/APF, PEQ changing that crossover by
-  at least 0.5 dB is vetoed and the rejected filter is reported.
+- Phase-valid sessions model complete RBJ PEQ magnitude/phase and jointly verify
+  PEQ with polarity, delay, and APF using measured-plus-complex-model delta.
+- Sessions without valid phase retain the conservative 0.5 dB crossover PEQ veto.
 - Lint and external verification independently check PEQ, PM polarity, delay,
   APF, crossover, output attributes, and other time-alignment attributes.
 
@@ -121,7 +125,7 @@ record.
 
 ## Verified State
 
-- Twenty-three regression tests pass, including objective invariants, session gates,
+- Twenty-eight regression tests pass, including objective invariants, session gates,
   crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity
@@ -138,14 +142,17 @@ record.
 - Repeated exact scoring on the three-position historical set measured about
   `214.6 scores/s`; the P0 snapshot was about `17.9 scores/s`.
 - The P1 beam candidate passed independent PEQ-only AFPX verification.
+- Complex RBJ magnitude matches the existing PEQ dB model to numerical precision;
+  phase-valid combined candidates use the canonical phase-session schema.
 - Historical test results are not assumptions about future measurements.
 
 ## Deliberate Non-Changes
 
-- No automatic voicing/target-family layer; the supplied target is authoritative.
+- No automatic voicing or preferred target; opt-in audition files leave the
+  supplied target authoritative and are neutral choices for listening tests.
 - No broad-LF boost exception.
 - No direct `fit_peq()` post-pass because it uses a different objective.
-- No complex PEQ summation until filter phase is modeled consistently.
+- No sub output-level writes; sub blend remains a recommendation.
 - No automated crossover-frequency/slope writing.
 - No live capture app; measurement capture remains external, normally REW.
 

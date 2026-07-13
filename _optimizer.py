@@ -54,11 +54,13 @@ from _make_v3 import (
 )
 from _tunefit import (
     allpass_fil_str,
+    allpass_H,
     audibility_score,
     audibility_weight,
     band_limited_impulse_delay,
     band_limited_delay_from_phase,
     cascade_db,
+    cascade_complex,
     erb_smooth,
     erb_hz,
     excess_gd_mask,
@@ -1349,6 +1351,28 @@ def apply_session_phase_validity(crossover_rows: List[Dict[str, object]],
             )
 
 
+def analyze_phase_session(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap,
+                          measurement_session: Dict[str, object],
+                          sample_rate_hz: float = 96000.0,
+                          impulse_root: Path | None = None,
+                          phase_cache: Path | None = None,
+                          writes: bool = True) -> Dict[str, object]:
+    """Canonical routine phase entry point and stable report schema."""
+    rows, cache = cached_crossover_phase_diagnostics(
+        phase_cache, freqs, traces, rich, measurement_session, impulse_root
+    )
+    apply_session_phase_validity(rows, dict(measurement_session.get("audit", {})))
+    plan = phase_write_plan(rows, sample_rate_hz) if writes else []
+    return {
+        "schema": "audiofischer-phase-session-v1",
+        "phase_valid": bool(dict(measurement_session.get("audit", {})).get("phase_valid")),
+        "diagnostics": rows,
+        "writes": plan,
+        "cache": cache,
+        "experimental_engines": ["lr_midbass_phase_search", "multinull_phase_search"],
+    }
+
+
 def trace_channels(trace_name: str) -> Tuple[int, ...]:
     if trace_name == "Sub":
         return (6, 7)
@@ -1503,6 +1527,160 @@ def phase_safe_component_scorer(component_score, freqs: np.ndarray,
             comp["objective"] = 1e6 + 1000.0 * len(conflicts) + comp["phase_peq_conflict_max_db"]
         return comp
     return score
+
+
+def _channel_complex_transfers(freqs: np.ndarray, groups: GroupBands,
+                               phase_plan: List[Dict[str, object]] | None) -> Dict[int, np.ndarray]:
+    transfers = {ch: np.ones_like(freqs, dtype=complex) for ch in range(8)}
+    for group, bands in groups.items():
+        response = cascade_complex(freqs, bands)
+        for channel in GROUPS.get(group, {}).get("channels", ()):
+            transfers[int(channel)] *= response
+    for edit in phase_plan or []:
+        for channel in edit.get("polarity_channels", ()):
+            transfers[int(channel)] *= -1.0
+        delay_s = float(edit.get("delay_ms", 0.0)) / 1000.0
+        if delay_s:
+            delay_h = np.exp(-1j * 2.0 * np.pi * freqs * delay_s)
+            for channel in edit.get("channels", ()):
+                transfers[int(channel)] *= delay_h
+        if edit.get("apf"):
+            apf_h = allpass_H(freqs, float(edit["apf_f"]), float(edit["apf_q"]))
+            for channel in edit.get("apf_channels", ()):
+                transfers[int(channel)] *= apf_h
+    return transfers
+
+
+def complex_crossover_verification(freqs: np.ndarray, rich: RichTraceMap,
+                                   groups: GroupBands,
+                                   phase_plan: List[Dict[str, object]] | None) -> Dict[str, object]:
+    """Jointly verify PEQ magnitude/phase and attached phase writes."""
+    transfers = _channel_complex_transfers(freqs, groups, phase_plan)
+    phase_only = _channel_complex_transfers(freqs, {name: [] for name in GROUPS}, phase_plan)
+    affected_channels = {
+        int(channel)
+        for edit in phase_plan or []
+        for channel in edit.get("crossover_channels", ())
+    }
+    rows = []
+    for spec in crossover_specs(freqs, rich):
+        ca = _complex_from_rich(rich[str(spec["a"])])
+        cb = _complex_from_rich(rich[str(spec["b"])])
+        together = spec.get("together")
+        if ca is None or cb is None or together is None:
+            continue
+        channels_a = trace_channels(str(spec["a"]))
+        channels_b = trace_channels(str(spec["b"]))
+        if affected_channels and not affected_channels.intersection(channels_a + channels_b):
+            continue
+        ha = np.mean([transfers[ch] for ch in channels_a], axis=0)
+        hb = np.mean([transfers[ch] for ch in channels_b], axis=0)
+        href_a = np.mean([phase_only[ch] for ch in channels_a], axis=0)
+        href_b = np.mean([phase_only[ch] for ch in channels_b], axis=0)
+        before = ca + cb
+        after = ca * ha + cb * hb
+        lo, hi = spec["band"]
+        selected = (freqs >= float(lo)) & (freqs <= float(hi))
+        measured = np.asarray(together["spl"])
+        model_before = 20.0 * np.log10(np.abs(before) + 1e-12)
+        model_after = 20.0 * np.log10(np.abs(after) + 1e-12)
+        predicted_after = measured + (model_after - model_before)
+        incoherent_after = 10.0 * np.log10(np.abs(ca * ha) ** 2 + np.abs(cb * hb) ** 2 + 1e-24)
+        deficit = np.minimum(predicted_after - incoherent_after, 0.0)
+        deficit_rms = _band_rms(deficit, selected)
+        ref_after = ca * href_a + cb * href_b
+        ref_model = 20.0 * np.log10(np.abs(ref_after) + 1e-12)
+        ref_predicted = measured + (ref_model - model_before)
+        ref_incoherent = 10.0 * np.log10(
+            np.abs(ca * href_a) ** 2 + np.abs(cb * href_b) ** 2 + 1e-24
+        )
+        ref_deficit = np.minimum(ref_predicted - ref_incoherent, 0.0)
+        ref_rms = _band_rms(ref_deficit, selected)
+        worst = float(np.min(deficit[selected]))
+        ref_worst = float(np.min(ref_deficit[selected]))
+        rows.append({
+            "name": spec["name"],
+            "band_hz": [float(lo), float(hi)],
+            "deficit_rms_db": round(deficit_rms, 4),
+            "phase_only_deficit_rms_db": round(ref_rms, 4),
+            "predicted_worst_deficit_db": round(worst, 4),
+            "phase_only_worst_deficit_db": round(ref_worst, 4),
+            "pass": bool(deficit_rms <= ref_rms + 0.25 and worst >= ref_worst - 1.0),
+            "method": "measured_plus_complex_model_delta",
+        })
+    return {
+        "schema": "audiofischer-complex-crossover-v1",
+        "eligible": bool(rows),
+        "pass": bool(rows) and all(bool(row["pass"]) for row in rows),
+        "crossovers": rows,
+    }
+
+
+def complex_phase_component_scorer(component_score, freqs: np.ndarray, rich: RichTraceMap,
+                                   phase_plan: List[Dict[str, object]] | None,
+                                   phase_valid: bool):
+    """Replace the coarse crossover PEQ veto only for a phase-valid session."""
+    if not phase_valid or not phase_plan:
+        return phase_safe_component_scorer(component_score, freqs, phase_plan)
+
+    def score(groups: GroupBands) -> Dict[str, float]:
+        comp = dict(component_score(groups))
+        verification = complex_crossover_verification(freqs, rich, groups, phase_plan)
+        comp["complex_crossover_pass"] = float(bool(verification["pass"]))
+        comp["complex_crossover_worst_deficit_db"] = max(
+            (-float(row["predicted_worst_deficit_db"]) for row in verification["crossovers"]),
+            default=0.0,
+        )
+        if not verification["pass"]:
+            comp["objective"] = 1e6 + 1000.0 + comp["complex_crossover_worst_deficit_db"]
+        return comp
+    return score
+
+
+def same_level_sub_blend_recommendation(freqs: np.ndarray, traces: TraceMap,
+                                        target: np.ndarray,
+                                        measurement_session: Dict[str, object],
+                                        headroom_db: float | None) -> Dict[str, object]:
+    audit = dict(measurement_session.get("audit", {}))
+    calibrated = bool(audit.get("tonal_valid")) and not audit.get("missing_calibration_roles")
+    if not calibrated:
+        return {"status": "blocked", "reason": "same-level calibrated measurements are required"}
+    if headroom_db is None:
+        return {"status": "blocked", "reason": "known output/headroom margin is required"}
+    low = (freqs >= 35.0) & (freqs <= 80.0)
+    if not np.any(low):
+        return {"status": "blocked", "reason": "35-80 Hz measurement band is missing"}
+    error = erb_smooth(freqs, target - traces["System Sum"])
+    trim = float(np.median(error[low]))
+    trim = float(np.clip(trim, -3.0, min(3.0, max(0.0, float(headroom_db)))))
+    return {
+        "status": "recommendation_only",
+        "recommended_sub_output_trim_db": round(trim, 2),
+        "available_headroom_db": float(headroom_db),
+        "band_hz": [35.0, 80.0],
+        "method": "target-referenced same-level system residual",
+        "warning": "apply as sub output level, not broad PEQ; re-measure sub/front summation",
+    }
+
+
+def write_voicing_variants(out_dir: Path, base_xml: str, groups: GroupBands,
+                           phase_plan: List[Dict[str, object]] | None) -> List[Dict[str, object]]:
+    """Write neutral-labelled audition choices without changing the target."""
+    definitions = (
+        ("warm", "slightly fuller bass and softer top", {"low_sym": [(80.0, 0.5, 1.0)], "high_sym": [(8000.0, 0.5, -0.75)]}),
+        ("reference", "optimizer result with supplied target unchanged", {}),
+        ("clear", "slightly leaner bass and brighter top", {"low_sym": [(80.0, 0.5, -0.75)], "high_sym": [(8000.0, 0.5, 0.75)]}),
+    )
+    outputs = []
+    for label, description, additions in definitions:
+        variant = {name: list(bands) for name, bands in groups.items()}
+        for name, bands in additions.items():
+            if name in variant:
+                variant[name].extend(bands)
+        path = out_dir / f"voicing_{label}.afpx"
+        write_candidate(base_xml, path, variant, phase_plan=phase_plan)
+        outputs.append({"label": label, "file": path.name, "description": description, "preferred": False})
+    return outputs
 
 
 def add_allpass_to_oc(oc: str, f0: float, q: float = 0.7, invert: bool = False) -> str:
@@ -1765,11 +1943,15 @@ def make_objective(
     worst_weight: float = 0.018,
     min_total_bands: int = 0,
     phase_plan: List[Dict[str, object]] | None = None,
+    rich_traces: RichTraceMap | None = None,
+    phase_valid: bool = False,
 ):
-    component_score = phase_safe_component_scorer(
+    component_score = complex_phase_component_scorer(
         make_component_scorer(freqs, traces, target, filter_cost_scale, worst_weight),
         freqs,
+        rich_traces or {},
         phase_plan,
+        phase_valid,
     )
 
     def objective(trial: optuna.Trial) -> float:
@@ -2259,6 +2441,9 @@ def write_report(
         ),
         "crossover_phase_confidence": crossover_rows,
         "written_phase_plan": phase_plan,
+        "phase_session": getattr(args, "phase_session", None),
+        "sub_blend_recommendation": getattr(args, "sub_blend_recommendation", None),
+        "voicing_variants": getattr(args, "voicing_variants", []),
         "phase_peq_rejections": getattr(args, "phase_peq_rejections", [])[:20],
         "generated_files": {
             "report": str(md),
@@ -2367,6 +2552,16 @@ def write_report(
             "refinement": getattr(args, "refinement", None),
         },
         "phase_actions": compact_phase_actions,
+        "complex_crossover_verification": (
+            complex_crossover_verification(
+                np.asarray(getattr(args, "freqs")), getattr(args, "rich_traces", {}),
+                best_row.get("groups", {}) if best_row else {}, phase_plan
+            )
+            if best_row and getattr(args, "rich_traces", None)
+            and bool(compact_session.get("phase_valid")) and phase_plan else None
+        ),
+        "sub_blend_recommendation": getattr(args, "sub_blend_recommendation", None),
+        "voicing_variants": getattr(args, "voicing_variants", []),
         "phase_peq_rejections": {
             "reported_count": len(rejection_source),
             "may_be_truncated": len(rejection_source) >= 20,
@@ -2589,6 +2784,9 @@ def main() -> None:
                         help="JSON object mapping measurement role/file names to dB offsets for mixed-level sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
+    parser.add_argument("--sub-blend", choices=("off", "recommend"), default="off")
+    parser.add_argument("--headroom-db", type=float, default=None)
+    parser.add_argument("--voicing-variants", choices=("off", "audition"), default="off")
     parser.add_argument("--progress", action="store_true", help="Show Optuna's progress bar.")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -2609,11 +2807,14 @@ def main() -> None:
     target = raw_target + target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = decode_afpx(args.baseline)
     args.validation = pair_sum_validation(freqs, traces)
-    crossover_rows, args.phase_diagnostic_cache = cached_crossover_phase_diagnostics(
-        args.phase_cache, freqs, traces, rich_traces, args.measurement_session, args.impulse_root
+    phase_session = analyze_phase_session(
+        freqs, traces, rich_traces, args.measurement_session, args.sample_rate,
+        args.impulse_root, args.phase_cache, writes=args.phase_writes != "off"
     )
-    apply_session_phase_validity(crossover_rows, args.measurement_session["audit"])
-    phase_plan = [] if args.phase_writes == "off" else phase_write_plan(crossover_rows, args.sample_rate)
+    crossover_rows = phase_session["diagnostics"]
+    args.phase_diagnostic_cache = phase_session["cache"]
+    args.phase_session = phase_session
+    phase_plan = phase_session["writes"]
     failed_validation = [item for item in args.validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
@@ -2625,7 +2826,7 @@ def main() -> None:
     baseline_groups: GroupBands = {group: [] for group in GROUPS}
     baseline_pred = predict_traces(freqs, traces, baseline_groups)
     baseline_score = tune_scorecard(freqs, baseline_pred, target)
-    component_score = phase_safe_component_scorer(
+    component_score = complex_phase_component_scorer(
         make_component_scorer(
             freqs,
             traces,
@@ -2634,7 +2835,9 @@ def main() -> None:
             worst_weight=args.worst_weight,
         ),
         freqs,
+        rich_traces,
         phase_plan,
+        bool(args.measurement_session["audit"].get("phase_valid")),
     )
     baseline_score["components"] = component_score(baseline_groups)
     objective = make_objective(
@@ -2645,6 +2848,8 @@ def main() -> None:
         worst_weight=args.worst_weight,
         min_total_bands=args.min_total_bands,
         phase_plan=phase_plan,
+        rich_traces=rich_traces,
+        phase_valid=bool(args.measurement_session["audit"].get("phase_valid")),
     )
     baseline_objective = objective(StaticTrial(baseline_groups))
 
@@ -2679,10 +2884,14 @@ def main() -> None:
         if sig in seen:
             continue
         seen.add(sig)
-        conflicts = phase_peq_conflicts(freqs, groups, phase_plan)
-        if conflicts:
-            args.phase_peq_rejections.extend(conflicts)
-            continue
+        if args.measurement_session["audit"].get("phase_valid") and phase_plan:
+            if not complex_crossover_verification(freqs, rich_traces, groups, phase_plan)["pass"]:
+                continue
+        else:
+            conflicts = phase_peq_conflicts(freqs, groups, phase_plan)
+            if conflicts:
+                args.phase_peq_rejections.extend(conflicts)
+                continue
         rank = len(ranked_rows) + 1
         file_name = f"candidate_{rank:02d}_objective_{candidate_value:.4f}.afpx"
         out_path = out_dir / file_name
@@ -2725,6 +2934,17 @@ def main() -> None:
             notes.append(f"{label} destructive-summing audit flagged: {pretty}.")
 
     write_family_aliases(out_dir, ranked_rows, base_xml, phase_plan=phase_plan)
+    args.freqs = freqs
+    args.rich_traces = rich_traces
+    args.voicing_variants = (
+        write_voicing_variants(out_dir, base_xml, ranked_rows[0]["groups"], phase_plan)
+        if args.voicing_variants == "audition" and ranked_rows else []
+    )
+    args.sub_blend_recommendation = (
+        same_level_sub_blend_recommendation(
+            freqs, traces, target, args.measurement_session, args.headroom_db
+        ) if args.sub_blend == "recommend" else None
+    )
     write_report(out_dir, ranked_rows, baseline_score, notes, args, family_rows=ranked_rows,
                  crossover_rows=crossover_rows, phase_plan=phase_plan)
 

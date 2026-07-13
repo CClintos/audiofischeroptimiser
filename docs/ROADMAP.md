@@ -58,23 +58,27 @@ compute benefit, and token savings. Detailed evidence is in
      assistant-summary path.
    - Preserve resume/checkpoint behavior and silent long-run mode.
 
-## P2: Audible Extensions With Explicit User Choice
+## P2: Audible Extensions With Explicit User Choice (completed 2026-07-13)
 
 10. **Same-level sub blend recommendation**
+    - Complete: opt-in `-SubBlend recommend -HeadroomDb N`; report-only output trim.
     - Recommendation-only first; require calibrated measurements and headroom.
     - Do not fake output trim with broad PEQ boost.
 
 11. **Explicit voicing audition variants**
+    - Complete: opt-in `-VoicingVariants audition`; warm/reference/clear files.
     - Keep the supplied target untouched.
     - Generate a small labelled set only when requested; never auto-claim a
       preferred tonal balance.
 
 12. **Full complex PEQ/crossover prediction**
+    - Complete: full RBJ transfer and measured-plus-model-delta crossover gate.
     - Model biquad magnitude and phase together.
     - Enable only for phase-valid solo/together sessions.
     - Then jointly verify PEQ with polarity/delay/residual APF.
 
 13. **Unify normal phase entry points**
+    - Complete: `analyze_phase_session()` and `audiofischer-phase-session-v1`.
     - Keep specialist midbass/multinull engines experimental.
     - Expose one canonical phase API and report schema for routine use.
 

@@ -57,6 +57,26 @@ uses a bounded worker count, prepares phase diagnostics once, runs/resumes the
 search, merges and verifies family candidates, then prints only the path to
 `assistant_summary.json`.
 
+Optional audible extensions are never enabled silently:
+
+```powershell
+.\run_optimizer.ps1 -DataRoot ".\my measurements" `
+  -SubBlend recommend -HeadroomDb 3 `
+  -VoicingVariants audition
+```
+
+`SubBlend` reports a same-level sub output-trim suggestion only when the session
+is calibrated and declared headroom is available; it never creates a broad PEQ
+boost. `VoicingVariants` writes labelled warm, reference, and clear audition
+files while leaving the supplied target untouched and declaring no winner.
+
+For phase-valid solo/together sessions, candidate PEQ is evaluated as a full
+complex RBJ transfer together with polarity, delay, and residual APF. Invalid or
+missing phase data keeps the conservative crossover-band PEQ veto. Routine phase
+analysis uses `analyze_phase_session()` and the stable
+`audiofischer-phase-session-v1` schema; specialist multinull tools remain
+experimental.
+
 Suggested prompt:
 
 ```text

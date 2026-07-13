@@ -22,7 +22,8 @@ LOGSTEP = 2 ** (1 / 96.0)        # REW 96 PPO
 
 # --------------------------------------------------------------------------
 # biquad + cascade (same RBJ math _devcalc.py uses, vector over freq axis)
-def peaking_db(freqs, f0, Q, gain_db, fs=FS):
+def peaking_complex(freqs, f0, Q, gain_db, fs=FS):
+    """Complete RBJ peaking transfer, including magnitude and phase."""
     A = 10 ** (gain_db / 40.0)
     w0 = 2 * np.pi * f0 / fs
     al = np.sin(w0) / (2 * Q)
@@ -30,8 +31,17 @@ def peaking_db(freqs, f0, Q, gain_db, fs=FS):
     a0, a1, a2 = 1 + al / A, -2 * np.cos(w0), 1 - al / A
     w = 2 * np.pi * freqs / fs
     z1, z2 = np.exp(-1j * w), np.exp(-2j * w)
-    H = (b0 + b1 * z1 + b2 * z2) / (a0 + a1 * z1 + a2 * z2)
+    return (b0 + b1 * z1 + b2 * z2) / (a0 + a1 * z1 + a2 * z2)
+
+def peaking_db(freqs, f0, Q, gain_db, fs=FS):
+    H = peaking_complex(freqs, f0, Q, gain_db, fs)
     return 20 * np.log10(np.abs(H))
+
+def cascade_complex(freqs, bands, fs=FS):
+    out = np.ones_like(freqs, dtype=complex)
+    for F, Q, G in bands:
+        out *= peaking_complex(freqs, F, Q, G, fs)
+    return out
 
 def cascade_db(freqs, bands):
     out = np.zeros_like(freqs, dtype=float)

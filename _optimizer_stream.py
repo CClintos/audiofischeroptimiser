@@ -790,23 +790,31 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
         old.unlink()
     phase_plan = getattr(args, "phase_plan", [])
     crossover_rows = getattr(args, "crossover_rows", [])
+    phase_valid = bool(dict(args.measurement_session.get("audit", {})).get("phase_valid"))
     def safe_entries(entries):
         kept = []
         for entry in entries or []:
-            conflicts = opt.phase_peq_conflicts(freqs, entry[2], phase_plan)
-            if conflicts:
-                args.phase_peq_rejections.extend(conflicts)
+            if phase_valid and phase_plan:
+                verification = opt.complex_crossover_verification(freqs, rich_traces, entry[2], phase_plan)
+                if verification["pass"]:
+                    kept.append(entry)
             else:
+                conflicts = opt.phase_peq_conflicts(freqs, entry[2], phase_plan)
+                if conflicts:
+                    args.phase_peq_rejections.extend(conflicts)
+                    continue
                 kept.append(entry)
         return kept
     best = safe_entries(best)
     family_entries = safe_entries(family_entries)
-    component_score = opt.phase_safe_component_scorer(
+    component_score = opt.complex_phase_component_scorer(
         opt.make_component_scorer(
             freqs, traces, target, args.filter_cost_scale, args.worst_weight
         ),
         freqs,
+        rich_traces,
         phase_plan,
+        phase_valid,
     )
     rows = build_rows(freqs, traces, target, best, component_score)
     family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
@@ -913,11 +921,13 @@ def main():
             for item in failed_validation
         )
         raise SystemExit("Measurement validation gate failed: " + details)
-    args.crossover_rows, args.phase_diagnostic_cache = opt.cached_crossover_phase_diagnostics(
-        args.phase_cache, freqs, traces, rich_traces, args.measurement_session, args.impulse_root
+    phase_session = opt.analyze_phase_session(
+        freqs, traces, rich_traces, args.measurement_session, args.sample_rate,
+        args.impulse_root, args.phase_cache, writes=args.phase_writes != "off"
     )
-    opt.apply_session_phase_validity(args.crossover_rows, args.measurement_session["audit"])
-    args.phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(args.crossover_rows, args.sample_rate)
+    args.crossover_rows = phase_session["diagnostics"]
+    args.phase_diagnostic_cache = phase_session["cache"]
+    args.phase_plan = phase_session["writes"]
     guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
     cma_proposal = None
     if args.proposal == "cmaes":
@@ -933,12 +943,14 @@ def main():
     baseline_groups: GroupBands = {group: [] for group in opt.GROUPS}
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
     baseline_score = opt.tune_scorecard(freqs, baseline_pred, target)
-    component_score = opt.phase_safe_component_scorer(
+    component_score = opt.complex_phase_component_scorer(
         opt.make_component_scorer(
             freqs, traces, target, args.filter_cost_scale, args.worst_weight
         ),
         freqs,
+        rich_traces,
         args.phase_plan,
+        bool(args.measurement_session["audit"].get("phase_valid")),
     )
     args.phase_peq_rejections = []
     baseline_score["components"] = component_score(baseline_groups)

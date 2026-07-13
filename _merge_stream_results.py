@@ -58,6 +58,9 @@ def main():
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
+    parser.add_argument("--sub-blend", choices=("off", "recommend"), default="off")
+    parser.add_argument("--headroom-db", type=float, default=None)
+    parser.add_argument("--voicing-variants", choices=("off", "audition"), default="off")
     args = parser.parse_args()
 
     measurement_session, level_calibration = opt.prepare_measurement_session(
@@ -76,11 +79,13 @@ def main():
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
-    crossover_rows, phase_diagnostic_cache = opt.cached_crossover_phase_diagnostics(
-        args.phase_cache, freqs, traces, rich_traces, measurement_session, args.impulse_root
+    phase_session = opt.analyze_phase_session(
+        freqs, traces, rich_traces, measurement_session, args.sample_rate,
+        args.impulse_root, args.phase_cache, writes=args.phase_writes != "off"
     )
-    opt.apply_session_phase_validity(crossover_rows, measurement_session["audit"])
-    phase_plan = [] if args.phase_writes == "off" else opt.phase_write_plan(crossover_rows, args.sample_rate)
+    crossover_rows = phase_session["diagnostics"]
+    phase_diagnostic_cache = phase_session["cache"]
+    phase_plan = phase_session["writes"]
     failed_validation = [item for item in validation if not item["pass"]]
     if failed_validation:
         details = "; ".join(
@@ -88,12 +93,15 @@ def main():
             for item in failed_validation
         )
         raise SystemExit("Measurement validation gate failed: " + details)
-    component_score = opt.phase_safe_component_scorer(
+    phase_valid = bool(measurement_session["audit"].get("phase_valid"))
+    component_score = opt.complex_phase_component_scorer(
         opt.make_component_scorer(
             freqs, traces, target, args.filter_cost_scale, args.worst_weight
         ),
         freqs,
+        rich_traces,
         phase_plan,
+        phase_valid,
     )
     baseline_groups = {group: [] for group in opt.GROUPS}
     items.append((
@@ -106,10 +114,14 @@ def main():
     rescored_items = []
     phase_peq_rejections = []
     for _stored_value, sig, groups, source in items:
-        conflicts = opt.phase_peq_conflicts(freqs, groups, phase_plan)
-        if conflicts:
-            phase_peq_rejections.extend(conflicts)
-            continue
+        if phase_valid and phase_plan:
+            if not opt.complex_crossover_verification(freqs, rich_traces, groups, phase_plan)["pass"]:
+                continue
+        else:
+            conflicts = opt.phase_peq_conflicts(freqs, groups, phase_plan)
+            if conflicts:
+                phase_peq_rejections.extend(conflicts)
+                continue
         rescored_items.append((component_score(groups)["objective"], sig, groups, source))
     if not rescored_items:
         raise SystemExit("Every stored candidate conflicts with an attached crossover phase write")
@@ -158,6 +170,14 @@ def main():
             "left_alone": opt.left_alone_note(freqs, traces),
         })
     opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
+    voicing_variants = []
+    if args.voicing_variants == "audition" and best:
+        voicing_variants = opt.write_voicing_variants(out_dir, base_xml, best[0][2], phase_plan)
+    sub_blend = None
+    if args.sub_blend == "recommend":
+        sub_blend = opt.same_level_sub_blend_recommendation(
+            freqs, traces, target, measurement_session, args.headroom_db
+        )
 
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
     baseline_score = opt.tune_scorecard(freqs, baseline_pred, target)
@@ -173,6 +193,11 @@ def main():
         phase_peq_rejections=phase_peq_rejections[:20],
         phase_cache=args.phase_cache,
         phase_diagnostic_cache=phase_diagnostic_cache,
+        phase_session=phase_session,
+        freqs=freqs,
+        rich_traces=rich_traces,
+        voicing_variants=voicing_variants,
+        sub_blend_recommendation=sub_blend,
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
     )

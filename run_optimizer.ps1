@@ -12,6 +12,11 @@ param(
     [string]$PhaseWrites = "auto",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [ValidateSet("off", "recommend")]
+    [string]$SubBlend = "off",
+    [double]$HeadroomDb = -1,
+    [ValidateSet("off", "audition")]
+    [string]$VoicingVariants = "off",
     [string]$PythonExe = ""
 )
 
@@ -68,6 +73,8 @@ $mergeArgs = @(
     "--top", "20", "--baseline", $baselinePath, "--target", $targetPath,
     "--validation-threshold", "$ValidationThreshold", "--phase-writes", $PhaseWrites
 )
+$mergeArgs += @("--sub-blend", $SubBlend, "--voicing-variants", $VoicingVariants)
+if ($HeadroomDb -ge 0) { $mergeArgs += @("--headroom-db", "$HeadroomDb") }
 if (Test-Path -LiteralPath $phaseCache) { $mergeArgs += @("--phase-cache", $phaseCache) }
 if ($ImpulseRoot) { $mergeArgs += @("--impulse-root", $ImpulseRoot) }
 if ($LevelCalibration) { $mergeArgs += @("--level-calibration", $LevelCalibration) }
@@ -77,7 +84,7 @@ if ($LASTEXITCODE -ne 0) { throw ($mergeOutput -join [Environment]::NewLine) }
 $merged = Join-Path $Root "_merged_top"
 $verifyDir = Join-Path $merged "verification"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
-foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "family_*.afpx") {
+foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Where-Object { $_.Name -like "family_*" -or $_.Name -like "voicing_*" }) {
     $verifyArgs = @(
         "scripts\verify_written_tune.py", $baselinePath, $candidate.FullName,
         "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))

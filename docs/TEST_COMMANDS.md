@@ -88,6 +88,10 @@ py -3 .\scripts\summarise_optimizer_run.py ".\Optimizer_Run\_merged_top"
 Start here before opening large reports or CSVs.
 The helper reads `assistant_summary.json` first.
 
+P2 regression tests are included in the normal suite. An opt-in output smoke can
+use `-SubBlend recommend -HeadroomDb 3 -VoicingVariants audition`; verify both
+`family_*.afpx` and `voicing_*.afpx` against the baseline.
+
 ## Summarise One Candidate
 
 ```powershell
