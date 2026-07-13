@@ -52,6 +52,10 @@ record.
   gated polarity/delay/APF changes are considered.
 - The GUI assumes one fresh, consistently leveled measurement session and does
   not expose level-calibration JSON. Explicit calibration remains CLI-only.
+- Results automatically emit a local `SQ_Tuning_Report.pdf`; PEQ and phase runs
+  receive mode-specific evidence, change, restraint, and verification sections.
+- The GUI About tab documents the two-stage workflow, named objective, phase
+  ladder, guardrails, and deliberate non-changes.
 - Packaged builds contain a windowed GUI plus a console worker companion so
   PowerShell can wait for the bundled runtime without displaying a GUI console.
 

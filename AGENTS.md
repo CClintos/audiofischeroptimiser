@@ -30,6 +30,7 @@ when the current-state checkpoint does not answer it.
 - `run_optimizer.ps1`: preferred one-command local runner.
 - `audiofischer_gui.py`: packaged/source GUI entry point and worker dispatcher.
 - `optimizer_gui/`: native GUI, durable jobs, preflight, progress and results.
+- `optimizer_gui/reporting.py`: mode-specific local PDF tuning reports.
 - `_benchmark.py`: benchmark/check script.
 - `objective_module/afpx_objective.py`: scalar objective.
 - `objective_module/_tunefit.py`: DSP/math helpers.

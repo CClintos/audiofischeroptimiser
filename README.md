@@ -24,6 +24,10 @@ gated phase/delay/APF changes. It also controls CPU and optimizer RAM use,
 preserves checkpoints, safely stops/resumes runs, and loads verified candidates
 from `assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
 
+Results automatically creates `SQ_Tuning_Report.pdf` with the named score
+components, supported changes, warnings, deliberately untouched regions, and
+the required in-car checks. The About tab explains the scoring and workflow.
+
 For AI-assisted development, start with `AGENTS.md` and
 `docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md`.
 

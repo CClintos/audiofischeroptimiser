@@ -19,6 +19,11 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
    then the normal merge and AFPX verification path runs.
 8. Review and export the verified candidate files from Results.
 
+Loading Results automatically creates `SQ_Tuning_Report.pdf` beside the merged
+candidate files. The report summarizes the objective components, exact supported
+changes, confidence warnings, deliberately untouched regions, and re-measure
+checks. The About tab explains the same scoring and safety model in-app.
+
 Alternative guided/CMA/random search methods remain developer CLI options for
 benchmarking. They are intentionally hidden from the normal GUI.
 

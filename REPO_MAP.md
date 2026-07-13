@@ -14,6 +14,7 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 - `audiofischer_gui.py`: native Windows GUI entry point and packaged worker dispatch.
 - `optimizer_gui/backend.py`: durable run config, preflight, progress, memory and results contract.
 - `optimizer_gui/window.py`: PySide6 inputs, run controls, progress and candidate export.
+- `optimizer_gui/reporting.py`: local PEQ/phase PDF tuning report generation.
 - `AudioFischerOptimizer.spec`: reproducible on-disk Windows package.
 
 ## Core Logic Areas

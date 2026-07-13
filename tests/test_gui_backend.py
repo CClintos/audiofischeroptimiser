@@ -8,6 +8,7 @@ from pathlib import Path
 from optimizer_gui.backend import (
     RunConfig, candidate_files, collect_progress, powershell_command, validate_config,
 )
+from optimizer_gui.reporting import build_report_html
 
 
 class GuiJobTests(unittest.TestCase):
@@ -63,6 +64,28 @@ class GuiJobTests(unittest.TestCase):
             summary = {"families": {"balanced": {"file": "family_balanced.afpx", "objective": 2.0}}}
             rows = candidate_files(summary, summary_path)
             self.assertEqual(rows[0]["role"], "Balanced")
+
+    def test_pdf_report_uses_named_components_and_phase_actions(self) -> None:
+        summary = {
+            "search": {"mode": "phase"},
+            "candidate_count": 1,
+            "baseline": {"objective": 5.0, "tonal_error_db": 2.0, "presence_error_db": 2.2},
+            "best": {
+                "file": "candidate.afpx", "objective": 4.0,
+                "components": {"objective": 4.0, "tonal_error_db": 1.5, "presence_error_db": 1.8},
+                "left_alone": "450 Hz null: destructive, not EQ-able",
+            },
+            "phase_actions": [{
+                "source": "Left mid to tweeter", "delay_samples": -12,
+                "confidence": "warning",
+            }],
+            "gates": {"measurement_session": {"phase_valid": True}},
+        }
+        report = build_report_html(summary, {}, Path("assistant_summary.json"))
+        self.assertIn("Phase / Timing Diagnostic", report)
+        self.assertIn("Vocal / presence error", report)
+        self.assertIn("delay -12 samples", report)
+        self.assertIn("destructive, not EQ-able", report)
 
 
 if __name__ == "__main__":

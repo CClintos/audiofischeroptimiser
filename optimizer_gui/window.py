@@ -22,6 +22,7 @@ from .backend import (
     discover_baseline, export_candidate, load_summary, locate_summary,
     powershell_command, process_tree_memory, timestamped_run_root, validate_config,
 )
+from .reporting import generate_tuning_report
 
 
 class DropLineEdit(QLineEdit):
@@ -55,6 +56,7 @@ class OptimizerWindow(QMainWindow):
         self.process: QProcess | None = None
         self.config: RunConfig | None = None
         self.summary_path: Path | None = None
+        self.report_path: Path | None = None
         self.summary: dict = {}
         self.started_monotonic = 0.0
         self.memory_limit_hits = 0
@@ -98,6 +100,7 @@ class OptimizerWindow(QMainWindow):
         self.tabs.addTab(self._build_phase_tab(), "2  Sweeps / Phase")
         self.tabs.addTab(self._build_run_tab(), "3  Run")
         self.tabs.addTab(self._build_results_tab(), "4  Results")
+        self.tabs.addTab(self._build_about_tab(), "5  About")
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
 
@@ -362,7 +365,12 @@ class OptimizerWindow(QMainWindow):
         self.open_results_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
         self.open_results_button.clicked.connect(self._open_results_folder)
         self.open_results_button.setEnabled(False)
+        self.open_report_button = QPushButton("Open Tuning Report")
+        self.open_report_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.open_report_button.clicked.connect(self._open_report)
+        self.open_report_button.setEnabled(False)
         result_actions.addWidget(self.export_button)
+        result_actions.addWidget(self.open_report_button)
         result_actions.addWidget(self.open_results_button)
         result_actions.addStretch()
         layout.addLayout(result_actions)
@@ -371,6 +379,42 @@ class OptimizerWindow(QMainWindow):
         self.result_details.setReadOnly(True)
         self.result_details.setPlaceholderText("Named score components, phase actions and warnings appear here.")
         layout.addWidget(self.result_details, 1)
+        return page
+
+    def _build_about_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 22, 24, 22)
+        about = QTextEdit()
+        about.setReadOnly(True)
+        about.setHtml("""
+        <h1>AudioFischer Optimizer</h1>
+        <p>A local, conservative tuning tool for Helix and Audiotec Fischer AFPX files. It reads REW measurements, predicts supported changes, writes new candidate tunes, and never overwrites the baseline.</p>
+        <h2>Two-stage workflow</h2>
+        <p><b>1. PEQ / RTA:</b> Uses fresh magnitude or moving-mic RTA measurements to improve tonal balance and L/R consistency. Delay, polarity, APF and crossovers remain untouched.</p>
+        <p><b>2. Sweeps / Phase:</b> After the PEQ result is loaded, fresh phase-valid sweeps are used to test crossover polarity, bounded relative delay and residual all-pass correction. Existing PEQ remains unchanged.</p>
+        <h2>How PEQ is judged</h2>
+        <ul>
+          <li>ERB-smoothed tonal error against the supplied target.</li>
+          <li>Extra weighting through the vocal and presence region.</li>
+          <li>Peaks cost more than comparable dips.</li>
+          <li>L/R signed bias plus absolute and RMS mismatch from solo traces.</li>
+          <li>Centre, left-ear and right-ear robustness when those positions are supplied.</li>
+          <li>Penalties for positive gain, excessive filter count, narrow/deep filters, wasted bands and unsupported asymmetry.</li>
+        </ul>
+        <h2>How phase is judged</h2>
+        <p>The tool validates that solo traces reproduce the measured together trace, then checks only the crossover band. It tests polarity first, relative delay second and an APF only for a supported residual. Weak or inconsistent evidence is rejected or clearly warned.</p>
+        <h2>What it deliberately avoids</h2>
+        <ul>
+          <li>Boosting destructive acoustic nulls or crossover cancellations with PEQ.</li>
+          <li>EQ outside a driver's useful passband or at physical roll-off edges.</li>
+          <li>Changing crossover frequency, slope, shelves or output levels automatically.</li>
+          <li>Claiming that a predicted tune is verified before it is loaded and re-measured.</li>
+        </ul>
+        <h2>Objective</h2>
+        <p>Lower is better. The displayed objective is a weighted decision score made from the named components above, not a single raw flatness number. Candidate reports show why a result won, what changed, what was left alone and what must be checked in-car.</p>
+        """)
+        layout.addWidget(about)
         return page
 
     def _apply_style(self):
@@ -736,6 +780,13 @@ class OptimizerWindow(QMainWindow):
         }
         self.result_details.setPlainText(json.dumps(core, indent=2))
         self.open_results_button.setEnabled(True)
+        try:
+            self.report_path = generate_tuning_report(summary_path)
+            self.open_report_button.setEnabled(self.report_path.exists())
+        except Exception as exc:
+            self.report_path = None
+            self.open_report_button.setEnabled(False)
+            self.result_details.append(f"\nPDF report could not be generated: {exc}")
         if rows:
             self.result_table.selectRow(0)
 
@@ -765,6 +816,10 @@ class OptimizerWindow(QMainWindow):
     def _open_results_folder(self):
         if self.summary_path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.summary_path.parent)))
+
+    def _open_report(self):
+        if self.report_path and self.report_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.report_path)))
 
     def closeEvent(self, event):
         if self.process and self.process.state() != QProcess.NotRunning:

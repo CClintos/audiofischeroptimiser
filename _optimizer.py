@@ -2535,6 +2535,11 @@ def write_report(
             "objective": round(float(best_row.get("objective", 0.0)), 6),
             "components": best_core,
             "delta_vs_baseline": deltas,
+            "added_filters": {
+                group: [[float(F), float(Q), float(G)] for F, Q, G in bands]
+                for group, bands in best_row.get("groups", {}).items()
+                if bands
+            },
             "left_alone": best_row.get("left_alone", ""),
             "position_tonal_db": best_components.get("spatial_position_tonal_db", {}),
             "spatial_hold_pass": best_components.get("spatial_hold_pass", True),
