@@ -52,3 +52,13 @@ The on-disk package is written to `dist\AudioFischerOptimizer`. It contains:
 
 The two-executable design is intentional. Windows PowerShell waits for the worker
 binary but does not open a console for the desktop interface.
+
+Install for the current Windows user without administrator access:
+
+```powershell
+.\install_gui.ps1
+```
+
+This copies the built package to `%LOCALAPPDATA%\AudioFischerOptimizer` and
+creates `AudioFischer Optimizer.lnk` on the desktop. Remove it with
+`uninstall_gui.ps1`.

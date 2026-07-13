@@ -14,6 +14,9 @@ For a packaged release, open `AudioFischerOptimizer.exe`. From source:
 .\start_gui.ps1
 ```
 
+After building, `install_gui.ps1` installs the app for the current Windows user
+and creates a desktop shortcut; it does not require administrator access.
+
 The app accepts dragged measurement folders and AFPX files, runs the authoritative
 measurement gates before starting, controls CPU and optimizer RAM use, preserves
 checkpoints, safely stops/resumes runs, and loads verified candidates from
