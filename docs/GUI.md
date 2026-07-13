@@ -22,6 +22,10 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 Alternative guided/CMA/random search methods remain developer CLI options for
 benchmarking. They are intentionally hidden from the normal GUI.
 
+The GUI assumes each folder is one fresh measurement session captured without
+changing playback or input level. Advanced level-calibration files remain
+available through the CLI only.
+
 Runs are stored under `Documents\AudioFischer Optimizer Runs` by default. Each
 contains `gui_job.json`, worker checkpoints, logs, merged results, verification
 JSON, and `assistant_summary.json`. Open Existing Run resumes an incomplete run

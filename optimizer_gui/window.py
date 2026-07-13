@@ -124,7 +124,10 @@ class OptimizerWindow(QMainWindow):
         layout.setContentsMargins(18, 20, 18, 18)
         layout.setSpacing(14)
 
-        intro = QLabel("First stage: use magnitude or RTA measurements to optimize PEQ. Phase, delay and APF writes are disabled in this stage.")
+        intro = QLabel(
+            "First stage: use fresh magnitude or RTA measurements captured at one consistent level "
+            "to optimize PEQ. Phase, delay and APF writes are disabled in this stage."
+        )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -133,13 +136,11 @@ class OptimizerWindow(QMainWindow):
         data_row, self.data_edit = self._path_row("folder", self._browse_data)
         base_row, self.baseline_edit = self._path_row("file", self._browse_baseline)
         target_row, self.target_edit = self._path_row("file", self._browse_target)
-        calibration_row, self.calibration_edit = self._path_row("file", self._browse_calibration)
         self.data_edit.pathDropped.connect(self._data_dropped)
         self.baseline_edit.pathDropped.connect(self._baseline_dropped)
         form.addRow("Measurements", data_row)
         form.addRow("Baseline AFPX", base_row)
         form.addRow("Target curve", target_row)
-        form.addRow("Level calibration", calibration_row)
         layout.addLayout(form)
 
         actions = QHBoxLayout()
@@ -178,13 +179,11 @@ class OptimizerWindow(QMainWindow):
         data_row, self.phase_data_edit = self._path_row("folder", self._browse_phase_data)
         base_row, self.phase_baseline_edit = self._path_row("file", self._browse_phase_baseline)
         target_row, self.phase_target_edit = self._path_row("file", self._browse_phase_target)
-        calibration_row, self.phase_calibration_edit = self._path_row("file", self._browse_phase_calibration)
         self.phase_data_edit.pathDropped.connect(self._phase_data_dropped)
         self.phase_baseline_edit.pathDropped.connect(self._phase_baseline_dropped)
         form.addRow("Fresh sweep folder", data_row)
         form.addRow("PEQ result AFPX", base_row)
         form.addRow("Target curve", target_row)
-        form.addRow("Level calibration", calibration_row)
         layout.addLayout(form)
 
         action_line = QHBoxLayout()
@@ -439,11 +438,6 @@ class OptimizerWindow(QMainWindow):
         if path:
             self.target_edit.setText(path)
 
-    def _browse_calibration(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select level calibration", "", "JSON files (*.json)")
-        if path:
-            self.calibration_edit.setText(path)
-
     def _browse_phase_data(self):
         path = QFileDialog.getExistingDirectory(self, "Select fresh sweep folder")
         if path:
@@ -458,11 +452,6 @@ class OptimizerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select target curve", "", "Text files (*.txt);;All files (*)")
         if path:
             self.phase_target_edit.setText(path)
-
-    def _browse_phase_calibration(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select level calibration", "", "JSON files (*.json)")
-        if path:
-            self.phase_calibration_edit.setText(path)
 
     def _phase_data_dropped(self, _value: str):
         return
@@ -487,12 +476,10 @@ class OptimizerWindow(QMainWindow):
             data_root = self.phase_data_edit.text().strip()
             baseline = self.phase_baseline_edit.text().strip()
             target = self.phase_target_edit.text().strip()
-            calibration = self.phase_calibration_edit.text().strip()
         else:
             data_root = self.data_edit.text().strip()
             baseline = self.baseline_edit.text().strip()
             target = self.target_edit.text().strip()
-            calibration = self.calibration_edit.text().strip()
         return RunConfig(
             data_root=data_root, baseline=baseline, target=target,
             run_root=str(run_root or timestamped_run_root()), mode=mode,
@@ -503,7 +490,7 @@ class OptimizerWindow(QMainWindow):
             voicing_variants=("audition" if self.voicing_check.isChecked() else "off") if mode == "peq" else "off",
             sub_blend=("recommend" if self.sub_blend_check.isChecked() else "off") if mode == "peq" else "off",
             headroom_db=(self.headroom_spin.value() if self.sub_blend_check.isChecked() else None) if mode == "peq" else None,
-            level_calibration=calibration,
+            level_calibration="",
         )
 
     def validate_inputs(self):

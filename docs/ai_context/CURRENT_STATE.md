@@ -50,6 +50,8 @@ record.
   benchmarking. Its PEQ/RTA stage disables phase writes; its Sweeps/Phase stage
   uses one baseline-only candidate so existing PEQ remains byte-identical while
   gated polarity/delay/APF changes are considered.
+- The GUI assumes one fresh, consistently leveled measurement session and does
+  not expose level-calibration JSON. Explicit calibration remains CLI-only.
 - Packaged builds contain a windowed GUI plus a console worker companion so
   PowerShell can wait for the bundled runtime without displaying a GUI console.
 
