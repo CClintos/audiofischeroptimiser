@@ -19,6 +19,9 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
    then the normal merge and AFPX verification path runs.
 8. Review and export the verified candidate files from Results.
 
+If PEQ is already dialled in, users may start directly at **Sweeps / Phase**
+with the current tune and fresh phase-valid sweeps; a PEQ/RTA run is not required.
+
 Loading Results automatically creates `SQ_Tuning_Report.pdf` beside the merged
 candidate files. The report summarizes the objective components, exact supported
 changes, confidence warnings, deliberately untouched regions, and re-measure

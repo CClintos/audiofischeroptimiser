@@ -9,9 +9,19 @@ from optimizer_gui.backend import (
     RunConfig, candidate_files, collect_progress, powershell_command, validate_config,
 )
 from optimizer_gui.reporting import build_report_html
+from optimizer_gui.window import OptimizerWindow
 
 
 class GuiJobTests(unittest.TestCase):
+    def test_start_button_boolean_is_not_treated_as_resume_path(self) -> None:
+        calls = []
+
+        class DummyWindow:
+            start_run = lambda self, *args: calls.append(args)
+
+        OptimizerWindow._start_clicked(DummyWindow(), False)
+        self.assertEqual(calls, [()])
+
     def test_job_round_trip_and_worker_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = RunConfig("data", "base.afpx", "target.txt", tmp, cpu_percent=100)

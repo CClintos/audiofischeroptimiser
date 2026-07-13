@@ -56,6 +56,8 @@ record.
   receive mode-specific evidence, change, restraint, and verification sections.
 - The GUI About tab documents the two-stage workflow, named objective, phase
   ladder, guardrails, and deliberate non-changes.
+- Users with an already-dialled PEQ tune can enter Sweeps/Phase directly. The
+  phase run is a short one-worker baseline diagnostic, not a timed PEQ search.
 - Packaged builds contain a windowed GUI plus a console worker companion so
   PowerShell can wait for the bundled runtime without displaying a GUI console.
 

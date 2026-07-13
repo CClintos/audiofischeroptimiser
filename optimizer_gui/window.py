@@ -171,8 +171,9 @@ class OptimizerWindow(QMainWindow):
         layout.setSpacing(14)
 
         intro = QLabel(
-            "Second stage: load the PEQ result into the DSP, take fresh phase-valid sweeps, "
-            "then use that PEQ result as the baseline here. Existing PEQ is preserved."
+            "Use this stage directly if the current tune's PEQ is already dialled in. Otherwise, "
+            "load the PEQ result into the DSP first, take fresh phase-valid sweeps, and use that "
+            "tune as the baseline here. Existing PEQ is preserved."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -185,7 +186,7 @@ class OptimizerWindow(QMainWindow):
         self.phase_data_edit.pathDropped.connect(self._phase_data_dropped)
         self.phase_baseline_edit.pathDropped.connect(self._phase_baseline_dropped)
         form.addRow("Fresh sweep folder", data_row)
-        form.addRow("PEQ result AFPX", base_row)
+        form.addRow("Current / PEQ tune AFPX", base_row)
         form.addRow("Target curve", target_row)
         layout.addLayout(form)
 
@@ -238,9 +239,18 @@ class OptimizerWindow(QMainWindow):
         self.cpu_slider.setValue(60)
         self.cpu_label = QLabel("60%")
         self.cpu_slider.valueChanged.connect(lambda value: self.cpu_label.setText(f"{value}%"))
-        cpu_box = QHBoxLayout()
+        self.cpu_control = QWidget()
+        cpu_box = QHBoxLayout(self.cpu_control)
+        cpu_box.setContentsMargins(0, 0, 0, 0)
         cpu_box.addWidget(self.cpu_slider, 1)
         cpu_box.addWidget(self.cpu_label)
+
+        self.phase_run_value = QLabel("Automatic diagnostic - usually under 1 minute")
+        self.phase_run_value.setObjectName("metricValue")
+        self.phase_run_value.hide()
+        self.phase_cpu_value = QLabel("1 bounded worker")
+        self.phase_cpu_value.setObjectName("metricValue")
+        self.phase_cpu_value.hide()
 
         self.ram_slider = QSlider(Qt.Horizontal)
         self.ram_slider.setRange(20, 70)
@@ -257,8 +267,10 @@ class OptimizerWindow(QMainWindow):
         grid.addWidget(QLabel("Run length"), 0, 0)
         grid.addWidget(self.preset_combo, 0, 1)
         grid.addWidget(self.seconds_spin, 0, 2)
+        grid.addWidget(self.phase_run_value, 0, 1, 1, 2)
         grid.addWidget(QLabel("CPU target"), 1, 0)
-        grid.addLayout(cpu_box, 1, 1, 1, 2)
+        grid.addWidget(self.cpu_control, 1, 1, 1, 2)
+        grid.addWidget(self.phase_cpu_value, 1, 1, 1, 2)
         grid.addWidget(QLabel("Optimizer RAM limit"), 2, 0)
         grid.addLayout(ram_box, 2, 1, 1, 2)
         grid.addWidget(QLabel("Workflow"), 3, 0)
@@ -290,7 +302,7 @@ class OptimizerWindow(QMainWindow):
         self.start_button = QPushButton("Start Optimizer")
         self.start_button.setObjectName("primary")
         self.start_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.start_button.clicked.connect(self.start_run)
+        self.start_button.clicked.connect(self._start_clicked)
         self.start_button.setEnabled(False)
         self.cancel_button = QPushButton("Stop Safely")
         self.cancel_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
@@ -591,6 +603,11 @@ class OptimizerWindow(QMainWindow):
             self.preset_combo.setEnabled(not phase_mode)
             self.seconds_spin.setEnabled(not phase_mode)
             self.cpu_slider.setEnabled(not phase_mode)
+            self.preset_combo.setVisible(not phase_mode)
+            self.seconds_spin.setVisible(not phase_mode)
+            self.cpu_control.setVisible(not phase_mode)
+            self.phase_run_value.setVisible(phase_mode)
+            self.phase_cpu_value.setVisible(phase_mode)
             self.voicing_check.setEnabled(not phase_mode)
             self.sub_blend_check.setEnabled(not phase_mode)
             self.headroom_spin.setEnabled(not phase_mode and self.sub_blend_check.isChecked())
@@ -602,7 +619,12 @@ class OptimizerWindow(QMainWindow):
         if seconds:
             self.seconds_spin.setValue(seconds)
 
+    def _start_clicked(self, _checked: bool = False):
+        self.start_run()
+
     def start_run(self, resume_root: Path | None = None):
+        if isinstance(resume_root, bool):
+            resume_root = None
         if self.process and self.process.state() != QProcess.NotRunning:
             return
         if resume_root is None:
