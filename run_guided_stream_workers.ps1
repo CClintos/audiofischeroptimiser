@@ -162,8 +162,14 @@ foreach ($item in $started) {
     }
     $stderr = Join-Path $Root ($item.Worker + ".stderr.log")
     $stdout = Join-Path $Root ($item.Worker + ".stdout.log")
-    $errText = if (Test-Path -LiteralPath $stderr) { (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue).Trim() } else { "" }
-    $outText = if (Test-Path -LiteralPath $stdout) { (Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue).Trim() } else { "" }
+    $errText = if (Test-Path -LiteralPath $stderr) {
+        $rawError = Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $rawError) { "" } else { ([string]$rawError).Trim() }
+    } else { "" }
+    $outText = if (Test-Path -LiteralPath $stdout) {
+        $rawOutput = Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $rawOutput) { "" } else { ([string]$rawOutput).Trim() }
+    } else { "" }
     $failed += [pscustomobject]@{
         Worker = $item.Worker
         Id = $item.Id
