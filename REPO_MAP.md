@@ -11,6 +11,10 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 - `run_guided_stream_workers.ps1`: preferred launcher for long local stream runs.
 - `merge_guided_stream_results.ps1`: preferred merge wrapper after worker runs complete.
 - `run_optimizer.ps1`: one-command bounded run, merge, verification, and compact result path.
+- `audiofischer_gui.py`: native Windows GUI entry point and packaged worker dispatch.
+- `optimizer_gui/backend.py`: durable run config, preflight, progress, memory and results contract.
+- `optimizer_gui/window.py`: PySide6 inputs, run controls, progress and candidate export.
+- `AudioFischerOptimizer.spec`: reproducible on-disk Windows package.
 
 ## Core Logic Areas
 
@@ -43,6 +47,7 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 ## Common Task Routing
 
 - "Run the optimiser locally": start with `scripts/make_measurement_manifest.py`, then `run_guided_stream_workers.ps1` or `_optimizer.py` depending on run size.
+- "Use without Codex": launch the GUI; source setup is `setup_gui.ps1`, packaged entry is `AudioFischerOptimizer.exe`.
 - "Review a completed run": start with `scripts/summarise_optimizer_run.py`, then inspect the report or candidate files only if needed.
 - "Check whether a candidate write is safe": use `scripts/verify_written_tune.py`.
 - "Change scoring": inspect `_optimizer.py`, `_tunefit.py`, and `objective_module/afpx_objective.py`, then run `_benchmark.py`.

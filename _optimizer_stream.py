@@ -287,7 +287,7 @@ def guided_groups(rng: np.random.Generator, profile: str, pools) -> GroupBands:
 
 def deterministic_beam_combinations(pools, component_score, beam_width: int = 24,
                                     pool_limit: int = 6, deadline: float | None = None,
-                                    order_seed: int | None = None):
+                                    order_seed: int | None = None, stop_requested=None):
     """Build exact guided-band combinations while retaining best partial tunes."""
     empty = {group: [] for group in opt.GROUPS}
     beam = [(float(component_score(empty)["objective"]), opt.bands_signature(empty), empty)]
@@ -309,6 +309,9 @@ def deterministic_beam_combinations(pools, component_score, beam_width: int = 24
         expanded = []
         for _value, _signature, partial in beam:
             for option in options:
+                if stop_requested is not None and stop_requested():
+                    candidates_now = beam + expanded
+                    return sorted(candidates_now, key=lambda item: (item[0], item[1]))[:max(1, int(beam_width))], evaluations
                 if deadline is not None and time.monotonic() >= deadline:
                     candidates_now = beam + expanded
                     unique_now = {}
@@ -896,12 +899,15 @@ def main():
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
+    parser.add_argument("--stop-file", type=Path, default=None,
+                        help="Optional shared stop-request file for graceful GUI cancellation.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from OUT\\stream_state.json if it exists.")
     parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact",
                         help="Console detail only; full reports are always written to disk.")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    stop_requested = lambda: bool(args.stop_file and args.stop_file.exists())
 
     args.measurement_session, level_calibration = opt.prepare_measurement_session(
         args.baseline, args.target, args.level_calibration
@@ -993,6 +999,7 @@ def main():
             pool_limit=args.beam_pool_limit,
             deadline=(start + args.seconds) if args.seconds else None,
             order_seed=beam_order_seed,
+            stop_requested=stop_requested,
         )
         for item in beam_entries:
             components = component_score(item[2])
@@ -1010,6 +1017,8 @@ def main():
         }
     while True:
         now = time.monotonic()
+        if stop_requested():
+            break
         if args.seconds and now - start >= args.seconds:
             break
         if args.max_trials and trials >= args.max_trials:
@@ -1069,12 +1078,16 @@ def main():
     archive, archive_scores = prune_archive(archive, archive_scores, args.archive_size)
     save_state(state_path, best, rng, args._completed_trials, args._elapsed_seconds, args, archive=archive)
     final_entries = combine_unique_entries(best, archive)
-    refined_entries, args.refinement = refine_entries(
-        final_entries,
-        component_score,
-        top=args.refine_top,
-        passes=args.refine_passes,
-    )
+    if stop_requested():
+        refined_entries = []
+        args.refinement = {"enabled": False, "reason": "graceful stop requested"}
+    else:
+        refined_entries, args.refinement = refine_entries(
+            final_entries,
+            component_score,
+            top=args.refine_top,
+            passes=args.refine_passes,
+        )
     final_entries = combine_unique_entries(final_entries, refined_entries)
     save_state(
         state_path,

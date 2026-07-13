@@ -28,6 +28,8 @@ when the current-state checkpoint does not answer it.
 - `_optimizer_stream.py`: constant-memory worker optimiser.
 - `_merge_stream_results.py`: merges worker archives.
 - `run_optimizer.ps1`: preferred one-command local runner.
+- `audiofischer_gui.py`: packaged/source GUI entry point and worker dispatcher.
+- `optimizer_gui/`: native GUI, durable jobs, preflight, progress and results.
 - `_benchmark.py`: benchmark/check script.
 - `objective_module/afpx_objective.py`: scalar objective.
 - `objective_module/_tunefit.py`: DSP/math helpers.

@@ -52,6 +52,8 @@ $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Ta
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
 $phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
+$stopFilePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "stop_requested"
+Remove-Item -LiteralPath $stopFilePath -Force -ErrorAction SilentlyContinue
 
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -115,6 +117,7 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--phase-writes", "$PhaseWrites",
         "--phase-cache", $phaseCachePath,
         "--checkpoint-seconds", "60",
+        "--stop-file", $stopFilePath,
         "--seed", "$seed",
         "--resume",
         "--out", $out

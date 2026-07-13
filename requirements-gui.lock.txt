@@ -1,0 +1,7 @@
+numpy==2.3.5
+scipy==1.18.0
+optuna==4.9.0
+cma==4.4.4
+PySide6==6.11.1
+psutil==7.2.2
+PyInstaller==6.21.0

@@ -2,7 +2,25 @@
 
 This repo is a local AFPX tuning tool for Helix / Audiotec Fischer DSP systems.
 
-For AI-assisted work, start with `AGENTS.md` and `docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md` to open only the relevant files.
+The normal user interface is the Windows desktop app. AI-assisted and command-line
+work remain available, but neither Codex nor Claude is required to run a tune.
+
+## Windows App
+
+For a packaged release, open `AudioFischerOptimizer.exe`. From source:
+
+```powershell
+.\setup_gui.ps1
+.\start_gui.ps1
+```
+
+The app accepts dragged measurement folders and AFPX files, runs the authoritative
+measurement gates before starting, controls CPU and optimizer RAM use, preserves
+checkpoints, safely stops/resumes runs, and loads verified candidates from
+`assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
+
+For AI-assisted development, start with `AGENTS.md` and
+`docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md`.
 
 It takes your baseline `.afpx` tune plus REW measurement exports, tries many possible PEQ combinations, scores them, and gives you back ranked AFPX tune candidates to test.
 
@@ -45,7 +63,7 @@ reference metadata. Mixed or missing level provenance requires an explicit JSON
 map of role/file names to dB corrections; phase writes require one shared timing
 reference plus measured-together validation.
 
-It is meant to be used through Claude or Codex:
+It can also be used through Claude or Codex:
 
 1. Drag in your REW measurement text exports.
 2. Drag in your baseline `.afpx` tune.

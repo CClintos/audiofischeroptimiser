@@ -85,7 +85,7 @@ compute benefit, and token savings. Detailed evidence is in
 ## P3: Maintainability And Distribution
 
 14. De-duplicate the two `_tunefit.py` copies after objective fixtures exist.
-15. Add dependency locking and one supported installation/launcher path.
+15. Add dependency locking and one supported installation/launcher path. - complete for the GUI release
 16. Expand AFPX/PCT6 fixtures and property-style byte-preservation tests.
 17. Add PCT6 optimization writes only after per-device channel maps are proven.
 
@@ -94,6 +94,6 @@ compute benefit, and token savings. Detailed evidence is in
 - Special +4 to +5 dB broad-LF boost exception.
 - More APF sophistication before P0/P1.
 - Blind crossover writes.
-- Live analyzer/GUI as the next milestone.
+- Live measurement capture/analyzer; the offline optimizer GUI is now implemented.
 - ML, cloud/API search, or a larger model for numerical optimization.
 - Adding optimizer libraries before beam search is benchmarked.

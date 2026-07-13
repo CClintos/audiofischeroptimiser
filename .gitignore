@@ -1,4 +1,6 @@
 .venv/
+build/
+dist/
 __pycache__/
 *.pyc
 *.afpx
@@ -26,6 +28,8 @@ Sub.txt
 SUB.txt
 
 Optimizer_*/
+!optimizer_gui/
+!optimizer_gui/*.py
 *_Smoke/
 *_FailSmoke/
 *_MergeSmoke/
