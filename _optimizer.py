@@ -2409,7 +2409,7 @@ def write_report(
         "run_config": {
             key: (str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key))
             for key in (
-                "seed", "profile", "sampler", "proposal", "jobs", "seconds",
+                "seed", "profile", "sampler", "proposal", "mode", "jobs", "seconds",
                 "max_trials", "filter_cost_scale", "worst_weight",
                 "validation_threshold", "gate_ms", "sample_rate", "phase_writes", "impulse_root",
                 "level_calibration",
@@ -2547,6 +2547,7 @@ def write_report(
             for role, row in family_picks.items()
         },
         "search": {
+            "mode": getattr(args, "mode", "peq"),
             "proposal": getattr(args, "proposal", ""),
             "beam": getattr(args, "beam", None),
             "refinement": getattr(args, "refinement", None),

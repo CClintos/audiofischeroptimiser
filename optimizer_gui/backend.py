@@ -48,6 +48,7 @@ class RunConfig:
     seconds: int = 1200
     cpu_percent: int = 60
     ram_percent: int = 50
+    mode: str = "peq"
     proposal: str = "beam"
     phase_writes: str = "auto"
     voicing_variants: str = "off"
@@ -62,6 +63,8 @@ class RunConfig:
 
     @property
     def workers(self) -> int:
+        if self.mode == "phase":
+            return 1
         logical = os.cpu_count() or 4
         return max(1, min(12, round(logical * self.cpu_percent / 100.0)))
 
@@ -118,6 +121,8 @@ def validate_config(config: RunConfig) -> dict[str, Any]:
             preflight = {"valid": False, "errors": [completed.stderr.strip() or "Optimizer preflight did not return a result"]}
         if not preflight.get("valid"):
             blocking.extend(str(item) for item in preflight.get("errors", []))
+        if config.mode == "phase" and not dict(preflight.get("measurement_session", {})).get("phase_valid"):
+            blocking.append("Phase stage requires phase-valid sweeps with one shared timing reference")
     return {
         "valid": not blocking,
         "errors": blocking,
@@ -138,6 +143,7 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
         "-Root", config.run_root,
         "-Seconds", str(config.seconds),
         "-Workers", str(config.workers),
+        "-Mode", config.mode,
         "-Proposal", config.proposal,
         "-PhaseWrites", config.phase_writes,
         "-VoicingVariants", config.voicing_variants,

@@ -46,6 +46,10 @@ record.
 - A native PySide6 Windows GUI now provides drag/drop inputs, authoritative
   preflight, bounded CPU/RAM controls, durable stop/resume, compact progress,
   results review, and AFPX export without Codex.
+- The GUI exposes Beam only. Developer CLI methods remain available for
+  benchmarking. Its PEQ/RTA stage disables phase writes; its Sweeps/Phase stage
+  uses one baseline-only candidate so existing PEQ remains byte-identical while
+  gated polarity/delay/APF changes are considered.
 - Packaged builds contain a windowed GUI plus a console worker companion so
   PowerShell can wait for the bundled runtime without displaying a GUI console.
 
@@ -130,7 +134,7 @@ record.
 
 ## Verified State
 
-- Thirty-two regression tests pass, including objective invariants, session gates,
+- Thirty-three regression tests pass, including objective invariants, session gates,
   crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity
@@ -151,6 +155,8 @@ record.
   phase-valid combined candidates use the canonical phase-session schema.
 - The packaged Windows worker completed a real AFPX/measurement run, merged 20
   candidates, emitted `assistant_summary.json`, and passed family verification.
+- A phase-only smoke produced one candidate with one gated delay action; external
+  verification reported zero added/removed PEQ filters and no crossover changes.
 - Historical test results are not assumptions about future measurements.
 
 ## Deliberate Non-Changes

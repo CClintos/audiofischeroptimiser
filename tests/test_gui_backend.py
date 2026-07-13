@@ -19,6 +19,12 @@ class GuiJobTests(unittest.TestCase):
             self.assertEqual(loaded.data_root, "data")
             self.assertLessEqual(loaded.workers, 12)
 
+    def test_phase_mode_is_single_worker_and_explicit(self) -> None:
+        config = RunConfig("data", "base.afpx", "target.txt", "run", mode="phase", cpu_percent=80)
+        self.assertEqual(config.workers, 1)
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+        self.assertEqual(args[args.index("-Mode") + 1], "phase")
+
     def test_command_passes_explicit_user_choices(self) -> None:
         config = RunConfig(
             "C:\\Measurements", "C:\\Measurements\\base.afpx", "C:\\target.txt",

@@ -6,6 +6,8 @@ param(
     [int]$Top = 20,
     [int]$Keep = 80,
     [int]$ArchiveSize = 6000,
+    [ValidateSet("peq", "phase")]
+    [string]$Mode = "peq",
     [ValidateSet("guided", "random", "mixed", "cmaes", "beam")]
     [string]$Proposal = "guided",
     [double]$CmaSigma = 0.18,
@@ -104,6 +106,7 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--keep", "$Keep",
         "--archive-size", "$ArchiveSize",
         "--proposal", "$Proposal",
+        "--mode", "$Mode",
         "--profile", "explore",
         "--filter-cost-scale", "0.1",
         "--min-total-bands", "0",

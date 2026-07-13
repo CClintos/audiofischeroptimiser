@@ -710,6 +710,7 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
         "seed": int(args.seed),
         "profile": args.profile,
         "proposal": args.proposal,
+        "mode": getattr(args, "mode", "peq"),
         "filter_cost_scale": float(args.filter_cost_scale),
         "worst_weight": float(args.worst_weight),
         "min_total_bands": int(args.min_total_bands),
@@ -871,6 +872,8 @@ def main():
     parser.add_argument("--seed", type=int, default=20260703)
     parser.add_argument("--profile", choices=("safe", "explore"), default="explore")
     parser.add_argument("--proposal", choices=("guided", "random", "mixed", "cmaes", "beam"), default="guided")
+    parser.add_argument("--mode", choices=("peq", "phase"), default="peq",
+                        help="Phase mode preserves PEQ and evaluates only the gated phase plan.")
     parser.add_argument("--filter-cost-scale", type=float, default=0.1)
     parser.add_argument("--worst-weight", type=float, default=0.10)
     parser.add_argument("--min-total-bands", type=int, default=0)
@@ -934,7 +937,11 @@ def main():
     args.crossover_rows = phase_session["diagnostics"]
     args.phase_diagnostic_cache = phase_session["cache"]
     args.phase_plan = phase_session["writes"]
-    guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
+    if args.mode == "phase":
+        args.proposal = "beam"
+        guided_pools = {group: [] for group in opt.GROUPS}
+    else:
+        guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
     cma_proposal = None
     if args.proposal == "cmaes":
         cma_proposal = CmaProposal(

@@ -5,6 +5,8 @@ param(
     [string]$Root = "",
     [int]$Seconds = 1200,
     [int]$Workers = 0,
+    [ValidateSet("peq", "phase")]
+    [string]$Mode = "peq",
     [ValidateSet("guided", "beam", "cmaes", "mixed", "random")]
     [string]$Proposal = "beam",
     [double]$ValidationThreshold = 2.5,
@@ -38,8 +40,14 @@ if ($Workers -le 0) {
     $logical = [Environment]::ProcessorCount
     $Workers = [Math]::Max(1, [Math]::Min(12, [Math]::Floor($logical * 0.60)))
 }
+if ($Mode -eq "phase") {
+    $Workers = 1
+    $Proposal = "beam"
+    $PhaseWrites = "auto"
+}
 $launch = @{
     Root = $Root; Workers = $Workers; Seconds = $Seconds; Proposal = $Proposal
+    Mode = $Mode
     DataRoot = $data; Baseline = $baselinePath; Target = $targetPath
     ValidationThreshold = $ValidationThreshold; PhaseWrites = $PhaseWrites
     ArchiveSize = 1200; Keep = 80; Top = 20; PythonExe = $python
@@ -74,6 +82,7 @@ $mergeArgs = @(
     "--validation-threshold", "$ValidationThreshold", "--phase-writes", $PhaseWrites
 )
 $mergeArgs += @("--sub-blend", $SubBlend, "--voicing-variants", $VoicingVariants)
+$mergeArgs += @("--mode", $Mode)
 if ($HeadroomDb -ge 0) { $mergeArgs += @("--headroom-db", "$HeadroomDb") }
 if (Test-Path -LiteralPath $phaseCache) { $mergeArgs += @("--phase-cache", $phaseCache) }
 if ($ImpulseRoot) { $mergeArgs += @("--impulse-root", $ImpulseRoot) }

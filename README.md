@@ -17,10 +17,12 @@ For a packaged release, open `AudioFischerOptimizer.exe`. From source:
 After building, `install_gui.ps1` installs the app for the current Windows user
 and creates a desktop shortcut; it does not require administrator access.
 
-The app accepts dragged measurement folders and AFPX files, runs the authoritative
-measurement gates before starting, controls CPU and optimizer RAM use, preserves
-checkpoints, safely stops/resumes runs, and loads verified candidates from
-`assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
+The app has separate **PEQ / RTA** and **Sweeps / Phase** stages. PEQ always uses
+the recommended Beam search with phase writes disabled. The second stage uses
+fresh sweeps and the PEQ result as its baseline, preserves PEQ, and writes only
+gated phase/delay/APF changes. It also controls CPU and optimizer RAM use,
+preserves checkpoints, safely stops/resumes runs, and loads verified candidates
+from `assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
 
 For AI-assisted development, start with `AGENTS.md` and
 `docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md`.

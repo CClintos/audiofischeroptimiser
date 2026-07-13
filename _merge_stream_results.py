@@ -58,6 +58,7 @@ def main():
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
+    parser.add_argument("--mode", choices=("peq", "phase"), default="peq")
     parser.add_argument("--sub-blend", choices=("off", "recommend"), default="off")
     parser.add_argument("--headroom-db", type=float, default=None)
     parser.add_argument("--voicing-variants", choices=("off", "audition"), default="off")
@@ -193,6 +194,7 @@ def main():
         phase_peq_rejections=phase_peq_rejections[:20],
         phase_cache=args.phase_cache,
         phase_diagnostic_cache=phase_diagnostic_cache,
+        mode=args.mode,
         phase_session=phase_session,
         freqs=freqs,
         rich_traces=rich_traces,

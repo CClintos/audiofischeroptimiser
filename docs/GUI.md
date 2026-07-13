@@ -5,16 +5,22 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 
 ## Workflow
 
-1. Drop in a measurement folder and baseline AFPX.
-2. Validate the measurement session. Missing files, tonal provenance, phase
+1. In **PEQ / RTA**, drop in magnitude/RTA measurements and the current AFPX.
+2. Validate and run. The app always uses deterministic Beam search and disables
+   phase writes for this stage.
+3. Load the selected PEQ result into the DSP and take fresh phase-valid sweeps.
+4. In **Sweeps / Phase**, select the fresh sweep folder and use the PEQ result as
+   the baseline. This stage preserves PEQ and searches no new PEQ filters.
+5. Validate the measurement session. Missing files, tonal provenance, phase
    references, and solo/together gates are checked before workers start.
-3. Choose run time, CPU target, optimizer RAM limit, search method, and explicit
-   phase/voicing/sub-blend options.
-4. Start the run. Candidate count, objective, worker count, elapsed time, and
+6. Start the run. Candidate count, objective, worker count, elapsed time, and
    process-tree memory are shown live.
-5. Stop safely when needed. Workers save their current state and partial results,
+7. Stop safely when needed. Workers save their current state and partial results,
    then the normal merge and AFPX verification path runs.
-6. Review and export the verified candidate files from Results.
+8. Review and export the verified candidate files from Results.
+
+Alternative guided/CMA/random search methods remain developer CLI options for
+benchmarking. They are intentionally hidden from the normal GUI.
 
 Runs are stored under `Documents\AudioFischer Optimizer Runs` by default. Each
 contains `gui_job.json`, worker checkpoints, logs, merged results, verification

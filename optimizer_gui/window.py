@@ -59,6 +59,7 @@ class OptimizerWindow(QMainWindow):
         self.started_monotonic = 0.0
         self.memory_limit_hits = 0
         self.stop_requested_reason = ""
+        self.active_mode = "peq"
         self._build_ui()
         self._apply_style()
         self.poll_timer = QTimer(self)
@@ -66,6 +67,9 @@ class OptimizerWindow(QMainWindow):
         self.data_edit.textChanged.connect(self._input_changed)
         self.baseline_edit.textChanged.connect(self._input_changed)
         self.target_edit.textChanged.connect(self._input_changed)
+        self.phase_data_edit.textChanged.connect(self._input_changed)
+        self.phase_baseline_edit.textChanged.connect(self._input_changed)
+        self.phase_target_edit.textChanged.connect(self._input_changed)
         self._set_defaults()
 
     def _build_ui(self):
@@ -90,9 +94,10 @@ class OptimizerWindow(QMainWindow):
         outer.addLayout(header)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_inputs_tab(), "1  Inputs")
-        self.tabs.addTab(self._build_run_tab(), "2  Run")
-        self.tabs.addTab(self._build_results_tab(), "3  Results")
+        self.tabs.addTab(self._build_inputs_tab(), "1  PEQ / RTA")
+        self.tabs.addTab(self._build_phase_tab(), "2  Sweeps / Phase")
+        self.tabs.addTab(self._build_run_tab(), "3  Run")
+        self.tabs.addTab(self._build_results_tab(), "4  Results")
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
 
@@ -119,7 +124,7 @@ class OptimizerWindow(QMainWindow):
         layout.setContentsMargins(18, 20, 18, 18)
         layout.setSpacing(14)
 
-        intro = QLabel("Drop in the measurement folder and baseline tune. The app checks the session before any optimizer workers start.")
+        intro = QLabel("First stage: use magnitude or RTA measurements to optimize PEQ. Phase, delay and APF writes are disabled in this stage.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -138,7 +143,7 @@ class OptimizerWindow(QMainWindow):
         layout.addLayout(form)
 
         actions = QHBoxLayout()
-        self.validate_button = QPushButton("Validate Measurements")
+        self.validate_button = QPushButton("Validate RTA / Prepare PEQ")
         self.validate_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
         self.validate_button.clicked.connect(self.validate_inputs)
         self.resume_button = QPushButton("Open Existing Run")
@@ -153,6 +158,58 @@ class OptimizerWindow(QMainWindow):
         self.validation_text.setReadOnly(True)
         self.validation_text.setPlaceholderText("Validation results appear here.")
         layout.addWidget(self.validation_text, 1)
+        return page
+
+    def _build_phase_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 20, 18, 18)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "Second stage: load the PEQ result into the DSP, take fresh phase-valid sweeps, "
+            "then use that PEQ result as the baseline here. Existing PEQ is preserved."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        data_row, self.phase_data_edit = self._path_row("folder", self._browse_phase_data)
+        base_row, self.phase_baseline_edit = self._path_row("file", self._browse_phase_baseline)
+        target_row, self.phase_target_edit = self._path_row("file", self._browse_phase_target)
+        calibration_row, self.phase_calibration_edit = self._path_row("file", self._browse_phase_calibration)
+        self.phase_data_edit.pathDropped.connect(self._phase_data_dropped)
+        self.phase_baseline_edit.pathDropped.connect(self._phase_baseline_dropped)
+        form.addRow("Fresh sweep folder", data_row)
+        form.addRow("PEQ result AFPX", base_row)
+        form.addRow("Target curve", target_row)
+        form.addRow("Level calibration", calibration_row)
+        layout.addLayout(form)
+
+        action_line = QHBoxLayout()
+        self.validate_phase_button = QPushButton("Validate Sweeps / Prepare Phase")
+        self.validate_phase_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.validate_phase_button.clicked.connect(self.validate_phase_inputs)
+        self.phase_use_peq_button = QPushButton("Use Latest PEQ Result")
+        self.phase_use_peq_button.clicked.connect(self._use_latest_peq_result)
+        action_line.addWidget(self.validate_phase_button)
+        action_line.addWidget(self.phase_use_peq_button)
+        action_line.addStretch()
+        layout.addLayout(action_line)
+
+        note = QLabel(
+            "Only gated polarity, relative delay and residual APF changes can be written. "
+            "No new PEQ filters are searched in this stage."
+        )
+        note.setObjectName("warning")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.phase_validation_text = QTextEdit()
+        self.phase_validation_text.setReadOnly(True)
+        self.phase_validation_text.setPlaceholderText("Sweep and phase validation results appear here.")
+        layout.addWidget(self.phase_validation_text, 1)
         return page
 
     def _build_run_tab(self):
@@ -192,11 +249,8 @@ class OptimizerWindow(QMainWindow):
         ram_box.addWidget(self.ram_slider, 1)
         ram_box.addWidget(self.ram_label)
 
-        self.proposal_combo = QComboBox()
-        self.proposal_combo.addItems(["beam", "guided", "cmaes", "mixed", "random"])
-        self.phase_combo = QComboBox()
-        self.phase_combo.addItem("Automatic when evidence passes", "auto")
-        self.phase_combo.addItem("PEQ only", "off")
+        self.workflow_value = QLabel("PEQ / RTA - Beam search")
+        self.workflow_value.setObjectName("metricValue")
 
         grid.addWidget(QLabel("Run length"), 0, 0)
         grid.addWidget(self.preset_combo, 0, 1)
@@ -205,10 +259,8 @@ class OptimizerWindow(QMainWindow):
         grid.addLayout(cpu_box, 1, 1, 1, 2)
         grid.addWidget(QLabel("Optimizer RAM limit"), 2, 0)
         grid.addLayout(ram_box, 2, 1, 1, 2)
-        grid.addWidget(QLabel("Search method"), 3, 0)
-        grid.addWidget(self.proposal_combo, 3, 1, 1, 2)
-        grid.addWidget(QLabel("Phase / delay / APF"), 4, 0)
-        grid.addWidget(self.phase_combo, 4, 1, 1, 2)
+        grid.addWidget(QLabel("Workflow"), 3, 0)
+        grid.addWidget(self.workflow_value, 3, 1, 1, 2)
         layout.addLayout(grid)
 
         option_line = QHBoxLayout()
@@ -227,7 +279,7 @@ class OptimizerWindow(QMainWindow):
         option_line.addStretch()
         layout.addLayout(option_line)
 
-        self.phase_warning = QLabel("Phase writes remain gated by measurement-session and solo/together validation. The baseline is never overwritten.")
+        self.phase_warning = QLabel("PEQ stage uses Beam and cannot write phase changes. Phase stage preserves PEQ and writes only changes that pass the evidence gates. The baseline is never overwritten.")
         self.phase_warning.setObjectName("warning")
         self.phase_warning.setWordWrap(True)
         layout.addWidget(self.phase_warning)
@@ -352,6 +404,7 @@ class OptimizerWindow(QMainWindow):
         target = default_target()
         if target.exists():
             self.target_edit.setText(str(target))
+            self.phase_target_edit.setText(str(target))
 
     def _input_changed(self):
         self.start_button.setEnabled(False)
@@ -391,21 +444,76 @@ class OptimizerWindow(QMainWindow):
         if path:
             self.calibration_edit.setText(path)
 
-    def _current_config(self, run_root: Path | None = None) -> RunConfig:
+    def _browse_phase_data(self):
+        path = QFileDialog.getExistingDirectory(self, "Select fresh sweep folder")
+        if path:
+            self.phase_data_edit.setText(path)
+
+    def _browse_phase_baseline(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select PEQ result tune", "", "AFPX tune (*.afpx)")
+        if path:
+            self.phase_baseline_edit.setText(path)
+
+    def _browse_phase_target(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select target curve", "", "Text files (*.txt);;All files (*)")
+        if path:
+            self.phase_target_edit.setText(path)
+
+    def _browse_phase_calibration(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select level calibration", "", "JSON files (*.json)")
+        if path:
+            self.phase_calibration_edit.setText(path)
+
+    def _phase_data_dropped(self, _value: str):
+        return
+
+    def _phase_baseline_dropped(self, _value: str):
+        return
+
+    def _use_latest_peq_result(self):
+        if not self.summary_path or not self.summary:
+            QMessageBox.information(self, "No PEQ result loaded", "Complete or open a PEQ run first.")
+            return
+        best = self.summary.get("best") or {}
+        candidate = self.summary_path.parent / str(best.get("file", ""))
+        if not candidate.exists():
+            QMessageBox.warning(self, "PEQ result missing", "The best PEQ candidate file could not be found.")
+            return
+        self.phase_baseline_edit.setText(str(candidate))
+
+    def _current_config(self, run_root: Path | None = None, mode: str | None = None) -> RunConfig:
+        mode = mode or self.active_mode
+        if mode == "phase":
+            data_root = self.phase_data_edit.text().strip()
+            baseline = self.phase_baseline_edit.text().strip()
+            target = self.phase_target_edit.text().strip()
+            calibration = self.phase_calibration_edit.text().strip()
+        else:
+            data_root = self.data_edit.text().strip()
+            baseline = self.baseline_edit.text().strip()
+            target = self.target_edit.text().strip()
+            calibration = self.calibration_edit.text().strip()
         return RunConfig(
-            data_root=self.data_edit.text().strip(), baseline=self.baseline_edit.text().strip(),
-            target=self.target_edit.text().strip(), run_root=str(run_root or timestamped_run_root()),
-            seconds=self.seconds_spin.value(), cpu_percent=self.cpu_slider.value(),
-            ram_percent=self.ram_slider.value(), proposal=self.proposal_combo.currentText(),
-            phase_writes=self.phase_combo.currentData(),
-            voicing_variants="audition" if self.voicing_check.isChecked() else "off",
-            sub_blend="recommend" if self.sub_blend_check.isChecked() else "off",
-            headroom_db=self.headroom_spin.value() if self.sub_blend_check.isChecked() else None,
-            level_calibration=self.calibration_edit.text().strip(),
+            data_root=data_root, baseline=baseline, target=target,
+            run_root=str(run_root or timestamped_run_root()), mode=mode,
+            seconds=30 if mode == "phase" else self.seconds_spin.value(),
+            cpu_percent=20 if mode == "phase" else self.cpu_slider.value(),
+            ram_percent=self.ram_slider.value(), proposal="beam",
+            phase_writes="auto" if mode == "phase" else "off",
+            voicing_variants=("audition" if self.voicing_check.isChecked() else "off") if mode == "peq" else "off",
+            sub_blend=("recommend" if self.sub_blend_check.isChecked() else "off") if mode == "peq" else "off",
+            headroom_db=(self.headroom_spin.value() if self.sub_blend_check.isChecked() else None) if mode == "peq" else None,
+            level_calibration=calibration,
         )
 
     def validate_inputs(self):
-        config = self._current_config()
+        return self._validate_workflow("peq", self.validation_text)
+
+    def validate_phase_inputs(self):
+        return self._validate_workflow("phase", self.phase_validation_text)
+
+    def _validate_workflow(self, mode: str, output: QTextEdit):
+        config = self._current_config(mode=mode)
         result = validate_config(config)
         if result["compact"]:
             compact = result["compact"]
@@ -437,13 +545,25 @@ class OptimizerWindow(QMainWindow):
                 lines.append("\nBlocked:\n- " + "\n- ".join(result["errors"]))
             if result["valid"]:
                 lines.append("\nPASS: the optimizer can start with this input set.")
-            self.validation_text.setPlainText("\n".join(lines))
+            output.setPlainText("\n".join(lines))
         else:
-            self.validation_text.setPlainText("\n".join(result["errors"]))
+            output.setPlainText("\n".join(result["errors"]))
         self.start_button.setEnabled(bool(result["valid"]))
         self.run_badge.setText("VALIDATED" if result["valid"] else "INPUT BLOCKED")
         if result["valid"]:
-            self.tabs.setCurrentIndex(1)
+            self.active_mode = mode
+            phase_mode = mode == "phase"
+            self.workflow_value.setText(
+                "Sweeps / Phase - preserve PEQ, gated phase writes only"
+                if phase_mode else "PEQ / RTA - Beam search, no phase writes"
+            )
+            self.preset_combo.setEnabled(not phase_mode)
+            self.seconds_spin.setEnabled(not phase_mode)
+            self.cpu_slider.setEnabled(not phase_mode)
+            self.voicing_check.setEnabled(not phase_mode)
+            self.sub_blend_check.setEnabled(not phase_mode)
+            self.headroom_spin.setEnabled(not phase_mode and self.sub_blend_check.isChecked())
+            self.tabs.setCurrentIndex(3)
         return result["valid"]
 
     def _preset_changed(self):
@@ -454,8 +574,10 @@ class OptimizerWindow(QMainWindow):
     def start_run(self, resume_root: Path | None = None):
         if self.process and self.process.state() != QProcess.NotRunning:
             return
-        if resume_root is None and not self.validate_inputs():
-            return
+        if resume_root is None:
+            validator = self.validate_phase_inputs if self.active_mode == "phase" else self.validate_inputs
+            if not validator():
+                return
         if resume_root is not None:
             config = RunConfig.load(resume_root)
             config.status = "resuming"
@@ -492,7 +614,7 @@ class OptimizerWindow(QMainWindow):
         )
         self.progress.setValue(0)
         self.poll_timer.start(1000)
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(2)
 
     def _read_process_output(self):
         if not self.process:
@@ -583,13 +705,19 @@ class OptimizerWindow(QMainWindow):
             QMessageBox.warning(self, "Not a GUI run", str(exc))
             return
         self.config = config
-        self.data_edit.setText(config.data_root)
-        self.baseline_edit.setText(config.baseline)
-        self.target_edit.setText(config.target)
+        self.active_mode = getattr(config, "mode", "peq")
+        if self.active_mode == "phase":
+            self.phase_data_edit.setText(config.data_root)
+            self.phase_baseline_edit.setText(config.baseline)
+            self.phase_target_edit.setText(config.target)
+        else:
+            self.data_edit.setText(config.data_root)
+            self.baseline_edit.setText(config.baseline)
+            self.target_edit.setText(config.target)
         summary = locate_summary(root)
         if summary:
             self.load_results(summary)
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(3)
         else:
             reply = QMessageBox.question(self, "Resume run", "No merged result exists. Resume this run from its checkpoints?")
             if reply == QMessageBox.Yes:
