@@ -14,6 +14,8 @@ Read `docs/AUDIO_DSP_RULES.md` if the task directly changes scoring, phase/delay
 - Judge sub/front alignment around the crossover region, not full-band.
 - Phase/delay/APF changes need before/after summation validation.
 - Any AFPX/PCT6 writer change needs decode-write-decode verification.
+- Use one baseline-derived target anchor for every candidate; never re-anchor before/after curves.
+- Recompute pair/system sums after unilateral EQ and judge absolute L/R mismatch, not separately normalized side shapes.
 
 ## Scope Rules
 

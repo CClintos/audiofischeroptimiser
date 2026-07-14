@@ -70,6 +70,52 @@ class ObjectiveInvariantTests(unittest.TestCase):
         self.assertNotEqual(parts["tonal_masked"], parts["sum_tonal_anchor_db"])
         self.assertNotEqual(parts["presence_error_db"], parts["peak_penalty_db"])
 
+    def test_fixed_anchor_audit_dilutes_unilateral_eq_in_combined_pair(self) -> None:
+        freqs = np.array([300.0, 424.3, 600.0, 848.5, 1200.0])
+        left = np.full_like(freqs, 60.0)
+        right = np.full_like(freqs, 60.0)
+        inactive = np.full_like(freqs, -100.0)
+        low_together = optimizer.power_sum_db([left, right])
+        high_together = optimizer.power_sum_db([inactive, inactive])
+        system = optimizer.power_sum_db([low_together, high_together, inactive])
+        traces = {
+            "FL High": inactive,
+            "FR High": inactive,
+            "FL Low": left,
+            "FR Low": right,
+            "Sub": inactive,
+            "Tweeters Together": high_together,
+            "Mid Bass Together": low_together,
+            "System Sum": system,
+        }
+        baseline = [[] for _ in range(8)]
+        candidate = [[] for _ in range(8)]
+        candidate[2] = [(600.0, 1.0, -6.0)]
+        with patch.multiple(
+            objective,
+            _F=freqs,
+            _T=traces,
+            _TGT=system + 2.0,
+            _V5=baseline,
+            _BASE_CASCADES=[np.zeros_like(freqs) for _ in range(8)],
+            _TOTAL_DB=system,
+            _SMOOTHER=None,
+        ):
+            audit = objective.response_audit(candidate)
+
+        center = next(row for row in audit["checkpoints"] if row["frequency_hz"] == 600.0)
+        expected_pair_delta = 10.0 * np.log10(10.0 ** (-6.0 / 10.0) + 1.0) - 10.0 * np.log10(2.0)
+        self.assertAlmostEqual(center["pair_delta_db"]["low"], expected_pair_delta, places=3)
+        self.assertNotAlmostEqual(center["pair_delta_db"]["low"], -6.0, places=1)
+        self.assertAlmostEqual(
+            center["candidate_error_db"] - center["baseline_error_db"],
+            center["raw_system_delta_db"],
+            places=3,
+        )
+        self.assertEqual(
+            audit["anchor_policy"], "target_anchored_once_from_baseline_system_sum"
+        )
+
 
 class MeasurementSessionGateTests(unittest.TestCase):
     def test_tonal_mode_rejects_uncalibrated_level_change(self) -> None:

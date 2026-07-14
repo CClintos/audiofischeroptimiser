@@ -737,6 +737,12 @@ def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return band_sets
 
 
+def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
+    if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "response_audit"):
+        return {}
+    return dict(AFPX_OBJECTIVE.response_audit(groups_to_band_sets(groups)))
+
+
 def suggest_group_bands(trial: optuna.Trial, group: str) -> List[Band]:
     cfg = GROUPS[group]
     out: List[Band] = []
@@ -2319,6 +2325,16 @@ def write_report(
     family_picks = select_family_rows(family_source)
     crossover_rows = crossover_rows or []
     phase_plan = phase_plan or []
+    best_row = rows[0] if rows else None
+    fixed_anchor_audit = (
+        fixed_anchor_response_audit(best_row.get("groups", {})) if best_row else {}
+    )
+    comparison_integrity = {
+        "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
+        "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
+        "combined_response": "recomputed_from_solo_power_sums_plus_measured_residual",
+        "review_rule": "judge raw deltas and absolute L/R mismatch; never re-anchor candidates independently",
+    }
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -2425,6 +2441,8 @@ def write_report(
         "beam": getattr(args, "beam", None),
         "trials": getattr(args, "trials", ""),
         "candidate_count": len(rows),
+        "comparison_integrity": comparison_integrity,
+        "best_fixed_anchor_response": fixed_anchor_audit,
         "top_candidates": summary_rows,
         "family_picks": {
             role: {
@@ -2465,7 +2483,6 @@ def write_report(
         "spatial_fragility_penalty", "spatial_position_count",
     )
     base_components = dict(baseline_score.get("components", {}))
-    best_row = rows[0] if rows else None
     best_components = dict(best_row.get("components", {})) if best_row else {}
     def compact_components(values):
         return {
@@ -2524,6 +2541,7 @@ def write_report(
         "schema": "audiofischer-assistant-summary-v1",
         "run_folder": str(out_dir),
         "candidate_count": len(rows),
+        "comparison_integrity": comparison_integrity,
         "inputs": compact_inputs,
         "gates": {
             "measurement_session": compact_session,
@@ -2537,6 +2555,7 @@ def write_report(
             "objective": round(float(best_row.get("objective", 0.0)), 6),
             "components": best_core,
             "delta_vs_baseline": deltas,
+            "fixed_anchor_response": fixed_anchor_audit,
             "added_filters": {
                 group: [[float(F), float(Q), float(G)] for F, Q, G in bands]
                 for group, bands in best_row.get("groups", {}).items()
@@ -2604,6 +2623,7 @@ def write_report(
         f"- Trials: `{args.trials}`",
         "- Mode: PEQ from magnitude data; optional polarity/delay/APF from gated crossover evidence; no crossover/shelf/level writes",
         "- Objective: imported `afpx_objective.score_bands(band_sets)['objective']`; lower is better. Search-space guardrails restrict what candidates are generated, but no extra target-matching term is added.",
+        "- Comparison integrity: the target is anchored once from the baseline; candidate deltas are never re-anchored, and unilateral EQ is recombined through the measured pair/system model.",
         "",
         "## Validation Gate",
         "",

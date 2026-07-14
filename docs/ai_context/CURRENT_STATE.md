@@ -40,6 +40,10 @@ record.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
 - `assistant_summary.json` contains only the decision core; `optimizer_summary.json`
   retains full settings, validation, phase confidence, components, and refinement.
+- Candidate summaries include an anchor-free response audit at each changed filter
+  centre and half-octave shoulders. It exposes baseline error, candidate error,
+  raw system delta, pair dilution, and absolute L/R balance change from the same
+  objective prediction, preventing independent re-anchoring during review.
 - Optional P2 choices are explicit: sub blend is recommendation-only and needs
   calibrated level plus declared headroom; voicing files are generated only on
   request and never identify a preferred tonal balance.
@@ -142,7 +146,7 @@ record.
 
 ## Verified State
 
-- Thirty-three regression tests pass, including objective invariants, session gates,
+- Thirty-seven regression tests pass, including objective invariants, session gates,
   crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity

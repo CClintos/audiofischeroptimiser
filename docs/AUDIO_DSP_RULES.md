@@ -32,6 +32,11 @@ These rules are meant to make Codex faster and more accurate, not more timid.
 - Start from `assistant_summary.json` before reading the full summary, reports, CSVs, or candidate files.
 - Explain audible trade-offs, not just score deltas.
 - Distinguish the safest candidate from the strongest correction candidate.
+- Anchor the target once from the measured baseline and reuse it for every candidate. Never re-anchor before/after responses independently.
+- Verify candidate minus baseline as a raw delta. At every checkpoint, `candidate error - baseline error` must equal that raw delta.
+- Recombine unilateral EQ through the solo pair and system model; a 3 dB filter on one side is not a 3 dB change to the combined response.
+- Judge imaging from absolute L/R mismatch. Do not normalize each side to its own local trend and call the result balance.
+- Treat tiny modeled differences as ties unless a named tonal, peak, spatial, or L/R component shows a meaningful advantage.
 
 ## Measurement Rules
 

@@ -547,6 +547,75 @@ def _predict(band_sets):
     return pr
 
 
+def _changed_band_centers(band_sets):
+    """Return frequencies whose hardware-rounded PEQ differs from baseline."""
+    centers = set()
+    count = max(len(_V5), len(band_sets))
+    for index in range(count):
+        baseline = Counter(_band_key(b) for b in (_V5[index] if index < len(_V5) else []))
+        candidate = Counter(_band_key(b) for b in (band_sets[index] if index < len(band_sets) else []))
+        for key in baseline.keys() | candidate.keys():
+            if baseline[key] != candidate[key]:
+                centers.add(float(key[0]))
+    return sorted(centers)
+
+
+def response_audit(band_sets):
+    """Report raw candidate deltas against one baseline-derived target anchor."""
+    _init()
+    baseline = _predict(_V5)
+    candidate = _predict(band_sets)
+    system_delta = candidate['System Sum'] - baseline['System Sum']
+    inband = (_F >= INBAND[0]) & (_F <= INBAND[1])
+
+    checkpoints = set()
+    for center in _changed_band_centers(band_sets):
+        for ratio in (2 ** -0.5, 1.0, 2 ** 0.5):
+            frequency = center * ratio
+            if _F[0] <= frequency <= _F[-1]:
+                checkpoints.add(round(float(frequency), 1))
+
+    rows = []
+    baseline_error = baseline['System Sum'] - _TGT
+    candidate_error = candidate['System Sum'] - _TGT
+    for frequency in sorted(checkpoints):
+        pair_delta = {}
+        balance_delta = {}
+        for name, (left, right, together, _band_range, _balance) in PAIR_SPECS.items():
+            pair_change = _interp_at(candidate[together] - baseline[together], frequency)
+            lr_change = _interp_at(
+                (candidate[left] - candidate[right]) - (baseline[left] - baseline[right]),
+                frequency,
+            )
+            if abs(pair_change) >= 0.0005:
+                pair_delta[name] = round(pair_change, 4)
+            if abs(lr_change) >= 0.0005:
+                balance_delta[name] = round(lr_change, 4)
+        rows.append({
+            'frequency_hz': frequency,
+            'baseline_error_db': round(_interp_at(baseline_error, frequency), 4),
+            'candidate_error_db': round(_interp_at(candidate_error, frequency), 4),
+            'raw_system_delta_db': round(_interp_at(system_delta, frequency), 4),
+            'pair_delta_db': pair_delta,
+            'lr_balance_delta_db': balance_delta,
+        })
+
+    return {
+        'anchor_policy': 'target_anchored_once_from_baseline_system_sum',
+        'delta_policy': 'candidate_prediction_minus_baseline_prediction_no_reanchoring',
+        'pair_model': 'measured_plus_power_sum_residual',
+        'system_delta_rms_db': round(
+            float(np.sqrt(np.mean(system_delta[inband] ** 2))) if np.any(inband) else 0.0,
+            4,
+        ),
+        'system_delta_max_abs_db': round(
+            float(np.max(np.abs(system_delta[inband]))) if np.any(inband) else 0.0,
+            4,
+        ),
+        'checkpoints': rows,
+    }
+
+
 def _weighted_quantile(values, weights, quantile):
     values = np.asarray(values, dtype=float)
     weights = np.asarray(weights, dtype=float)
