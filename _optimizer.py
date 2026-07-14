@@ -743,6 +743,12 @@ def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
     return dict(AFPX_OBJECTIVE.response_audit(groups_to_band_sets(groups)))
 
 
+def report_plot_data(groups: GroupBands) -> Dict[str, object]:
+    if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "report_plot_data"):
+        return {}
+    return dict(AFPX_OBJECTIVE.report_plot_data(groups_to_band_sets(groups)))
+
+
 def suggest_group_bands(trial: optuna.Trial, group: str) -> List[Band]:
     cfg = GROUPS[group]
     out: List[Band] = []
@@ -2329,6 +2335,7 @@ def write_report(
     fixed_anchor_audit = (
         fixed_anchor_response_audit(best_row.get("groups", {})) if best_row else {}
     )
+    response_plot = report_plot_data(best_row.get("groups", {})) if best_row else {}
     comparison_integrity = {
         "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
         "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
@@ -2443,6 +2450,7 @@ def write_report(
         "candidate_count": len(rows),
         "comparison_integrity": comparison_integrity,
         "best_fixed_anchor_response": fixed_anchor_audit,
+        "response_plot": response_plot,
         "top_candidates": summary_rows,
         "family_picks": {
             role: {

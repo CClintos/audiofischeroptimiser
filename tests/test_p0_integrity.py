@@ -102,6 +102,7 @@ class ObjectiveInvariantTests(unittest.TestCase):
             _SMOOTHER=None,
         ):
             audit = objective.response_audit(candidate)
+            plot = objective.report_plot_data(candidate, max_points=5)
 
         center = next(row for row in audit["checkpoints"] if row["frequency_hz"] == 600.0)
         expected_pair_delta = 10.0 * np.log10(10.0 ** (-6.0 / 10.0) + 1.0) - 10.0 * np.log10(2.0)
@@ -114,6 +115,12 @@ class ObjectiveInvariantTests(unittest.TestCase):
         )
         self.assertEqual(
             audit["anchor_policy"], "target_anchored_once_from_baseline_system_sum"
+        )
+        center_index = plot["frequency_hz"].index(600.0)
+        self.assertAlmostEqual(
+            plot["candidate_error_db"][center_index] - plot["baseline_error_db"][center_index],
+            plot["raw_system_delta_db"][center_index],
+            places=3,
         )
 
 

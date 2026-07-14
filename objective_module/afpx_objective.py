@@ -616,6 +616,44 @@ def response_audit(band_sets):
     }
 
 
+def report_plot_data(band_sets, max_points=220):
+    """Return compact, fixed-anchor curves for local visual reports."""
+    _init()
+    baseline = _predict(_V5)
+    candidate = _predict(band_sets)
+    eligible = np.flatnonzero((_F >= INBAND[0]) & (_F <= INBAND[1]))
+    count = min(max(int(max_points), 32), len(eligible))
+    selected = np.unique(np.linspace(0, len(eligible) - 1, count).round().astype(int))
+    indices = eligible[selected]
+
+    def values(curve):
+        return [round(float(value), 3) for value in np.asarray(curve)[indices]]
+
+    payload = {
+        'schema': 'audiofischer-response-plot-v1',
+        'anchor_policy': 'target_anchored_once_from_baseline_system_sum',
+        'frequency_hz': values(_F),
+        'baseline_error_db': values(baseline['System Sum'] - _TGT),
+        'candidate_error_db': values(candidate['System Sum'] - _TGT),
+        'raw_system_delta_db': values(candidate['System Sum'] - baseline['System Sum']),
+        'pairs': {},
+    }
+    for name, (left, right, _together, _band_range, balance_band) in PAIR_SPECS.items():
+        selected = indices[(_F[indices] >= balance_band[0]) & (_F[indices] <= balance_band[1])]
+        payload['pairs'][name] = {
+            'frequency_hz': [round(float(value), 3) for value in _F[selected]],
+            'baseline_lr_db': [
+                round(float(value), 3)
+                for value in (baseline[left] - baseline[right])[selected]
+            ],
+            'candidate_lr_db': [
+                round(float(value), 3)
+                for value in (candidate[left] - candidate[right])[selected]
+            ],
+        }
+    return payload
+
+
 def _weighted_quantile(values, weights, quantile):
     values = np.asarray(values, dtype=float)
     weights = np.asarray(weights, dtype=float)

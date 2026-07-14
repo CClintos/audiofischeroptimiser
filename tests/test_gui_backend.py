@@ -97,6 +97,37 @@ class GuiJobTests(unittest.TestCase):
         self.assertIn("delay -12 samples", report)
         self.assertIn("destructive, not EQ-able", report)
 
+    def test_peq_report_leads_with_plain_language_and_fixed_anchor_graph(self) -> None:
+        summary = {
+            "search": {"mode": "peq"},
+            "candidate_count": 2,
+            "baseline": {
+                "objective": 7.0, "tonal_error_db": 2.5, "presence_error_db": 2.4,
+                "peak_penalty_db": 2.0, "balance_penalty_db": 2.8,
+            },
+            "best": {
+                "file": "candidate.afpx", "objective": 5.0,
+                "components": {
+                    "objective": 5.0, "tonal_error_db": 1.8, "presence_error_db": 1.9,
+                    "peak_penalty_db": 1.3, "balance_penalty_db": 2.4,
+                },
+                "fixed_anchor_response": {
+                    "checkpoints": [
+                        {"frequency_hz": 100.0, "baseline_error_db": 3.0,
+                         "candidate_error_db": 1.0, "raw_system_delta_db": -2.0},
+                        {"frequency_hz": 1000.0, "baseline_error_db": -2.0,
+                         "candidate_error_db": -1.0, "raw_system_delta_db": 1.0},
+                    ]
+                },
+            },
+            "gates": {"measurement_session": {"phase_valid": False}},
+        }
+        report = build_report_html(summary, {}, Path("assistant_summary.json"))
+        self.assertIn("What You Should Notice", report)
+        self.assertIn("target is anchored once", report)
+        self.assertIn("data:image/png;base64,", report)
+        self.assertIn("Tonal accuracy", report)
+
 
 if __name__ == "__main__":
     unittest.main()

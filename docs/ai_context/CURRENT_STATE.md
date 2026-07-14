@@ -56,8 +56,11 @@ record.
   gated polarity/delay/APF changes are considered.
 - The GUI assumes one fresh, consistently leveled measurement session and does
   not expose level-calibration JSON. Explicit calibration remains CLI-only.
-- Results automatically emit a local `SQ_Tuning_Report.pdf`; PEQ and phase runs
-  receive mode-specific evidence, change, restraint, and verification sections.
+- Results automatically emit a local `SQ_Tuning_Report.pdf`. PEQ reports lead
+  with a plain-language verdict, fixed-anchor before/after response graph,
+  component-improvement bars, L/R plots, expected audible effects, filter changes,
+  restraint and verification. Phase reports use crossover confidence and ladder
+  before/after visuals instead of presenting phase as ordinary tonal EQ.
 - The GUI About tab documents the two-stage workflow, named objective, phase
   ladder, guardrails, and deliberate non-changes.
 - Users with an already-dialled PEQ tune can enter Sweeps/Phase directly. The
