@@ -233,10 +233,21 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         checks = [
             "Load the chosen PEQ candidate and keep a copy of the baseline for A/B listening.",
             "Confirm tonal balance at normal listening level with familiar material.",
-            "Take fresh phase-valid sweeps only after the PEQ candidate is loaded.",
-            "Use the Sweeps / Phase stage for supported delay, polarity and APF work.",
+            "A confirmation MMM is optional; use it only if listening exposes a concern.",
+            "Take fresh phase-valid sweeps later only if delay, polarity or APF work is needed.",
         ]
     check_html = "".join(f"<li>{html.escape(item)}</li>" for item in checks)
+    verification_title = "Load And Re-measure Checklist" if phase_mode else "Load And Check"
+    status_text = (
+        "Candidate generated from the supplied measurements. In-car re-measurement and listening remain required."
+        if phase_mode else
+        "Candidate generated from the supplied MMM measurements. A/B listening is recommended; a confirmation MMM is optional."
+    )
+    confidence_text = (
+        "Destructive interference, crossover skirts, driver roll-off and unsupported one-position corrections are not rewarded as ordinary EQ targets. The loaded-and-re-measured result is the final proof."
+        if phase_mode else
+        "Destructive interference, crossover skirts, driver roll-off and unsupported one-position corrections are not rewarded as ordinary EQ targets. Use A/B listening as the decision step; a confirmation MMM is optional."
+    )
 
     method = (
         "The phase stage checks only crossover bands. It validates whether solo traces predict the measured "
@@ -270,17 +281,17 @@ ul,ol {{ margin:4px 0 9px 20px; }} li {{ margin-bottom:4px; }} .page {{ page-bre
 <p><b>Lower is better.</b> Component values are decision metrics, not claims that the cabin response has been acoustically verified after loading.</p>
 {_component_table(baseline, best_components)}
 <h2>Measurement validation</h2>{validation_html}
-<h2>Confidence boundaries</h2><p>Destructive interference, crossover skirts, driver roll-off and unsupported one-position corrections are not rewarded as ordinary EQ targets. The loaded-and-re-measured result is the final proof.</p></div>
+<h2>Confidence boundaries</h2><p>{html.escape(confidence_text)}</p></div>
 
 <div class="page"><div class="eyebrow">2 - {'PHASE / TIMING' if phase_mode else 'PEQ CHANGES'}</div><h1>{'Written Phase Changes' if phase_mode else 'Added Parametric EQ'}</h1>
 {actions_html if phase_mode else filters_html}
 <h2>{'Crossover confidence' if phase_mode else 'Candidate families'}</h2>{crossover_html if phase_mode else family_html}
 <h2>Deliberately left alone</h2><p>{html.escape(str(best.get('left_alone') or 'No additional left-alone note was reported.'))}</p></div>
 
-<div class="page"><div class="eyebrow">3 - VERIFICATION</div><h1>Load And Re-measure Checklist</h1>
+<div class="page"><div class="eyebrow">3 - VERIFICATION</div><h1>{html.escape(verification_title)}</h1>
 <ol>{check_html}</ol>
 <h2>Integrity statement</h2><p>The optimizer never overwrites the baseline. PEQ mode does not write delay, polarity, APF or crossover changes. Phase mode preserves PEQ and writes only evidence-gated phase actions. Crossovers remain unchanged.</p>
-<div class="callout"><b>Status:</b> Candidate generated from the supplied measurements. In-car re-measurement and listening remain required.</div>
+<div class="callout"><b>Status:</b> {html.escape(status_text)}</div>
 <div class="footer">Source: {html.escape(source)} | Candidate: {html.escape(candidate)} | Report generated locally</div></div>
 </body></html>"""
 

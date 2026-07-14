@@ -2218,7 +2218,9 @@ def family_pick_scores(rows: List[Dict[str, object]], role: str) -> List[Tuple[f
             + 0.12 * nm("filter_count")
         )
 
-    return sorted((score_of(row), row) for row in rows)
+    scored = [(score_of(row), index, row) for index, row in enumerate(rows)]
+    scored.sort(key=lambda item: (item[0], row_metric(item[2], "objective"), item[1]))
+    return [(score, row) for score, _index, row in scored]
 
 
 def select_family_rows(rows: List[Dict[str, object]]) -> Dict[str, Dict[str, object]]:

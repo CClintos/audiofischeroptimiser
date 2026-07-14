@@ -106,6 +106,24 @@ class BeamSearchTests(unittest.TestCase):
         self.assertLess(a[0][0], 0.0)
 
 
+class FamilySelectionTests(unittest.TestCase):
+    def test_equal_family_scores_do_not_compare_row_dicts(self) -> None:
+        metrics = {
+            "objective": 1.0,
+            "pareto_tonal_db": 1.0,
+            "tonal_error_db": 1.0,
+            "sum_tonal_anchor_db": 1.0,
+            "presence_error_db": 1.0,
+            "peak_penalty_db": 1.0,
+            "balance_penalty_db": 1.0,
+            "positive_gain_penalty_db": 1.0,
+            "filter_count": 1.0,
+        }
+        rows = [{"components": dict(metrics), "name": name} for name in ("a", "b")]
+        ranked = optimizer.family_pick_scores(rows, "balanced")
+        self.assertEqual([row["name"] for _score, row in ranked], ["a", "b"])
+
+
 class PositionDiscoveryTests(unittest.TestCase):
     def test_discovers_prefixed_or_subfolder_position_measurement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
