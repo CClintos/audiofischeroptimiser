@@ -103,10 +103,12 @@ Use to inspect added filters and risk flags without reading the full file diff m
 ## Verify Written Tune Safety
 
 ```powershell
-py -3 .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_Run\_merged_top\family_balanced.afpx" --allow-delay --allow-apf --allow-polarity
+py -3 .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_Run\_merged_top\family_balanced.afpx" --allow-output-trim --allow-delay --allow-apf --allow-polarity
 ```
 
-Use after AFPX writes. If the task should be PEQ-only, omit all three allowances.
+Use after AFPX writes. `--allow-output-trim` still accepts only uniform,
+attenuation-only, 0.25 dB-stepped changes on every front output. Omit the phase
+allowances for a PEQ-only task.
 
 ## PCT6 Round-Trip Safety
 

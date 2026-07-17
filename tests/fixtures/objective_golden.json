@@ -1,9 +1,10 @@
 {
-  "objective": 5.079027263706685,
+  "objective": 5.48226179678685,
   "tonal_masked": 1.863505646695942,
   "sum_tonal_anchor_db": 2.2611120483155656,
   "presence_error_db": 1.5070126999611906,
   "peak_penalty_db": 1.3785287659044416,
+  "target_shape_error_db": 1.1520986659433292,
   "balance_penalty_db": 2.14222791753456,
   "low_balance_rms_db": 2.761491684710877,
   "tweeter_balance_rms_db": 1.3193796917796123

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import struct
 import zlib
@@ -62,6 +63,15 @@ def output_polarities(xml: str) -> list[str | None]:
     return values
 
 
+def output_volumes_db(xml: str) -> list[float]:
+    values = []
+    for block in re.findall(r"<OC\b.*?</OC>", xml, re.S):
+        tag = re.search(r"<Vol\b[^>]*/?>", block)
+        linear = float(attrs(tag.group()).get("L", "1")) if tag else 1.0
+        values.append(20.0 * math.log10(max(linear, 1e-30)))
+    return values
+
+
 def filter_key(tag: str) -> tuple[tuple[str, str | None], ...]:
     a = attrs(tag)
     return tuple((k, a.get(k)) for k in ("T", "F", "Q", "G", "dF", "I", "FilBy"))
@@ -93,7 +103,7 @@ def multiset_delta(old_items: list[object], new_items: list[object]) -> tuple[li
 
 
 def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
-           allow_polarity: bool = False) -> dict[str, object]:
+           allow_polarity: bool = False, allow_output_trim: bool = False) -> dict[str, object]:
     old_xml = decode_afpx(baseline)
     new_xml = decode_afpx(candidate)
     old_all = filter_keys(old_xml)
@@ -110,6 +120,22 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
     )
     delay_attributes_changed = delay_other_attributes(old_xml) != delay_other_attributes(new_xml)
     output_attributes_changed = output_attributes(old_xml, {"CINV"}) != output_attributes(new_xml, {"CINV"})
+    old_volumes = output_volumes_db(old_xml)
+    new_volumes = output_volumes_db(new_xml)
+    output_volume_changes = {
+        index: new_volumes[index] - old_volumes[index]
+        for index in range(min(len(old_volumes), len(new_volumes)))
+        if abs(new_volumes[index] - old_volumes[index]) >= 0.001
+    }
+    trim_values = list(output_volume_changes.values())
+    output_trim_valid = not output_volume_changes
+    if output_volume_changes and allow_output_trim:
+        changed = set(output_volume_changes)
+        valid_front_set = changed in ({0, 1, 2, 3}, {0, 1, 2, 3, 4, 5})
+        uniform = max(trim_values) - min(trim_values) <= 0.02
+        attenuation_only = all(-6.001 <= value <= -0.001 for value in trim_values)
+        hardware_steps = all(abs(value * 4.0 - round(value * 4.0)) <= 0.04 for value in trim_values)
+        output_trim_valid = valid_front_set and uniform and attenuation_only and hardware_steps
     crossover_changed = filter_keys(old_xml, {"15", "16", "9"}) != filter_keys(new_xml, {"15", "16", "9"})
     apf_added = any(dict(item).get("T") in ("19", "20") for item in added)
     forbidden_added = [
@@ -123,6 +149,8 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         errors.append("polarity_changed")
     if output_attributes_changed:
         errors.append("unrelated_output_attributes_changed")
+    if not output_trim_valid:
+        errors.append("unapproved_output_volume_changed")
     if delay_attributes_changed:
         errors.append("unrelated_time_alignment_attributes_changed")
     if crossover_changed:
@@ -143,6 +171,8 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         "delay_changed": delay_changed,
         "polarity_changed": polarity_changed,
         "output_attributes_changed": output_attributes_changed,
+        "output_volume_changes_db": {str(key): round(value, 4) for key, value in output_volume_changes.items()},
+        "protective_output_trim_valid": output_trim_valid,
         "time_alignment_attributes_changed": delay_attributes_changed,
         "crossover_changed": crossover_changed,
         "apf_changed": apf_added,
@@ -162,12 +192,13 @@ def main() -> None:
     parser.add_argument("--allow-delay", action="store_true")
     parser.add_argument("--allow-apf", action="store_true")
     parser.add_argument("--allow-polarity", action="store_true")
+    parser.add_argument("--allow-output-trim", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("latest_verify_written_tune.json"))
     args = parser.parse_args()
 
     payload = verify(
         args.baseline.resolve(), args.candidate.resolve(), args.allow_delay,
-        args.allow_apf, args.allow_polarity,
+        args.allow_apf, args.allow_polarity, args.allow_output_trim,
     )
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(payload, indent=2))

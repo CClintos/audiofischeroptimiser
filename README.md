@@ -42,6 +42,7 @@ Its scoring system is built to reward tunes that are more likely to sound better
 It scores candidates by:
 
 - how close the full system response is to the target, with distinct tonal and vocal/presence terms and extra cost for peaks
+- whether it reproduces the supplied target's 1.3-5 kHz contour in an anchor-independent shape check
 - how well left and right match each other, using signed bias plus weighted absolute/RMS mismatch from the solo drivers
 - whether the tune avoids boosting into destructive cancellation nulls
 - whether each filter is on a driver that is actually contributing at that frequency
@@ -54,7 +55,7 @@ The math layer also includes confidence and timing helpers for phase-valid measu
 - band-limited phase-delay estimation around crossover regions
 - gated impulse helpers that estimate how low a time window can be trusted
 
-The optimizer first proves that the solo complex responses reproduce the measured together trace. It then tests polarity and delay, and searches an APF only if a meaningful residual remains. Invalid reference locks, weak predicted improvements, ambiguous polarity, and conflicting impulse evidence block automatic writes. Written AFPX candidates are linted so only the intended PEQ, `PM` polarity, delay values, and APF slots may change.
+The optimizer first proves that the solo complex responses reproduce the measured together trace. It then tests polarity and delay, and searches an APF only if a meaningful residual remains. Invalid reference locks, weak predicted improvements, ambiguous polarity, and conflicting impulse evidence block automatic writes. Written AFPX candidates are linted so only the intended PEQ, `PM` polarity, delay values, APF slots, and declared uniform protective front attenuation may change.
 
 Optional companion impulse exports can be WAV or two-column time/amplitude text. Put them beside the measurements, or in an `impulses` folder, using the measurement stem, for example `Front L High.wav`, `Front L High Impulse.wav`, or `Front L High IR.txt`. Use `--impulse-root` / `-ImpulseRoot` when they live elsewhere. Band-limited cross-correlation supplies arrival and polarity evidence; disagreement with the complex-phase solution vetoes the write.
 
@@ -123,6 +124,7 @@ Polarity/delay/APF changes may be written only when the crossover ladder clears 
 It does not just chase a flat mono sum. Its scoring is designed to:
 
 - improve tonal accuracy, especially through the vocal band
+- reproduce deliberate target-shape changes instead of only changing bass or overall RMS
 - improve left/right balance using the solo driver traces
 - penalize boosting into destructive nulls
 - penalize unsupported asymmetric EQ
@@ -137,6 +139,11 @@ The optimizer is designed to:
 - avoid boosting into destructive nulls
 - keep PEQ conservative and phase writes independently auditable
 - prefer fewer, wider, symmetric, shallower filters unless the solo measurements justify otherwise
+
+Beam can apply a broad, low-Q `front_voicing` transfer identically to every front
+output. This preserves L/R balance and relative crossover phase. If the transfer
+raises the full front cascade peak, the writer applies only the uniform front
+attenuation needed to retain the baseline headroom; it never raises output level.
 
 Expected measurement files:
 
@@ -194,7 +201,7 @@ Useful examples:
 python .\scripts\make_measurement_manifest.py "C:\path\to\measurements"
 python .\scripts\summarise_optimizer_run.py ".\Optimizer_Run\_merged_top"
 python .\scripts\summarise_candidate_filters.py ".\Optimizer_Run\_merged_top\family_balanced.afpx" --baseline "C:\path\to\baseline.afpx"
-python .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_Run\_merged_top\family_balanced.afpx" --allow-delay --allow-apf
+python .\scripts\verify_written_tune.py "C:\path\to\baseline.afpx" ".\Optimizer_Run\_merged_top\family_balanced.afpx" --allow-output-trim --allow-delay --allow-apf
 ```
 
 ## Safety / Scope

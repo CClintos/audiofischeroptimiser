@@ -6,10 +6,26 @@ from unittest.mock import patch
 import numpy as np
 
 import _optimizer as optimizer
-from _make_v3 import afpx_roundtrip_lint
+from _make_v3 import afpx_roundtrip_lint, apply_output_trim
 
 
 class CrossoverLadderTests(unittest.TestCase):
+    def test_lint_allows_only_declared_protective_output_trim(self) -> None:
+        block = '<OC><Vol i="0" L="1" T="15"/></OC>'
+        old = '<Root>' + block * 4 + '</Root>'
+        new_blocks = [apply_output_trim(block, -1.0) for _ in range(4)]
+        new = '<Root>' + ''.join(new_blocks) + '</Root>'
+
+        rejected = afpx_roundtrip_lint(old, new, allowed_added_types=())
+        accepted = afpx_roundtrip_lint(
+            old, new, allowed_added_types=(),
+            allowed_volume_trims={index: -1.0 for index in range(4)},
+        )
+
+        self.assertFalse(rejected["pass"])
+        self.assertTrue(accepted["pass"], accepted)
+        self.assertEqual(set(accepted["output_volume_changes_db"]), {0, 1, 2, 3})
+
     def test_band_limited_impulse_finds_arrival_and_polarity(self) -> None:
         sample_rate = 48000.0
         a = np.zeros(4096)

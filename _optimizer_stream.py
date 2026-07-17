@@ -87,7 +87,12 @@ def branch_contribution(freqs, traces, group: str) -> np.ndarray:
     """
     cfg = opt.GROUPS[group]
     branch_name = cfg.get("branch", group)
-    if cfg.get("trace"):
+    if cfg.get("system_transfer"):
+        branch_power = np.zeros_like(freqs, dtype=float)
+        for pair in opt.PAIR_DEFS.values():
+            branch_power += 10 ** (traces[pair["together"]] / 10)
+        branch = 10.0 * np.log10(np.maximum(branch_power, 1e-30))
+    elif cfg.get("trace"):
         branch = traces[cfg["trace"]]
     else:
         branch = {"sub": traces["Sub"]}.get(branch_name)
@@ -113,7 +118,10 @@ def interference_masks(freqs, traces):
             pass
     for group, cfg in opt.GROUPS.items():
         branch = cfg.get("branch")
-        if branch in pair_masks:
+        if cfg.get("system_transfer"):
+            for pair_mask in pair_masks.values():
+                masks[group] |= pair_mask
+        elif branch in pair_masks:
             masks[group] |= pair_masks[branch]
     return masks
 
@@ -199,12 +207,25 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         contribution = branch_contribution(freqs, traces, group)
         active_driver = contribution >= (10 ** (-6.0 / 10.0))
         candidates = []
-        tonal_strength = np.abs(system_dev) * contribution * audible * vocal * peak_mult
+        if cfg.get("system_transfer"):
+            anchor_sel = (
+                (freqs >= 1000.0) & (freqs <= 1400.0)
+                & ~masks.get(group, np.zeros_like(freqs, dtype=bool))
+            )
+            shape_reference = float(np.median(system_dev[anchor_sel])) if np.any(anchor_sel) else 0.0
+            shape_dev = system_dev - shape_reference
+            shape_peak_mult = np.where(shape_dev > 0.0, 2.0, 0.85)
+            tonal_strength = np.abs(shape_dev) * contribution * audible * vocal * shape_peak_mult
+            tonal_gain = -0.90 * shape_dev / np.maximum(contribution, 0.55)
+            tonal_source = "target_shape"
+        else:
+            tonal_strength = np.abs(system_dev) * contribution * audible * vocal * peak_mult
+            tonal_gain = -0.65 * system_dev / np.maximum(contribution, 0.35)
+            tonal_source = "tonal"
         tonal_strength[masks.get(group, False)] = 0.0
         tonal_strength[~active_driver] = 0.0
-        tonal_gain = -0.65 * system_dev / np.maximum(contribution, 0.35)
         candidates.extend(candidate_peaks(
-            freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, "tonal", profile
+            freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, tonal_source, profile
         ))
 
         if cfg.get("pair") and cfg.get("side"):

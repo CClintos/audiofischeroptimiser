@@ -408,6 +408,7 @@ class OptimizerWindow(QMainWindow):
         <h2>How PEQ is judged</h2>
         <ul>
           <li>ERB-smoothed tonal error against the supplied target.</li>
+          <li>Anchor-independent target-contour accuracy through 1.3-5 kHz.</li>
           <li>Extra weighting through the vocal and presence region.</li>
           <li>Peaks cost more than comparable dips.</li>
           <li>L/R signed bias plus absolute and RMS mismatch from solo traces.</li>
@@ -420,7 +421,8 @@ class OptimizerWindow(QMainWindow):
         <ul>
           <li>Boosting destructive acoustic nulls or crossover cancellations with PEQ.</li>
           <li>EQ outside a driver's useful passband or at physical roll-off edges.</li>
-          <li>Changing crossover frequency, slope, shelves or output levels automatically.</li>
+          <li>Changing crossover frequency, slope, shelves or arbitrary output levels automatically.</li>
+          <li>A matched whole-front voicing boost may add uniform protective attenuation only; it never raises an output level.</li>
           <li>Claiming that a predicted tune is verified before it is loaded and re-measured.</li>
         </ul>
         <h2>Objective</h2>

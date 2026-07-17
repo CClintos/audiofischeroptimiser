@@ -41,6 +41,30 @@ def _manifest(source_volumes, timing_references=None, phase=True):
 
 
 class ObjectiveInvariantTests(unittest.TestCase):
+    def test_matched_front_voicing_gets_uniform_protective_trim(self) -> None:
+        freqs = np.geomspace(20.0, 20000.0, 512)
+        token = (len(freqs), float(freqs[0]), float(freqs[-1]), hash(freqs.tobytes()))
+        baseline = [[] for _ in range(8)]
+        candidate = [[] for _ in range(8)]
+        for index in range(4):
+            candidate[index] = [(2600.0, 1.1, 5.5)]
+        objective._cached_peaking.cache_clear()
+        with patch.multiple(
+            objective,
+            _F=freqs,
+            _GRID_TOKEN=token,
+            _V5=baseline,
+            _BASE_CASCADES=[np.zeros_like(freqs) for _ in range(8)],
+            _BASE_OUTPUT_DB=[-5.0] * 8,
+            CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+        ):
+            plan = objective.output_trim_plan(candidate)
+
+        self.assertEqual(set(plan), {0, 1, 2, 3})
+        self.assertEqual(len(set(plan.values())), 1)
+        self.assertLess(plan[0], 0.0)
+        self.assertAlmostEqual(plan[0] * 4.0, round(plan[0] * 4.0), places=10)
+
     def test_positive_deviation_has_extra_peak_cost(self) -> None:
         freqs = np.geomspace(80.0, 12000.0, 256)
         valid = np.ones_like(freqs, dtype=bool)
@@ -69,6 +93,17 @@ class ObjectiveInvariantTests(unittest.TestCase):
 
         self.assertNotEqual(parts["tonal_masked"], parts["sum_tonal_anchor_db"])
         self.assertNotEqual(parts["presence_error_db"], parts["peak_penalty_db"])
+
+    def test_target_shape_error_is_anchor_independent(self) -> None:
+        freqs = np.geomspace(800.0, 6000.0, 512)
+        shape = 4.0 * np.exp(-0.5 * (np.log2(freqs / 2600.0) / 0.45) ** 2)
+        valid = np.ones_like(freqs, dtype=bool)
+        first = objective.tonal_components(freqs, shape, valid)
+        shifted = objective.tonal_components(freqs, shape + 12.0, valid)
+
+        self.assertAlmostEqual(
+            first["target_shape_error_db"], shifted["target_shape_error_db"], places=10
+        )
 
     def test_fixed_anchor_audit_dilutes_unilateral_eq_in_combined_pair(self) -> None:
         freqs = np.array([300.0, 424.3, 600.0, 848.5, 1200.0])
@@ -169,7 +204,10 @@ class PhasePeqProtectionTests(unittest.TestCase):
 
     def test_rejects_peq_that_changes_written_crossover(self) -> None:
         groups = {name: [] for name in optimizer.GROUPS}
-        group = next(name for name, spec in optimizer.GROUPS.items() if 0 in spec["channels"])
+        group = next(
+            name for name, spec in optimizer.GROUPS.items()
+            if 0 in spec["channels"] and not spec.get("system_transfer")
+        )
         groups[group] = [(3000.0, 1.0, -3.0)]
         conflicts = optimizer.phase_peq_conflicts(self.freqs, groups, self.plan)
         self.assertEqual(len(conflicts), 1)

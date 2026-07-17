@@ -44,6 +44,13 @@ record.
   centre and half-octave shoulders. It exposes baseline error, candidate error,
   raw system delta, pair dilution, and absolute L/R balance change from the same
   objective prediction, preventing independent re-anchoring during review.
+- Beam includes a low-Q `front_voicing` group written identically to every front
+  output. The objective separately reports 1.3-5 kHz target-contour error relative
+  to a fixed 1.0-1.4 kHz reference, so a bass-only change cannot masquerade as a
+  successful retarget.
+- Matched positive front voicing can trigger a calculated uniform protective
+  attenuation. AFPX `<Vol>` changes are modelled, limited to `0..-6 dB`, rounded
+  to 0.25 dB, and accepted only on every front output by both verifiers.
 - Optional P2 choices are explicit: sub blend is recommendation-only and needs
   calibrated level plus declared headroom; voicing files are generated only on
   request and never identify a preferred tonal balance.
@@ -72,6 +79,8 @@ record.
 
 - Perceptually weighted tonal error reports distinct tonal, presence, and
   positive-peak components; peaks carry extra objective cost.
+- `target_shape_error_db` is anchor-independent and prevents the full-range
+  objective from overlooking a deliberate local target contour.
 - L/R evidence comes from solo traces and combines signed bias with weighted
   absolute/RMS mismatch, so opposite errors cannot cancel in the score.
 - Destructive summation/nulls earn no tonal reward.
@@ -109,7 +118,7 @@ record.
   PEQ with polarity, delay, and APF using measured-plus-complex-model delta.
 - Sessions without valid phase retain the conservative 0.5 dB crossover PEQ veto.
 - Lint and external verification independently check PEQ, PM polarity, delay,
-  APF, crossover, output attributes, and other time-alignment attributes.
+  APF, crossover, output volume/attributes, and other time-alignment attributes.
 
 ## Optional Impulses
 
@@ -149,8 +158,9 @@ record.
 
 ## Verified State
 
-- Thirty-seven regression tests pass, including objective invariants, session gates,
-  crossover PEQ vetoes, and a modern five-column TXT/AFPX golden benchmark.
+- Forty-two regression tests pass, including objective/target-shape invariants,
+  session gates, crossover PEQ vetoes, protective volume-write safety, and a
+  modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
 - Historical real-data smoke testing rejected the stale-reference sub polarity
   flip and an ambiguous left polarity result; it allowed only a warning-level
@@ -166,6 +176,11 @@ record.
 - Repeated exact scoring on the three-position historical set measured about
   `214.6 scores/s`; the P0 snapshot was about `17.9 scores/s`.
 - The P1 beam candidate passed independent PEQ-only AFPX verification.
+- The July 14 Harman retarget regression selected a matched whole-front
+  `+5.0 dB @ 2985 Hz, Q1.30` transfer plus uniform `-1.0 dB` front attenuation;
+  anchor-independent target-contour error improved from `4.21` to `1.97 dB`,
+  and external AFPX verification found no crossover, delay, polarity, APF, or
+  existing-filter changes.
 - Complex RBJ magnitude matches the existing PEQ dB model to numerical precision;
   phase-valid combined candidates use the canonical phase-session schema.
 - The packaged Windows worker completed a real AFPX/measurement run, merged 20
@@ -176,8 +191,8 @@ record.
 
 ## Deliberate Non-Changes
 
-- No automatic voicing or preferred target; opt-in audition files leave the
-  supplied target authoritative and are neutral choices for listening tests.
+- No automatic target choice or preferred voicing. The supplied target remains
+  authoritative; opt-in audition files remain neutral listening choices.
 - No broad-LF boost exception.
 - No direct `fit_peq()` post-pass because it uses a different objective.
 - No sub output-level writes; sub blend remains a recommendation.

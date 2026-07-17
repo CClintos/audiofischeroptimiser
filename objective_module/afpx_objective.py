@@ -22,6 +22,7 @@ import re
 import os
 import sys
 import zlib
+import math
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -88,12 +89,14 @@ ANCHOR_BAND = (300.0, 3000.0)
 # ---- objective weights (tunable; defaults encode the reviewed priorities) --
 W = {
     'tonal': 1.0,        # null-masked, vocal-weighted sum RMS  (primary)
+    'target_shape': 0.35, # anchor-independent requested contour through presence
     'peak': 0.35,        # positive deviations are more audible than equal dips
     'mid_balance': 0.6,  # weighted RMS FL/FR mismatch in the image band
     'tw_balance': 0.2,   # weighted RMS tweeter mismatch
     'balance_bias': 0.12, # broad signed image pull, separate from mismatch RMS
     'worst': 0.15,       # masked worst-case deviation
     'headroom': 0.4,     # per dB of cascade boost above SOFT_CAP
+    'output_gain': 1.0,  # never reward candidate-level output gain
     'null_boost': 0.8,   # per dB of EQ BOOST landing in a masked null bin (the exploit)
     'parsimony': 0.02,   # per active band
     'added_band': 0.05,   # a new filter must beat the one-seat noise floor
@@ -104,6 +107,8 @@ BALANCE_ABS_SHARE = 0.35
 SOFT_CAP_DB = 3.0        # cascade boost above this starts costing
 VOCAL_BAND = (200.0, 6000.0)
 VOCAL_WEIGHT = 1.8
+TARGET_SHAPE_BAND = (1300.0, 5000.0)
+TARGET_SHAPE_REFERENCE = (1000.0, 1400.0)
 INBAND = (60.0, 16000.0)
 
 
@@ -181,11 +186,17 @@ def tonal_components(freqs, deviation_db, valid_mask):
     anchor = _weighted_rms(dev, np.ones_like(freqs), valid)
     presence = _weighted_rms(dev, np.ones_like(freqs), valid & vocal)
     peak = _weighted_rms(np.maximum(dev, 0.0), weights, valid)
+    shape_reference = valid & (freqs >= TARGET_SHAPE_REFERENCE[0]) & (freqs <= TARGET_SHAPE_REFERENCE[1])
+    shape_band = valid & (freqs >= TARGET_SHAPE_BAND[0]) & (freqs <= TARGET_SHAPE_BAND[1])
+    reference_db = float(np.median(dev[shape_reference])) if np.any(shape_reference) else 0.0
+    target_shape = _weighted_rms(dev - reference_db, np.ones_like(freqs), shape_band)
     return {
         'tonal_masked': tonal,
         'sum_tonal_anchor_db': anchor,
         'presence_error_db': presence,
         'peak_penalty_db': peak,
+        'target_shape_error_db': target_shape,
+        'target_shape_reference_db': reference_db,
     }
 
 
@@ -226,6 +237,7 @@ _SMOOTH_T = {}
 _POSITION_TRACES = {}
 _POSITION_BASELINE = {}
 _SMOOTHER = None
+_BASE_OUTPUT_DB = []
 
 
 def _attrs(t):
@@ -239,6 +251,18 @@ def _peqset(xml):
                     for a in (_attrs(t) for t in re.findall(r'<Fil\b[^>]*/>', oc))
                     if a['T'] == '17' and float(a['G']) != 0])
     return out
+
+
+def _output_levels_db(xml):
+    levels = []
+    for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S)[:8]:
+        tag = re.search(r'<Vol\b[^>]*/?>', oc)
+        attrs = _attrs(tag.group()) if tag else {}
+        linear = float(attrs.get('L', 1.0))
+        levels.append(20.0 * np.log10(max(linear, 1e-30)))
+    while len(levels) < 8:
+        levels.append(0.0)
+    return levels
 
 
 def _position_path(prefixes, aliases):
@@ -281,6 +305,7 @@ def _smooth(values):
 def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
     global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
+    global _BASE_OUTPUT_DB
     if _F is not None:
         return
     raw = {}
@@ -329,7 +354,9 @@ def _init():
     for _name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
         _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
     with open(BASELINE_AFPX, 'rb') as handle:
-        _V5 = _peqset(zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace'))
+        baseline_xml = zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace')
+    _V5 = _peqset(baseline_xml)
+    _BASE_OUTPUT_DB = _output_levels_db(baseline_xml)
     _BASE_CASCADES = [_casc_uncached(bands) for bands in _V5]
     _TOTAL_DB = _system_branch_total_uncached()
     _SMOOTH_T = {key: _smooth(values) for key, values in _T.items()}
@@ -405,6 +432,15 @@ def _added_bands_by_channel(band_sets):
     return added
 
 
+def _matched_front_keys(added):
+    if not CH_KEYS:
+        return set()
+    common = Counter(_band_key(band) for band in added.get(0, []))
+    for index in range(1, len(CH_KEYS)):
+        common &= Counter(_band_key(band) for band in added.get(index, []))
+    return {key for key, count in common.items() if count > 0}
+
+
 def _interp_at(values, f):
     return float(np.interp(np.log10(float(f)), np.log10(_F), values))
 
@@ -478,6 +514,8 @@ def _asymmetry_penalty(band_sets, total=None):
 
 def _guardrail_score(band_sets):
     added = _added_bands_by_channel(band_sets)
+    matched_front = _matched_front_keys(added)
+    matched_seen = set()
     total_db = _system_branch_total_db()
     shape = 0.0
     unsupported = 0.0
@@ -488,6 +526,11 @@ def _guardrail_score(band_sets):
     for i, bands in added.items():
         channel_key = CH_KEYS[i]
         for f, q, g in bands:
+            key = _band_key((f, q, g))
+            matched = key in matched_front
+            if matched and key in matched_seen:
+                continue
+            matched_seen.add(key)
             n_added += 1
             shape += 0.012 * abs(g) * q
             if g > 0.0 and q > 1.8:
@@ -497,7 +540,7 @@ def _guardrail_score(band_sets):
                 unsupported += 0.75
                 unsupported += 0.85 * max(0.0, -g - 4.0)
                 unsupported += 0.65 * max(0.0, q - 2.5)
-            share = _driver_share_db(channel_key, f, total_db)
+            share = 0.0 if matched else _driver_share_db(channel_key, f, total_db)
             worst_share = share if worst_share is None else min(worst_share, share)
             if share < -6.0:
                 wasted += 0.18 * (-6.0 - share) * (0.5 + abs(g) / 4.0)
@@ -513,18 +556,46 @@ def _guardrail_score(band_sets):
         'high_q_boost_penalty': float(boost_q),
         'added_band_penalty': float(parsimony),
         'n_added_front_bands': n_added,
+        'n_matched_front_voicing_bands': len(matched_front),
         'worst_driver_share_db': float(worst_share if worst_share is not None else 0.0),
     }
 
 
-def _predict(band_sets):
+def output_trim_plan(band_sets):
+    """Return uniform front attenuation when matched voicing raises peak gain."""
+    _init()
+    added = _added_bands_by_channel(band_sets)
+    matched = _matched_front_keys(added)
+    has_positive_voicing = any(
+        1300.0 <= f <= 6000.0 and q <= 2.0 and g > 0.0
+        for f, q, g in matched
+    )
+    if not has_positive_voicing:
+        return {}
+    base_peak = max(
+        float(np.max(_BASE_CASCADES[i])) + float(_BASE_OUTPUT_DB[i])
+        for i in range(len(CH_KEYS))
+    )
+    candidate_peak = max(
+        float(np.max(_casc(band_sets[i]))) + float(_BASE_OUTPUT_DB[i])
+        for i in range(len(CH_KEYS))
+    )
+    needed = max(0.0, candidate_peak - base_peak)
+    trim = -min(6.0, math.ceil((needed - 1e-9) * 4.0) / 4.0)
+    if trim >= -0.01:
+        return {}
+    return {index: trim for index in range(len(CH_KEYS))}
+
+
+def _predict(band_sets, output_trim_override=None):
     """band_sets: 8 lists of (F,Q,G). Returns predicted magnitude traces."""
+    trim_plan = output_trim_plan(band_sets) if output_trim_override is None else dict(output_trim_override)
     pr = {}
     for i, k in enumerate(CH_KEYS):
-        pr[k] = _T[k] + (_casc(band_sets[i]) - _BASE_CASCADES[i])
+        pr[k] = _T[k] + (_casc(band_sets[i]) - _BASE_CASCADES[i]) + float(trim_plan.get(i, 0.0))
     if len(band_sets) > 6:
         baseline = _BASE_CASCADES[6] if len(_BASE_CASCADES) > 6 else _casc(_V5[6])
-        pr['Sub'] = _T['Sub'] + (_casc(band_sets[6]) - baseline)
+        pr['Sub'] = _T['Sub'] + (_casc(band_sets[6]) - baseline) + float(trim_plan.get(6, 0.0))
     else:
         pr['Sub'] = _T['Sub'].copy()
 
@@ -682,6 +753,7 @@ def _spatial_components(pr, band_sets, keep):
     center = tonal_components(_F, center_dev, keep)
     tonal_values = [center['tonal_masked']]
     peak_values = [center['peak_penalty_db']]
+    shape_values = [center['target_shape_error_db']]
     worst_values = [float(np.max(np.abs(center_dev[keep & (_F >= 100) & (_F <= 8000)])))]
     position_tonal = {'center': center['tonal_masked']}
     system_delta = pr['System Sum'] - _T['System Sum']
@@ -690,6 +762,7 @@ def _spatial_components(pr, band_sets, keep):
         parts = tonal_components(_F, dev, keep)
         tonal_values.append(parts['tonal_masked'])
         peak_values.append(parts['peak_penalty_db'])
+        shape_values.append(parts['target_shape_error_db'])
         worst_values.append(float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)]))))
         position_tonal[name] = parts['tonal_masked']
     weights = [2.0] + [1.0] * (len(tonal_values) - 1)
@@ -701,6 +774,10 @@ def _spatial_components(pr, band_sets, keep):
     spatial_peak = (
         0.65 * _weighted_quantile(peak_values, weights, 0.5)
         + 0.35 * max(peak_values)
+    )
+    spatial_shape = (
+        0.65 * _weighted_quantile(shape_values, weights, 0.5)
+        + 0.35 * max(shape_values)
     )
     spatial_worst = 0.70 * float(np.percentile(worst_values, 80)) + 0.30 * max(worst_values)
     fragility = 0.0
@@ -718,6 +795,7 @@ def _spatial_components(pr, band_sets, keep):
         **center,
         'spatial_tonal_db': float(spatial_tonal),
         'spatial_peak_db': float(spatial_peak),
+        'target_shape_error_db': float(spatial_shape),
         'spatial_worst_db': float(spatial_worst),
         'spatial_position_count': len(_POSITION_TRACES) + 1,
         'spatial_model': 'system_delta' if _POSITION_TRACES else 'centre_only',
@@ -727,16 +805,18 @@ def _spatial_components(pr, band_sets, keep):
     }
 
 
-def objective(band_sets):
+def objective(band_sets, output_trim_override=None):
     """The single scalar the optimizer minimizes, plus named components."""
     _init()
-    pr = _predict(band_sets)
+    trim_plan = output_trim_plan(band_sets) if output_trim_override is None else dict(output_trim_override)
+    pr = _predict(band_sets, trim_plan)
     inb = (_F >= INBAND[0]) & (_F <= INBAND[1])
     keep = inb & ~_NULL_MASK  # nulls MASKED OUT of tonal error + worst-case
 
     tonal_parts = _spatial_components(pr, band_sets, keep)
     tonal = tonal_parts['spatial_tonal_db']
     peak = tonal_parts['spatial_peak_db']
+    target_shape = tonal_parts['target_shape_error_db']
     worst = tonal_parts['spatial_worst_db']
 
     balances = {}
@@ -748,7 +828,7 @@ def objective(band_sets):
     head_peak = 0.0
     null_boost = 0.0
     for i in range(len(CH_KEYS)):
-        b = _casc(band_sets[i])
+        b = _casc(band_sets[i]) + float(trim_plan.get(i, 0.0))
         head_peak = max(head_peak, round(float(np.max(b)), 2))
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
@@ -761,6 +841,8 @@ def objective(band_sets):
         'headroom_peak': head_peak,
         'null_boost_avg': null_boost,
         'n_front_bands': n_bands,
+        'protective_output_trim_db': max(0.0, -min(trim_plan.values())) if trim_plan else 0.0,
+        'output_level_gain_db': max(0.0, max(trim_plan.values())) if trim_plan else 0.0,
     }
     if 'low' in balances:
         comp['low_balance'] = balances['low']['bias_db']
@@ -783,10 +865,12 @@ def objective(band_sets):
         + (0.25 * _balance_mismatch(balances['low']) if 'mid' in balances else 0.0)
     )
     scalar = (W['tonal'] * tonal
+              + W['target_shape'] * target_shape
               + W['peak'] * peak
               + balance_term
               + W['worst'] * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
+              + W['output_gain'] * comp['output_level_gain_db']
               + W['null_boost'] * null_boost
               + W['parsimony'] * n_bands
               + W['spatial_fragility'] * tonal_parts['spatial_fragility_penalty']
@@ -815,8 +899,15 @@ def cache_stats():
 
 
 def score_afpx(path):
+    _init()
     xml = zlib.decompress(open(path, 'rb').read()[4:]).decode('utf-8', 'replace')
-    return objective(_peqset(xml))
+    candidate_levels = _output_levels_db(xml)
+    output_delta = {
+        index: float(candidate_levels[index] - _BASE_OUTPUT_DB[index])
+        for index in range(min(len(candidate_levels), len(_BASE_OUTPUT_DB)))
+        if abs(float(candidate_levels[index] - _BASE_OUTPUT_DB[index])) >= 0.001
+    }
+    return objective(_peqset(xml), output_delta)
 
 
 if __name__ == '__main__':

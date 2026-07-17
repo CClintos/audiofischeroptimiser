@@ -5,6 +5,7 @@
 import re
 import struct
 import zlib
+import math
 from pathlib import Path
 
 
@@ -45,6 +46,21 @@ def set_attr(text, key, value):
     if re.search(pat, text):
         return re.sub(pat, '%s="%s"' % (key, value), text, count=1)
     return text[:-2] + ' %s="%s"/>' % (key, value) if text.endswith('/>') else text
+
+
+def apply_output_trim(oc, trim_db):
+    """Apply attenuation to one output's linear Vol value."""
+    trim_db = float(trim_db)
+    if trim_db > 1e-9 or trim_db < -6.0:
+        raise ValueError('protective output trim must be between -6 and 0 dB')
+    match = re.search(r'<Vol\b[^>]*/?>', oc)
+    if match is None:
+        raise ValueError('output channel has no Vol tag')
+    old = match.group()
+    linear = float(at(old, 'L') or '1')
+    new_linear = linear * (10.0 ** (trim_db / 20.0))
+    new = set_attr(old, 'L', format(new_linear, '.16g'))
+    return oc.replace(old, new, 1)
 
 
 def active_filter_tags(xml):
@@ -117,6 +133,15 @@ def channel_polarities(xml):
     return values
 
 
+def channel_volume_db(xml):
+    values = []
+    for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S):
+        tag = re.search(r'<Vol\b[^>]*/?>', oc)
+        linear = float(at(tag.group(), 'L') or '1') if tag else 1.0
+        values.append(20.0 * math.log10(max(linear, 1e-30)))
+    return values
+
+
 def multiset_delta(old_items, new_items):
     old_counts, new_counts = {}, {}
     for item in old_items:
@@ -133,7 +158,7 @@ def multiset_delta(old_items, new_items):
 
 def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
                         allow_crossover_changes=False, allow_polarity_changes=False,
-                        allowed_added_types=('17', '20')):
+                        allowed_added_types=('17', '20'), allowed_volume_trims=None):
     old_inv = channel_filter_inventory(old_xml)
     new_inv = channel_filter_inventory(new_xml)
     channel_diffs = []
@@ -164,6 +189,22 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
         channel_attribute_inventory(old_xml, exclude=('CINV',))
         != channel_attribute_inventory(new_xml, exclude=('CINV',))
     )
+    old_volume = channel_volume_db(old_xml)
+    new_volume = channel_volume_db(new_xml)
+    volume_changes = {
+        index: new_volume[index] - old_volume[index]
+        for index in range(min(len(old_volume), len(new_volume)))
+        if abs(new_volume[index] - old_volume[index]) >= 0.001
+    }
+    expected_volume = {
+        int(index): float(value)
+        for index, value in (allowed_volume_trims or {}).items()
+        if abs(float(value)) >= 0.001
+    }
+    volume_changes_valid = set(volume_changes) == set(expected_volume) and all(
+        abs(volume_changes[index] - expected_volume[index]) <= 0.01
+        for index in expected_volume
+    )
     errors = []
     if delay_changed and not allow_delay_changes:
         errors.append('delay tags changed')
@@ -173,6 +214,8 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
         errors.append('output polarity changed')
     if channel_attributes_changed:
         errors.append('unrelated output channel attributes changed')
+    if not volume_changes_valid:
+        errors.append('unapproved output volume changed')
     if delay_attributes_changed:
         errors.append('unrelated time alignment attributes changed')
     if forbidden:
@@ -184,12 +227,14 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
             'crossover_changed': crossover_changed,
             'polarity_changed': polarity_changed,
             'channel_attributes_changed': channel_attributes_changed,
+            'output_volume_changes_db': {index: round(value, 4) for index, value in volume_changes.items()},
+            'output_volume_changes_valid': volume_changes_valid,
             'delay_attributes_changed': delay_attributes_changed,
             'forbidden_added_filters': forbidden,
             'channel_diffs': channel_diffs}
 
 
-def validate_peq_band(F, Q, G):
+def validate_peq_band(F, Q, G, protected_boost=False):
     F, Q, G = float(F), float(Q), float(G)
     if not (20.0 <= F <= 20000.0):
         raise ValueError('PEQ frequency out of range: %.2f' % F)
@@ -197,7 +242,7 @@ def validate_peq_band(F, Q, G):
         raise ValueError('PEQ Q out of range: %.3f' % Q)
     if not (-15.0 <= G <= 6.0):
         raise ValueError('PEQ gain out of Helix range: %.2f' % G)
-    if G > 3.0:
+    if G > 3.0 and not protected_boost:
         print('warning: boost %.2f dB is inside hardware range but above the app safety cap' % G)
 
 
@@ -220,11 +265,11 @@ def edit_tweeter(oc):
     return oc.replace('F="13000.00" G="2.5"', 'F="13000.00" G="-1.5"', 1)
 
 
-def add_bands(oc, bands):
+def add_bands(oc, bands, protected_boost=False):
     # bands: list of (F, Q, G). Convert safe free slots (T="1") into active PEQs.
     slots = choose_free_slots(oc, len(bands))
     for (F, Q, G), slot in zip(bands, slots):
-        validate_peq_band(F, Q, G)
+        validate_peq_band(F, Q, G, protected_boost=protected_boost)
         new = slot
         new = set_attr(new, 'T', '17')
         new = set_attr(new, 'Q', Q)

@@ -96,6 +96,7 @@ New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Where-Object { $_.Name -like "family_*" -or $_.Name -like "voicing_*" }) {
     $verifyArgs = @(
         "scripts\verify_written_tune.py", $baselinePath, $candidate.FullName,
+        "--allow-output-trim",
         "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))
     )
     if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }

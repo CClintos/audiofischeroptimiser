@@ -87,6 +87,27 @@ class CacheTests(unittest.TestCase):
 
 
 class BeamSearchTests(unittest.TestCase):
+    def test_guided_pool_can_express_broad_matched_front_target_shape(self) -> None:
+        freqs = np.geomspace(80.0, 16000.0, 768)
+        flat = np.full_like(freqs, 60.0)
+        inactive = np.full_like(freqs, -100.0)
+        pair = optimizer.power_sum_db([flat, flat])
+        system = optimizer.power_sum_db([pair, pair, inactive])
+        requested = 5.0 * np.exp(-0.5 * (np.log2(freqs / 2700.0) / 0.45) ** 2)
+        traces = {
+            "FL High": flat, "FR High": flat,
+            "FL Low": flat, "FR Low": flat,
+            "Tweeters Together": pair, "Mid Bass Together": pair,
+            "Sub": inactive, "System Sum": system,
+        }
+        pools = stream.find_guided_candidates(freqs, traces, system + requested, "safe")
+        candidates = pools["front_voicing"]
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0]["source"], "target_shape")
+        self.assertGreater(candidates[0]["G"], 0.0)
+        self.assertLessEqual(candidates[0]["Q"], 1.8)
+
     def test_beam_is_deterministic_and_keeps_best_partial_combination(self) -> None:
         first_group = next(iter(optimizer.GROUPS))
         pools = {name: [] for name in optimizer.GROUPS}

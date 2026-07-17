@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 
 GROUP_LABELS = {
+    "front_voicing": "Whole front stage (matched voicing)",
     "sub": "Subwoofer",
     "high_sym": "Both tweeters (symmetric)",
     "fl_high": "Front L tweeter",
@@ -107,9 +108,11 @@ def _component_table(baseline: dict[str, Any], best: dict[str, Any]) -> str:
         ("objective", "Overall objective"),
         ("tonal_error_db", "Tonal error"),
         ("presence_error_db", "Vocal / presence error"),
+        ("target_shape_error_db", "Target contour error (anchor-independent)"),
         ("peak_penalty_db", "Peak penalty"),
         ("balance_penalty_db", "L/R balance penalty"),
         ("positive_gain_penalty_db", "Positive-gain / headroom penalty"),
+        ("protective_output_trim_db", "Protective front output trim"),
         ("spatial_worst_db", "Worst-position error"),
         ("guardrail_penalty", "Guardrail penalty"),
     )
@@ -400,6 +403,7 @@ def _plain_findings(summary: dict[str, Any], phase_mode: bool) -> list[str]:
     components = best.get("components") or {}
     for key, label in (
         ("tonal_error_db", "overall target tracking"),
+        ("target_shape_error_db", "the requested target contour"),
         ("presence_error_db", "the vocal region"),
         ("balance_penalty_db", "left/right consistency"),
     ):
@@ -538,8 +542,8 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         "when the evidence and predicted improvement clear the gates."
         if phase_mode else
         "The target is anchored once from the baseline measurement. Every candidate uses that same anchor. "
-        "The score combines tonal accuracy, extra vocal-band importance, peak control, L/R consistency, spatial "
-        "robustness, headroom and filter restraint. Lower error is better."
+        "The score combines tonal accuracy, anchor-independent target-contour accuracy, extra vocal-band importance, "
+        "peak control, L/R consistency, spatial robustness, headroom and filter restraint. Lower error is better."
     )
 
     plot = _response_plot(summary, full)
@@ -555,6 +559,7 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     for key, label in (
         ("tonal_error_db", "Tonal accuracy error"),
         ("presence_error_db", "Vocal / presence error"),
+        ("target_shape_error_db", "Target contour error"),
         ("peak_penalty_db", "Peak penalty"),
         ("balance_penalty_db", "L/R balance error"),
         ("spatial_worst_db", "Worst-position error"),

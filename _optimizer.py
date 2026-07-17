@@ -4,8 +4,10 @@ This runner is deliberately conservative about what it writes:
   - REW TXT input with optional phase/coherence columns;
   - PEQ added in free middle slots;
   - per-side front PEQ is allowed so L/R balance can be scored and corrected;
+  - broad voicing PEQ can be matched across every front output;
+  - matched front voicing may add a uniform protective output attenuation;
   - polarity/delay/APF writes only when the crossover ladder clears its gates;
-  - no crossover, shelf, or level writes.
+  - no crossover, shelf, or arbitrary level writes.
 
 The optimizer searches extra filters on top of the supplied baseline tune, writes
 ranked candidate AFPX files, and leaves all input files untouched.
@@ -46,6 +48,7 @@ from scripts.make_measurement_manifest import build_manifest
 
 from _make_v3 import (
     add_bands,
+    apply_output_trim,
     afpx_roundtrip_lint,
     choose_free_slots,
     decode_afpx,
@@ -126,7 +129,10 @@ def sync_external_objective(baseline: Path | None = None, target: Path | None = 
             setattr(AFPX_OBJECTIVE, "LEVEL_CALIBRATION", normalized)
             changed = True
     if changed:
-        for name, value in (("_F", None), ("_T", {}), ("_TGT", None), ("_NULL_MASK", None), ("_V5", None)):
+        for name, value in (
+            ("_F", None), ("_T", {}), ("_TGT", None), ("_NULL_MASK", None),
+            ("_V5", None), ("_BASE_OUTPUT_DB", []),
+        ):
             if hasattr(AFPX_OBJECTIVE, name):
                 setattr(AFPX_OBJECTIVE, name, value)
 
@@ -209,6 +215,15 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
     max_sym = 2 if explore else 1
     max_side = 3 if explore else 2
     groups: Dict[str, Dict[str, object]] = {
+        "front_voicing": {
+            "channels": tuple(range(6 if layout == "3way" else 4)),
+            "branch": "front",
+            "system_transfer": True,
+            "range": (1300.0, 6000.0),
+            "q_range": (0.5, 2.0 if explore else 1.8),
+            "gain_range": (-6.0, 6.0),
+            "max_bands": 2,
+        },
         "sub": {
             "channels": (6, 7),
             "branch": "sub",
@@ -737,6 +752,20 @@ def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return band_sets
 
 
+def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
+    needs_trim_check = any(
+        GROUPS.get(group, {}).get("system_transfer") and any(G > 0.0 for _F, _Q, G in bands)
+        for group, bands in groups.items()
+    )
+    if not needs_trim_check or AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "output_trim_plan"):
+        return {}
+    return {
+        int(channel): float(trim_db)
+        for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(groups_to_band_sets(groups)).items()
+        if abs(float(trim_db)) >= 0.01
+    }
+
+
 def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
     if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "response_audit"):
         return {}
@@ -919,8 +948,13 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
     pred: TraceMap = dict(traces)
 
     deltas = channel_deltas(freqs, groups)
+    trim_plan = output_trim_for_groups(groups)
     for channel, trace_name in CH_TRACE.items():
-        pred[trace_name] = traces[trace_name] + deltas.get(channel, np.zeros_like(freqs))
+        pred[trace_name] = (
+            traces[trace_name]
+            + deltas.get(channel, np.zeros_like(freqs))
+            + float(trim_plan.get(channel, 0.0))
+        )
     sub_delta = np.zeros_like(freqs)
     sub_count = 0
     for channel in (6, 7):
@@ -932,7 +966,7 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
         # sub filters. Average the duplicate channel deltas to model one shared
         # acoustic change instead of double-counting it.
         sub_delta = sub_delta / sub_count
-    pred["Sub"] = traces["Sub"] + sub_delta
+    pred["Sub"] = traces["Sub"] + sub_delta + float(trim_plan.get(6, 0.0))
 
     branch_outputs = []
     for pair in PAIR_DEFS.values():
@@ -1504,9 +1538,14 @@ def phase_peq_conflicts(freqs: np.ndarray, groups: GroupBands,
             continue
         crossover_channels = {int(value) for value in edit.get("crossover_channels", ())}
         for group, bands in groups.items():
-            group_channels = {int(value) for value in GROUPS.get(group, {}).get("channels", ())}
+            group_cfg = GROUPS.get(group, {})
+            group_channels = {int(value) for value in group_cfg.get("channels", ())}
             affected = sorted(crossover_channels & group_channels)
             if not affected:
+                continue
+            # An identical transfer on every driver in the crossover scales the
+            # acoustic sum without changing relative phase or level.
+            if group_cfg.get("system_transfer") and crossover_channels <= group_channels:
                 continue
             for F, Q, G in bands:
                 response = peaking_db(freqs, F, Q, G)
@@ -1548,6 +1587,8 @@ def _channel_complex_transfers(freqs: np.ndarray, groups: GroupBands,
         response = cascade_complex(freqs, bands)
         for channel in GROUPS.get(group, {}).get("channels", ()):
             transfers[int(channel)] *= response
+    for channel, trim_db in output_trim_for_groups(groups).items():
+        transfers[int(channel)] *= 10.0 ** (float(trim_db) / 20.0)
     for edit in phase_plan or []:
         for channel in edit.get("polarity_channels", ()):
             transfers[int(channel)] *= -1.0
@@ -1830,6 +1871,7 @@ def make_component_scorer(
                 "center_tonal_error_db": center_tonal,
                 "sum_tonal_anchor_db": tonal_anchor,
                 "presence_error_db": presence,
+                "target_shape_error_db": float(comp.get("target_shape_error_db", 0.0)),
                 "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
                 "peak_penalty_db": peak,
                 "balance_penalty_db": balance,
@@ -2004,7 +2046,16 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
         if not bands:
             continue
         for channel in GROUPS[group]["channels"]:
-            new_blocks[channel] = add_bands(new_blocks[channel], bands)
+            new_blocks[channel] = add_bands(
+                new_blocks[channel], bands,
+                protected_boost=bool(GROUPS[group].get("system_transfer")),
+            )
+
+    trim_plan = output_trim_for_groups(groups)
+    for channel, trim_db in trim_plan.items():
+        if channel >= len(new_blocks):
+            raise ValueError(f"Protective output trim targets missing channel {channel}")
+        new_blocks[channel] = apply_output_trim(new_blocks[channel], trim_db)
 
     new_xml = replace_oc_blocks(base_xml, new_blocks)
     new_xml = apply_phase_writes(new_xml, phase_plan)
@@ -2019,6 +2070,7 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
         allow_delay_changes=allow_delay,
         allow_polarity_changes=allow_polarity,
         allowed_added_types=("17", "20") if allow_apf else ("17",),
+        allowed_volume_trims=trim_plan,
     )
     if not lint["pass"]:
         raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
@@ -2097,6 +2149,7 @@ def format_component_summary(comp: Dict[str, float]) -> str:
             f"objective `{comp.get('objective', 0.0):.3f}`, tonal_masked `{comp.get('tonal_masked', 0.0):.3f}`, "
             f"spatial `{comp.get('spatial_tonal_db', comp.get('tonal_masked', 0.0)):.3f}`/`{comp.get('spatial_position_count', 1):.0f}` positions, "
             f"anchor `{comp.get('sum_tonal_anchor_db', 0.0):.3f}`, presence `{comp.get('presence_error_db', 0.0):.3f}`, "
+            f"target-shape `{comp.get('target_shape_error_db', 0.0):.3f}`, "
             f"peak `{comp.get('peak_penalty_db', 0.0):.3f}`, worst_masked `{comp.get('worst_masked', 0.0):.2f}`, "
             f"mid-bias `{comp.get('mid_balance', 0.0):+.2f}`, mid-RMS `{comp.get('mid_balance_rms_db', comp.get('low_balance_rms_db', 0.0)):.2f}`, "
             f"tweeter-bias `{comp.get('tweeter_balance', 0.0):+.2f}`, tweeter-RMS `{comp.get('tweeter_balance_rms_db', 0.0):.2f}`, "
@@ -2484,6 +2537,7 @@ def write_report(
 
     component_keys = (
         "objective", "tonal_error_db", "sum_tonal_anchor_db", "presence_error_db",
+        "target_shape_error_db", "protective_output_trim_db",
         "peak_penalty_db", "balance_penalty_db", "low_balance_rms_db",
         "mid_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
         "filter_count", "guardrail_penalty", "center_tonal_error_db",
@@ -2569,6 +2623,7 @@ def write_report(
                 for group, bands in best_row.get("groups", {}).items()
                 if bands
             },
+            "output_volume_changes_db": dict(best_row.get("lint", {}).get("output_volume_changes_db", {})),
             "left_alone": best_row.get("left_alone", ""),
             "position_tonal_db": best_components.get("spatial_position_tonal_db", {}),
             "spatial_hold_pass": best_components.get("spatial_hold_pass", True),
@@ -2629,7 +2684,8 @@ def write_report(
         f"- Baseline: `{args.baseline}`",
         f"- Target: `{args.target}`",
         f"- Trials: `{args.trials}`",
-        "- Mode: PEQ from magnitude data; optional polarity/delay/APF from gated crossover evidence; no crossover/shelf/level writes",
+        "- Mode: PEQ from magnitude data; optional polarity/delay/APF from gated crossover evidence; no crossover/shelf/arbitrary level writes",
+        "- Headroom: a broad matched whole-front voicing transfer may apply uniform protective attenuation to every front output; it never raises an output level.",
         "- Objective: imported `afpx_objective.score_bands(band_sets)['objective']`; lower is better. Search-space guardrails restrict what candidates are generated, but no extra target-matching term is added.",
         "- Comparison integrity: the target is anchored once from the baseline; candidate deltas are never re-anchored, and unilateral EQ is recombined through the measured pair/system model.",
         "",
