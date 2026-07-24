@@ -109,7 +109,8 @@ def _component_table(baseline: dict[str, Any], best: dict[str, Any]) -> str:
         ("tonal_error_db", "Tonal error"),
         ("presence_error_db", "Vocal / presence error"),
         ("target_shape_error_db", "Target contour error (anchor-independent)"),
-        ("peak_penalty_db", "Peak penalty"),
+        ("peak_penalty_db", "Broad peak penalty"),
+        ("narrow_peak_penalty_db", "Narrow / raw peak penalty"),
         ("balance_penalty_db", "L/R balance penalty"),
         ("positive_gain_penalty_db", "Positive-gain / headroom penalty"),
         ("protective_output_trim_db", "Protective front output trim"),
@@ -275,6 +276,15 @@ def _line_chart(
     return _png_data_uri(image)
 
 
+def line_chart_data_uri(
+    series: list[dict[str, Any]],
+    width: int = 1080,
+    height: int = 350,
+    zero_line: bool = True,
+) -> str:
+    """Render the same local chart used by PDF reports for native GUI views."""
+    return _line_chart(series, width=width, height=height, zero_line=zero_line)
+
 def _paired_bar_chart(rows: list[tuple[str, float, float]], width: int = 1080) -> str:
     _ensure_qt_app()
     rows = [(label, float(before), float(after)) for label, before, after in rows
@@ -320,6 +330,14 @@ def _response_plot(summary: dict[str, Any], full: dict[str, Any]) -> dict[str, A
     }
 
 
+def load_response_plot(summary_path: Path) -> dict[str, Any]:
+    """Load the full fixed-anchor response plot, with older-run fallback."""
+    summary_path = Path(summary_path)
+    summary = _read_json(summary_path)
+    details = summary.get("details") or {}
+    full_path = summary_path.parent / str(details.get("optimizer_summary", "optimizer_summary.json"))
+    return _response_plot(summary, _read_json(full_path))
+
 def _improvement(base: Any, best: Any) -> tuple[float | None, float | None]:
     if not isinstance(base, (int, float)) or not isinstance(best, (int, float)):
         return None, None
@@ -332,7 +350,7 @@ def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
     metrics = (
         ("tonal_error_db", "Tonal accuracy"),
         ("presence_error_db", "Vocal region"),
-        ("peak_penalty_db", "Audible peaks"),
+        ("narrow_peak_penalty_db", "Narrow peaks"),
         ("balance_penalty_db", "L/R balance"),
     )
     cells = []
@@ -560,7 +578,8 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         ("tonal_error_db", "Tonal accuracy error"),
         ("presence_error_db", "Vocal / presence error"),
         ("target_shape_error_db", "Target contour error"),
-        ("peak_penalty_db", "Peak penalty"),
+        ("peak_penalty_db", "Broad peak penalty"),
+        ("narrow_peak_penalty_db", "Narrow / raw peak penalty"),
         ("balance_penalty_db", "L/R balance error"),
         ("spatial_worst_db", "Worst-position error"),
     ):

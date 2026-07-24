@@ -5,9 +5,9 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 
 ## Workflow
 
-1. In **PEQ / RTA**, drop in magnitude/RTA measurements and the current AFPX.
-2. Validate and run. The app always uses deterministic Beam search and disables
-   phase writes for this stage.
+1. Start on **Home** and choose the workflow that matches the measurements available.
+2. For a normal tune, open **PEQ / RTA**, drop in magnitude/RTA measurements and
+   the current AFPX, then validate and run. Beam search is used with phase writes disabled.
 3. Load the selected PEQ result into the DSP and take fresh phase-valid sweeps.
 4. In **Sweeps / Phase**, select the fresh sweep folder and use the PEQ result as
    the baseline. This stage preserves PEQ and searches no new PEQ filters.
@@ -22,7 +22,13 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 If PEQ is already dialled in, users may start directly at **Sweeps / Phase**
 with the current tune and fresh phase-valid sweeps; a PEQ/RTA run is not required.
 
-Loading Results automatically creates `SQ_Tuning_Report.pdf` beside the merged
+**Retarget** is the final tab. Use it later with fresh MMM/RTA measurements of
+the current tune when changing to a different target curve; it preserves phase controls.
+The selected target is previewed against the built-in reference with both curves
+normalized to 0 dB at 1 kHz, making their tonal-shape difference visible.
+
+Results displays measured-before, predicted-candidate, and target curves using the same
+fixed-anchor response data as the report. Loading Results also creates `SQ_Tuning_Report.pdf` beside the merged
 candidate files. The report summarizes the objective components, exact supported
 changes, confidence warnings, deliberately untouched regions, and re-measure
 checks. The About tab explains the same scoring and safety model in-app.

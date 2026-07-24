@@ -1,11 +1,15 @@
 {
-  "objective": 5.48226179678685,
-  "tonal_masked": 1.863505646695942,
-  "sum_tonal_anchor_db": 2.2611120483155656,
-  "presence_error_db": 1.5070126999611906,
-  "peak_penalty_db": 1.3785287659044416,
-  "target_shape_error_db": 1.1520986659433292,
-  "balance_penalty_db": 2.14222791753456,
-  "low_balance_rms_db": 2.761491684710877,
-  "tweeter_balance_rms_db": 1.3193796917796123
+  "objective": 5.799214297010879,
+  "tonal_masked": 1.864616260725629,
+  "sum_tonal_anchor_db": 2.2611120483155673,
+  "presence_error_db": 1.5070126999611944,
+  "peak_penalty_db": 1.3595145710878098,
+  "narrow_peak_penalty_db": 1.3595424551445892,
+  "target_shape_error_db": 1.1520986659433217,
+  "balance_penalty_db": 2.224540850843188,
+  "low_balance_rms_db": 2.92875793113641,
+  "tweeter_balance_rms_db": 1.2791901806952473,
+  "complex_prediction_active": 0.0,
+  "complex_pair_count": 0.0,
+  "complex_system_validation_rms_db": 0.0
 }

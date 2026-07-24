@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import bisect
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +29,47 @@ def default_target() -> Path:
     return runtime_root() / "ResoNix Target Curve 2026.txt"
 
 
+def load_target_curve(path: Path, max_points: int = 260) -> dict[str, Any]:
+    """Load a two-column target and normalize its shape to 0 dB at 1 kHz."""
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    row_pattern = re.compile(rf"^\s*({number})\s*[,;\t ]+\s*({number})(?:\s|$)")
+    points: dict[float, float] = {}
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        frequency, level = float(match.group(1)), float(match.group(2))
+        if 10.0 <= frequency <= 50000.0 and math.isfinite(level):
+            points[frequency] = level
+    if len(points) < 2:
+        return {}
+    frequencies = sorted(points)
+    levels = [points[frequency] for frequency in frequencies]
+    logs = [math.log10(frequency) for frequency in frequencies]
+    anchor_log = math.log10(1000.0)
+    index = bisect.bisect_left(logs, anchor_log)
+    if index <= 0:
+        anchor = levels[0]
+    elif index >= len(logs):
+        anchor = levels[-1]
+    else:
+        span = logs[index] - logs[index - 1]
+        ratio = (anchor_log - logs[index - 1]) / span if span else 0.0
+        anchor = levels[index - 1] + ratio * (levels[index] - levels[index - 1])
+    eligible = [i for i, frequency in enumerate(frequencies) if 20.0 <= frequency <= 20000.0]
+    if len(eligible) > max_points:
+        step = (len(eligible) - 1) / float(max_points - 1)
+        eligible = sorted({eligible[round(i * step)] for i in range(max_points)})
+    return {
+        "file": path.name,
+        "frequency_hz": [round(frequencies[i], 3) for i in eligible],
+        "relative_db": [round(levels[i] - anchor, 3) for i in eligible],
+        "anchor_hz": 1000.0,
+    }
+
 def timestamped_run_root(base: Path | None = None) -> Path:
     parent = base or (Path.home() / "Documents" / "AudioFischer Optimizer Runs")
     return parent / ("Optimizer_Run_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -49,6 +93,7 @@ class RunConfig:
     cpu_percent: int = 60
     ram_percent: int = 50
     mode: str = "peq"
+    workflow: str = ""
     proposal: str = "beam"
     phase_writes: str = "auto"
     voicing_variants: str = "off"
@@ -60,6 +105,10 @@ class RunConfig:
     error: str = ""
     started_at: str = ""
     completed_at: str = ""
+
+    @property
+    def ui_workflow(self) -> str:
+        return self.workflow or self.mode
 
     @property
     def workers(self) -> int:

@@ -17,14 +17,18 @@ For a packaged release, open `AudioFischerOptimizer.exe`. From source:
 After building, `install_gui.ps1` installs the app for the current Windows user
 and creates a desktop shortcut; it does not require administrator access.
 
-The app has separate **PEQ / RTA** and **Sweeps / Phase** stages. PEQ always uses
-the recommended Beam search with phase writes disabled. The second stage uses
-fresh sweeps and the PEQ result as its baseline, preserves PEQ, and writes only
-gated phase/delay/APF changes. It also controls CPU and optimizer RAM use,
-preserves checkpoints, safely stops/resumes runs, and loads verified candidates
-from `assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
+The app opens on a workflow guide, followed by **PEQ / RTA**, **Sweeps / Phase**,
+and **Retarget** as the final tab. PEQ uses the recommended Beam search with phase
+writes disabled. The phase stage uses fresh sweeps and the PEQ result as its
+baseline, preserves PEQ, and writes only gated phase/delay/APF changes. Retarget
+applies the Beam workflow to fresh MMM/RTA measurements and a different supplied
+target. The app also controls CPU and optimizer RAM use, preserves checkpoints,
+safely stops/resumes runs, and loads verified candidates from
+`assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
 
-Results automatically creates `SQ_Tuning_Report.pdf` with the named score
+Retarget previews the selected target against the built-in reference, normalized at 1 kHz.
+Results shows the fixed-anchor measured-before, predicted-candidate, and target curves, and
+automatically creates `SQ_Tuning_Report.pdf` with the named score
 components, supported changes, warnings, deliberately untouched regions, and
 the required in-car checks. The About tab explains the scoring and workflow.
 
@@ -100,7 +104,11 @@ files while leaving the supplied target untouched and declaring no winner.
 
 For phase-valid solo/together sessions, candidate PEQ is evaluated as a full
 complex RBJ transfer together with polarity, delay, and residual APF. Invalid or
-missing phase data keeps the conservative crossover-band PEQ veto. Routine phase
+missing phase data keeps the conservative crossover-band PEQ veto. The tonal
+objective also complex-sums candidate PEQ from measured solo phase when those
+solos reproduce the measured together/system trace within 2.5 dB RMS. Failed or
+placeholder phase data automatically uses the measured-residual magnitude model.
+Routine phase
 analysis uses `analyze_phase_session()` and the stable
 `audiofischer-phase-session-v1` schema; specialist multinull tools remain
 experimental.
@@ -123,9 +131,10 @@ Polarity/delay/APF changes may be written only when the crossover ladder clears 
 
 It does not just chase a flat mono sum. Its scoring is designed to:
 
-- improve tonal accuracy, especially through the vocal band
+- improve tonal accuracy with smooth perceptual emphasis through the vocal band
 - reproduce deliberate target-shape changes instead of only changing bass or overall RMS
 - improve left/right balance using the solo driver traces
+- penalize broad peaks and separately catch raw / 1/6-octave narrow peaks
 - penalize boosting into destructive nulls
 - penalize unsupported asymmetric EQ
 - penalize unnecessary gain, wasted filters, and deep/narrow corrections
@@ -171,10 +180,15 @@ Expected tune file:
 - [run_guided_stream_workers.ps1](./run_guided_stream_workers.ps1): launches long local runs
 - [merge_guided_stream_results.ps1](./merge_guided_stream_results.ps1): safe merge wrapper
 - [objective_module/afpx_objective.py](./objective_module/afpx_objective.py): independent scalar objective used by the optimizer
-- [objective_module/_tunefit.py](./objective_module/_tunefit.py): DSP/math helpers used by the objective module
+- [objective_module/_tunefit.py](./objective_module/_tunefit.py): canonical DSP/math helpers used by both optimizer and objective
+- [objective_module/session.py](./objective_module/session.py): isolated multi-session scoring API
+- [_tunefit.py](./_tunefit.py): compatibility import for the canonical DSP module
 - [afpx.py](./afpx.py): generic `.afpx` inspector and channel-role helper
 - [pct6.py](./pct6.py): beta `.pct6` decode / encode utility for no-password PC-Tool 6 saves
 - [PCT6_SUPPORT.md](./PCT6_SUPPORT.md): caveats and safe usage notes for `.pct6`
+
+Required measurements now fail fast when missing, malformed, non-monotonic, or
+truncated. Optional phase, coherence, and position columns remain supported.
 
 The optimizer normalizes REW exports to the 96-points-per-octave grid used by its
 ERB and perceptual scoring math. The streaming search then applies a small

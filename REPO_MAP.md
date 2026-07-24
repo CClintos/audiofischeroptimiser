@@ -20,8 +20,9 @@ Current decisions and verified behavior live in `docs/ai_context/CURRENT_STATE.m
 ## Core Logic Areas
 
 - `objective_module/afpx_objective.py`: scalar objective used to score candidate tunes.
-- `_tunefit.py`: DSP and prediction math used by the optimiser.
-- `objective_module/_tunefit.py`: objective-layer DSP/math helpers.
+- `objective_module/_tunefit.py`: canonical DSP and prediction math used by optimizer and objective.
+- `_tunefit.py`: compatibility import; do not add independent DSP logic here.
+- `objective_module/session.py`: isolated scorer instances for multiple measurement sessions.
 - `afpx.py`: AFPX parsing, inspection, role/channel helpers.
 - `pct6.py`: beta PCT6 decode/encode support for no-password files.
 

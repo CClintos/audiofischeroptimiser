@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 
 from optimizer_gui.backend import (
-    RunConfig, candidate_files, collect_progress, powershell_command, validate_config,
+    RunConfig, candidate_files, collect_progress, load_target_curve, powershell_command,
+    validate_config,
 )
-from optimizer_gui.reporting import build_report_html
+from optimizer_gui.reporting import build_report_html, line_chart_data_uri, load_response_plot
 from optimizer_gui.window import OptimizerWindow
 
 
@@ -36,6 +37,21 @@ class GuiJobTests(unittest.TestCase):
         _program, args = powershell_command(config, executable="C:\\python.exe")
         self.assertEqual(args[args.index("-Mode") + 1], "phase")
 
+    def test_retarget_workflow_runs_through_peq_engine(self) -> None:
+        config = RunConfig(
+            "data", "current.afpx", "alternate_target.txt", "run",
+            mode="peq", workflow="retarget", phase_writes="off",
+        )
+        self.assertEqual(config.ui_workflow, "retarget")
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+        self.assertEqual(args[args.index("-Mode") + 1], "peq")
+        self.assertEqual(args[args.index("-Target") + 1], "alternate_target.txt")
+        self.assertEqual(args[args.index("-PhaseWrites") + 1], "off")
+
+    def test_old_jobs_fall_back_to_backend_mode_for_workflow(self) -> None:
+        config = RunConfig("data", "base.afpx", "target.txt", "run", mode="phase")
+        self.assertEqual(config.ui_workflow, "phase")
+
     def test_command_passes_explicit_user_choices(self) -> None:
         config = RunConfig(
             "C:\\Measurements", "C:\\Measurements\\base.afpx", "C:\\target.txt",
@@ -53,6 +69,34 @@ class GuiJobTests(unittest.TestCase):
             result = validate_config(config)
         self.assertFalse(result["valid"])
         self.assertGreaterEqual(len(result["errors"]), 1)
+
+    def test_target_curve_preview_is_normalized_at_one_khz(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "alternate.txt"
+            target.write_text("20 6\n1000 0\n20000 -4\n", encoding="utf-8")
+            curve = load_target_curve(target)
+        index = curve["frequency_hz"].index(1000.0)
+        self.assertEqual(curve["relative_db"][index], 0.0)
+        self.assertEqual(curve["file"], "alternate.txt")
+
+    def test_results_chart_uses_fixed_anchor_response_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "assistant_summary.json"
+            summary_path.write_text(json.dumps({
+                "best": {"fixed_anchor_response": {"checkpoints": [
+                    {"frequency_hz": 100.0, "baseline_error_db": 3.0,
+                     "candidate_error_db": 1.0, "raw_system_delta_db": -2.0},
+                    {"frequency_hz": 1000.0, "baseline_error_db": -2.0,
+                     "candidate_error_db": -1.0, "raw_system_delta_db": 1.0},
+                ]}},
+            }), encoding="utf-8")
+            plot = load_response_plot(summary_path)
+        self.assertEqual(plot["candidate_error_db"], [1.0, -1.0])
+        chart = line_chart_data_uri([{
+            "label": "Candidate", "x": plot["frequency_hz"],
+            "y": plot["candidate_error_db"], "color": "#16805d",
+        }])
+        self.assertTrue(chart.startswith("data:image/png;base64,"))
 
     def test_progress_and_candidates_read_compact_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2392,7 +2392,11 @@ def write_report(
     comparison_integrity = {
         "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
         "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
-        "combined_response": "recomputed_from_solo_power_sums_plus_measured_residual",
+        "combined_response": (
+            "validated_complex_solo_sum_plus_measured_residual"
+            if float((best_row or {}).get("components", {}).get("complex_prediction_active", 0.0)) > 0.5
+            else "recomputed_from_solo_power_sums_plus_measured_residual"
+        ),
         "review_rule": "judge raw deltas and absolute L/R mismatch; never re-anchor candidates independently",
     }
 
@@ -2402,7 +2406,7 @@ def write_report(
             "rank", "file", "objective", "pareto_rank", "family_role", "sum_rms_db", "sum_wrms_img_db",
             "worst_dev_db", "mid_balance_db", "tweeter_balance_db",
             "tonal_error_db", "sum_tonal_anchor_db", "presence_error_db", "pareto_tonal_db",
-            "peak_penalty_db", "balance_penalty_db",
+            "peak_penalty_db", "narrow_peak_penalty_db", "balance_penalty_db",
             "low_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
             "filter_count", "tonal_masked", "worst_masked", "mid_balance", "tweeter_balance",
             "headroom_peak", "null_boost_avg", "n_front_bands", "left_alone", "bands",
@@ -2417,7 +2421,7 @@ def write_report(
                 sc.get("mid_balance_db", ""), sc.get("tweeter_balance_db", ""),
                 comp.get("tonal_error_db", ""), comp.get("sum_tonal_anchor_db", ""),
                 comp.get("presence_error_db", ""), comp.get("pareto_tonal_db", ""),
-                comp.get("peak_penalty_db", ""),
+                comp.get("peak_penalty_db", ""), comp.get("narrow_peak_penalty_db", ""),
                 comp.get("balance_penalty_db", ""), comp.get("low_balance_rms_db", ""),
                 comp.get("high_balance_rms_db", ""), comp.get("positive_gain_penalty_db", ""),
                 comp.get("filter_count", ""),
@@ -2451,6 +2455,7 @@ def write_report(
                     "sum_tonal_anchor_db",
                     "presence_error_db",
                     "peak_penalty_db",
+                    "narrow_peak_penalty_db",
                     "balance_penalty_db",
                     "positive_gain_penalty_db",
                     "filter_count",
@@ -2538,11 +2543,13 @@ def write_report(
     component_keys = (
         "objective", "tonal_error_db", "sum_tonal_anchor_db", "presence_error_db",
         "target_shape_error_db", "protective_output_trim_db",
-        "peak_penalty_db", "balance_penalty_db", "low_balance_rms_db",
+        "peak_penalty_db", "narrow_peak_penalty_db", "balance_penalty_db", "low_balance_rms_db",
         "mid_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
         "filter_count", "guardrail_penalty", "center_tonal_error_db",
-        "spatial_tonal_db", "spatial_peak_db", "spatial_worst_db",
+        "spatial_tonal_db", "spatial_peak_db", "spatial_narrow_peak_db", "spatial_worst_db",
         "spatial_fragility_penalty", "spatial_position_count",
+        "complex_prediction_active", "complex_pair_count",
+        "complex_system_validation_rms_db", "complex_position_count",
     )
     base_components = dict(baseline_score.get("components", {}))
     best_components = dict(best_row.get("components", {})) if best_row else {}

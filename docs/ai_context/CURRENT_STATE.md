@@ -54,13 +54,14 @@ record.
 - Optional P2 choices are explicit: sub blend is recommendation-only and needs
   calibrated level plus declared headroom; voicing files are generated only on
   request and never identify a preferred tonal balance.
-- A native PySide6 Windows GUI now provides drag/drop inputs, authoritative
-  preflight, bounded CPU/RAM controls, durable stop/resume, compact progress,
-  results review, and AFPX export without Codex.
+- A native PySide6 Windows GUI opens on a workflow guide and provides drag/drop
+  inputs, authoritative preflight, bounded CPU/RAM controls, durable stop/resume,
+  compact progress, results review, and AFPX export without Codex.
 - The GUI exposes Beam only. Developer CLI methods remain available for
   benchmarking. Its PEQ/RTA stage disables phase writes; its Sweeps/Phase stage
   uses one baseline-only candidate so existing PEQ remains byte-identical while
-  gated polarity/delay/APF changes are considered.
+  gated polarity/delay/APF changes are considered. Retarget is a separate final
+  tab that reuses PEQ/Beam with a different supplied target and no phase writes.
 - The GUI assumes one fresh, consistently leveled measurement session and does
   not expose level-calibration JSON. Explicit calibration remains CLI-only.
 - Results automatically emit a local `SQ_Tuning_Report.pdf`. PEQ reports lead
@@ -68,8 +69,11 @@ record.
   component-improvement bars, L/R plots, expected audible effects, filter changes,
   restraint and verification. Phase reports use crossover confidence and ladder
   before/after visuals instead of presenting phase as ordinary tonal EQ.
-- The GUI About tab documents the two-stage workflow, named objective, phase
-  ladder, guardrails, and deliberate non-changes.
+- Retarget previews the selected target against the built-in reference at a common
+  1 kHz anchor. Results shows baseline, predicted candidate, and target from the
+  same fixed-anchor response data used by the PDF report.
+- The GUI About tab documents the workflow, named objective, phase ladder,
+  guardrails, and deliberate non-changes.
 - Users with an already-dialled PEQ tune can enter Sweeps/Phase directly. The
   phase run is a short one-worker baseline diagnostic, not a timed PEQ search.
 - Packaged builds contain a windowed GUI plus a console worker companion so
@@ -77,8 +81,9 @@ record.
 
 ## Objective And Guardrails
 
-- Perceptually weighted tonal error reports distinct tonal, presence, and
-  positive-peak components; peaks carry extra objective cost.
+- Perceptually weighted tonal error uses smooth log-frequency ramps and reports
+  distinct tonal, presence, broad-peak, and raw/1/6-octave narrow-peak components;
+  positive peaks carry extra objective cost.
 - `target_shape_error_db` is anchor-independent and prevents the full-range
   objective from overlooking a deliberate local target contour.
 - L/R evidence comes from solo traces and combines signed bias with weighted
@@ -93,7 +98,14 @@ record.
 - The proposed special `+4..5 dB` broad-LF boost exception was rejected. Do not
   add it unless the user reverses that decision.
 
-- Internal objective values retain full precision; rounding is report-only.
+- Phase-valid solos can drive the main tonal prediction through complete complex
+  candidate biquads only after they reproduce measured together/system traces
+  within 2.5 dB RMS. Constant placeholder phase or failed validation falls back
+  to the measured-residual magnitude model.
+- Optional per-ear solo bundles enable true per-position complex prediction;
+  system-sum-only ear bundles retain the centre-delta fallback.
+- Required TXT inputs fail fast when missing, malformed, non-monotonic, or
+  truncated. Internal objective values retain full precision; rounding is report-only.
 - A baseline candidate is always retained, so a short run cannot recommend a
   generated PEQ candidate that scores worse than the loaded tune.
 - Immutable baseline cascades, ERB windows, solo references, contribution
@@ -158,7 +170,7 @@ record.
 
 ## Verified State
 
-- Forty-two regression tests pass, including objective/target-shape invariants,
+- Fifty-six regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
@@ -181,6 +193,9 @@ record.
   anchor-independent target-contour error improved from `4.21` to `1.97 dB`,
   and external AFPX verification found no crossover, delay, polarity, APF, or
   existing-filter changes.
+- `objective_module/_tunefit.py` is the one canonical DSP implementation; the root
+  `_tunefit.py` is a compatibility import, preventing APF-limit and math drift.
+- `ScorerSession` loads independent objective modules and caches for multi-session callers.
 - Complex RBJ magnitude matches the existing PEQ dB model to numerical precision;
   phase-valid combined candidates use the canonical phase-session schema.
 - The packaged Windows worker completed a real AFPX/measurement run, merged 20

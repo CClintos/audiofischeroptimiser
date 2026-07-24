@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -19,10 +20,10 @@ from PySide6.QtWidgets import (
 
 from .backend import (
     APP_NAME, RunConfig, candidate_files, collect_progress, default_target,
-    discover_baseline, export_candidate, load_summary, locate_summary,
+    discover_baseline, export_candidate, load_summary, load_target_curve, locate_summary,
     powershell_command, process_tree_memory, timestamped_run_root, validate_config,
 )
-from .reporting import generate_tuning_report
+from .reporting import generate_tuning_report, line_chart_data_uri, load_response_plot
 
 
 class DropLineEdit(QLineEdit):
@@ -47,7 +48,54 @@ class DropLineEdit(QLineEdit):
                 return
 
 
+class ChartLabel(QLabel):
+    def __init__(self, placeholder: str, parent=None):
+        super().__init__(placeholder, parent)
+        self._source = QPixmap()
+        self._placeholder = placeholder
+        self.setObjectName("chart")
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumHeight(210)
+        self.setMaximumHeight(260)
+        self.setWordWrap(True)
+
+    def set_data_uri(self, data_uri: str, fallback: str | None = None):
+        encoded = data_uri.partition(",")[2] if data_uri else ""
+        pixmap = QPixmap()
+        if encoded and pixmap.loadFromData(base64.b64decode(encoded)):
+            self._source = pixmap
+            self.setText("")
+            self._rescale()
+            return
+        self.clear_chart(fallback or self._placeholder)
+
+    def clear_chart(self, message: str | None = None):
+        self._source = QPixmap()
+        self.setPixmap(QPixmap())
+        self.setText(message or self._placeholder)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self):
+        if self._source.isNull():
+            return
+        width = max(120, self.width() - 8)
+        height = max(120, self.height() - 8)
+        self.setPixmap(self._source.scaled(
+            width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ))
+
 class OptimizerWindow(QMainWindow):
+    TAB_HOME = 0
+    TAB_PEQ = 1
+    TAB_PHASE = 2
+    TAB_RUN = 3
+    TAB_RESULTS = 4
+    TAB_ABOUT = 5
+    TAB_RETARGET = 6
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
@@ -69,6 +117,10 @@ class OptimizerWindow(QMainWindow):
         self.data_edit.textChanged.connect(self._input_changed)
         self.baseline_edit.textChanged.connect(self._input_changed)
         self.target_edit.textChanged.connect(self._input_changed)
+        self.retarget_data_edit.textChanged.connect(self._input_changed)
+        self.retarget_baseline_edit.textChanged.connect(self._input_changed)
+        self.retarget_target_edit.textChanged.connect(self._input_changed)
+        self.retarget_target_edit.textChanged.connect(self._update_retarget_target_chart)
         self.phase_data_edit.textChanged.connect(self._input_changed)
         self.phase_baseline_edit.textChanged.connect(self._input_changed)
         self.phase_target_edit.textChanged.connect(self._input_changed)
@@ -96,13 +148,84 @@ class OptimizerWindow(QMainWindow):
         outer.addLayout(header)
 
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_home_tab(), "Home")
         self.tabs.addTab(self._build_inputs_tab(), "1  PEQ / RTA")
         self.tabs.addTab(self._build_phase_tab(), "2  Sweeps / Phase")
         self.tabs.addTab(self._build_run_tab(), "3  Run")
         self.tabs.addTab(self._build_results_tab(), "4  Results")
         self.tabs.addTab(self._build_about_tab(), "5  About")
+        self.tabs.addTab(self._build_retarget_tab(), "Retarget")
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
+
+    def _build_home_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 26, 28, 24)
+        layout.setSpacing(16)
+
+        heading = QLabel("Choose the right workflow")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+
+        intro = QLabel(
+            "For a normal tune, complete PEQ first, load the result into the DSP, then take fresh "
+            "sweeps for phase alignment. Retarget is only for changing the tonal curve later."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        peq_title = QLabel("1. PEQ / RTA - start here")
+        peq_title.setObjectName("workflowTitle")
+        layout.addWidget(peq_title)
+        peq_text = QLabel(
+            "Use fresh moving-mic or magnitude measurements to tune tonal balance and L/R response. "
+            "This stage writes PEQ only and preserves delay, polarity, crossovers and APFs."
+        )
+        peq_text.setWordWrap(True)
+        layout.addWidget(peq_text)
+        peq_button = QPushButton("Open PEQ / RTA")
+        peq_button.setObjectName("primary")
+        peq_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        peq_button.clicked.connect(
+            lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_PEQ)
+        )
+        layout.addWidget(peq_button, 0, Qt.AlignLeft)
+
+        phase_title = QLabel("2. Sweeps / Phase - after PEQ")
+        phase_title.setObjectName("workflowTitle")
+        layout.addWidget(phase_title)
+        phase_text = QLabel(
+            "Load the selected PEQ result into the DSP, take fresh phase-valid sweeps, then use this "
+            "stage for supported polarity, delay and residual APF changes. Existing PEQ is preserved."
+        )
+        phase_text.setWordWrap(True)
+        layout.addWidget(phase_text)
+        phase_button = QPushButton("Open Sweeps / Phase")
+        phase_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        phase_button.clicked.connect(
+            lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_PHASE)
+        )
+        layout.addWidget(phase_button, 0, Qt.AlignLeft)
+
+        retarget_title = QLabel("Retarget - use later when changing the tonal curve")
+        retarget_title.setObjectName("workflowTitle")
+        layout.addWidget(retarget_title)
+        retarget_text = QLabel(
+            "Use fresh MMM/RTA measurements of the current tune plus a different target curve. "
+            "It creates a new PEQ candidate without changing phase controls or the baseline."
+        )
+        retarget_text.setWordWrap(True)
+        layout.addWidget(retarget_text)
+        retarget_button = QPushButton("Open Retarget")
+        retarget_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        retarget_button.clicked.connect(
+            lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_RETARGET)
+        )
+        layout.addWidget(retarget_button, 0, Qt.AlignLeft)
+
+        layout.addStretch()
+        return page
 
     def _path_row(self, mode: str, browse_slot):
         edit = DropLineEdit(mode)
@@ -162,6 +285,77 @@ class OptimizerWindow(QMainWindow):
         self.validation_text.setReadOnly(True)
         self.validation_text.setPlaceholderText("Validation results appear here.")
         layout.addWidget(self.validation_text, 1)
+        return page
+
+    def _build_retarget_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 20, 18, 18)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "Retune an existing tune to a different tonal target using fresh MMM or RTA "
+            "measurements taken with that tune loaded. This runs the same conservative Beam "
+            "optimizer as PEQ / RTA; delay, polarity, crossovers and APFs remain untouched."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        data_row, self.retarget_data_edit = self._path_row("folder", self._browse_retarget_data)
+        base_row, self.retarget_baseline_edit = self._path_row("file", self._browse_retarget_baseline)
+        target_row, self.retarget_target_edit = self._path_row("file", self._browse_retarget_target)
+        self.retarget_data_edit.pathDropped.connect(self._retarget_data_dropped)
+        self.retarget_baseline_edit.pathDropped.connect(self._retarget_baseline_dropped)
+        self.retarget_target_edit.setPlaceholderText("Drop the new target curve here")
+        form.addRow("Fresh measurements", data_row)
+        form.addRow("Current tune AFPX", base_row)
+        form.addRow("New target curve", target_row)
+        layout.addLayout(form)
+
+        actions = QHBoxLayout()
+        self.validate_retarget_button = QPushButton("Validate / Prepare Retarget")
+        self.validate_retarget_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.validate_retarget_button.clicked.connect(self.validate_retarget_inputs)
+        actions.addWidget(self.validate_retarget_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        note = QLabel(
+            "The measurements must describe the current AFPX baseline. Retargeting changes only "
+            "supported PEQ bands and writes a new candidate file; the baseline is never overwritten."
+        )
+        note.setObjectName("warning")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(14)
+        chart_box = QVBoxLayout()
+        chart_title = QLabel("Target shape preview")
+        chart_title.setObjectName("workflowTitle")
+        chart_box.addWidget(chart_title)
+        self.retarget_target_chart = ChartLabel("Choose a new target curve to preview it.")
+        chart_box.addWidget(self.retarget_target_chart)
+        chart_note = QLabel(
+            "Curves are normalized to 0 dB at 1 kHz so their tonal shape can be compared."
+        )
+        chart_note.setObjectName("chartNote")
+        chart_note.setWordWrap(True)
+        chart_box.addWidget(chart_note)
+        preview_row.addLayout(chart_box, 2)
+
+        validation_box = QVBoxLayout()
+        validation_title = QLabel("Validation")
+        validation_title.setObjectName("workflowTitle")
+        validation_box.addWidget(validation_title)
+        self.retarget_validation_text = QTextEdit()
+        self.retarget_validation_text.setReadOnly(True)
+        self.retarget_validation_text.setPlaceholderText("Retarget validation results appear here.")
+        validation_box.addWidget(self.retarget_validation_text, 1)
+        preview_row.addLayout(validation_box, 1)
+        layout.addLayout(preview_row, 1)
         return page
 
     def _build_phase_tab(self):
@@ -358,6 +552,19 @@ class OptimizerWindow(QMainWindow):
         self.result_heading.setObjectName("sectionTitle")
         layout.addWidget(self.result_heading)
 
+        self.results_chart = ChartLabel(
+            "Complete or open a PEQ / Retarget run to see before and predicted-after response."
+        )
+        self.results_chart.setMinimumHeight(190)
+        self.results_chart.setMaximumHeight(230)
+        layout.addWidget(self.results_chart)
+        self.results_chart_note = QLabel(
+            "The 0 dB line is the target. Before and candidate use one fixed anchor; closer is better."
+        )
+        self.results_chart_note.setObjectName("chartNote")
+        self.results_chart_note.setWordWrap(True)
+        layout.addWidget(self.results_chart_note)
+
         self.result_table = QTableWidget(0, 3)
         self.result_table.setHorizontalHeaderLabels(["Candidate", "Objective", "File"])
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -402,9 +609,11 @@ class OptimizerWindow(QMainWindow):
         about.setHtml("""
         <h1>AudioFischer Optimizer</h1>
         <p>A local, conservative tuning tool for Helix and Audiotec Fischer AFPX files. It reads REW measurements, predicts supported changes, writes new candidate tunes, and never overwrites the baseline.</p>
-        <h2>Two-stage workflow</h2>
-        <p><b>1. PEQ / RTA:</b> Uses fresh magnitude or moving-mic RTA measurements to improve tonal balance and L/R consistency. Delay, polarity, APF and crossovers remain untouched.</p>
+        <h2>Workflows</h2>
+        <p><b>1. PEQ / RTA:</b> Start here with fresh magnitude or moving-mic RTA measurements to improve tonal balance and L/R consistency. Delay, polarity, APF and crossovers remain untouched.</p>
         <p><b>2. Sweeps / Phase:</b> After the PEQ result is loaded, fresh phase-valid sweeps are used to test crossover polarity, bounded relative delay and residual all-pass correction. Existing PEQ remains unchanged.</p>
+        <p><b>Retarget:</b> Use later when changing tonal balance. Fresh MMM or RTA measurements of the current tune are optimized against a different supplied target curve while phase controls remain untouched.</p>
+        <p>The Retarget tab previews target shapes at a common 1 kHz anchor. Results graphs the measured baseline and predicted candidate against the target using one fixed anchor.</p>
         <h2>How PEQ is judged</h2>
         <ul>
           <li>ERB-smoothed tonal error against the supplied target.</li>
@@ -441,6 +650,9 @@ class OptimizerWindow(QMainWindow):
             QLabel#metricName { color: #68717a; font-size: 11px; }
             QLabel#metricValue { color: #15191d; font-size: 18px; font-weight: 650; }
             QLabel#sectionTitle { font-size: 18px; font-weight: 650; }
+            QLabel#workflowTitle { font-size: 15px; font-weight: 650; color: #202327; margin-top: 8px; }
+            QLabel#chart { background: white; border: 1px solid #d8dde1; color: #68717a; padding: 4px; }
+            QLabel#chartNote { color: #68717a; font-size: 11px; }
             QTabWidget::pane { border: 1px solid #d9dde1; background: white; }
             QTabBar::tab { background: #e9ecef; border: 1px solid #d9dde1; padding: 9px 18px; }
             QTabBar::tab:selected { background: white; border-bottom-color: white; font-weight: 650; }
@@ -466,6 +678,36 @@ class OptimizerWindow(QMainWindow):
     def _input_changed(self):
         self.start_button.setEnabled(False)
         self.run_badge.setText("NEEDS VALIDATION")
+
+    def _update_retarget_target_chart(self, _value: str = ""):
+        selected_path = Path(self.retarget_target_edit.text().strip())
+        selected = load_target_curve(selected_path)
+        if not selected:
+            self.retarget_target_chart.clear_chart("Choose a valid new target curve to preview it.")
+            return
+        reference = load_target_curve(default_target())
+        series = [{
+            "label": selected.get("file", "New target"),
+            "x": selected.get("frequency_hz"),
+            "y": selected.get("relative_db"),
+            "color": "#16805d",
+        }]
+        try:
+            same_target = selected_path.resolve() == default_target().resolve()
+        except OSError:
+            same_target = False
+        if reference and not same_target:
+            series.append({
+                "label": "Built-in ResoNix 2026",
+                "x": reference.get("frequency_hz"),
+                "y": reference.get("relative_db"),
+                "color": "#a34b43",
+                "dashed": True,
+            })
+        self.retarget_target_chart.set_data_uri(
+            line_chart_data_uri(series, width=900, height=300),
+            "The selected target could not be plotted.",
+        )
 
     def _browse_data(self):
         path = QFileDialog.getExistingDirectory(self, "Select measurement folder")
@@ -495,6 +737,39 @@ class OptimizerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select target curve", "", "Text files (*.txt);;All files (*)")
         if path:
             self.target_edit.setText(path)
+
+    def _browse_retarget_data(self):
+        path = QFileDialog.getExistingDirectory(self, "Select fresh retarget measurement folder")
+        if path:
+            self.retarget_data_edit.setText(path)
+            baseline = discover_baseline(Path(path))
+            if baseline:
+                self.retarget_baseline_edit.setText(str(baseline))
+
+    def _retarget_data_dropped(self, value: str):
+        baseline = discover_baseline(Path(value))
+        if baseline:
+            self.retarget_baseline_edit.setText(str(baseline))
+
+    def _retarget_baseline_dropped(self, value: str):
+        if not self.retarget_data_edit.text():
+            self.retarget_data_edit.setText(str(Path(value).parent))
+
+    def _browse_retarget_baseline(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select current tune", self.retarget_data_edit.text(), "AFPX tune (*.afpx)"
+        )
+        if path:
+            self.retarget_baseline_edit.setText(path)
+            if not self.retarget_data_edit.text():
+                self.retarget_data_edit.setText(str(Path(path).parent))
+
+    def _browse_retarget_target(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select new target curve", "", "Text files (*.txt);;All files (*)"
+        )
+        if path:
+            self.retarget_target_edit.setText(path)
 
     def _browse_phase_data(self):
         path = QFileDialog.getExistingDirectory(self, "Select fresh sweep folder")
@@ -529,25 +804,31 @@ class OptimizerWindow(QMainWindow):
         self.phase_baseline_edit.setText(str(candidate))
 
     def _current_config(self, run_root: Path | None = None, mode: str | None = None) -> RunConfig:
-        mode = mode or self.active_mode
-        if mode == "phase":
+        workflow = mode or self.active_mode
+        if workflow == "phase":
             data_root = self.phase_data_edit.text().strip()
             baseline = self.phase_baseline_edit.text().strip()
             target = self.phase_target_edit.text().strip()
+        elif workflow == "retarget":
+            data_root = self.retarget_data_edit.text().strip()
+            baseline = self.retarget_baseline_edit.text().strip()
+            target = self.retarget_target_edit.text().strip()
         else:
             data_root = self.data_edit.text().strip()
             baseline = self.baseline_edit.text().strip()
             target = self.target_edit.text().strip()
+        backend_mode = "phase" if workflow == "phase" else "peq"
         return RunConfig(
             data_root=data_root, baseline=baseline, target=target,
-            run_root=str(run_root or timestamped_run_root()), mode=mode,
-            seconds=30 if mode == "phase" else self.seconds_spin.value(),
-            cpu_percent=20 if mode == "phase" else self.cpu_slider.value(),
+            run_root=str(run_root or timestamped_run_root()), mode=backend_mode,
+            workflow=workflow,
+            seconds=30 if workflow == "phase" else self.seconds_spin.value(),
+            cpu_percent=20 if workflow == "phase" else self.cpu_slider.value(),
             ram_percent=self.ram_slider.value(), proposal="beam",
-            phase_writes="auto" if mode == "phase" else "off",
-            voicing_variants=("audition" if self.voicing_check.isChecked() else "off") if mode == "peq" else "off",
-            sub_blend=("recommend" if self.sub_blend_check.isChecked() else "off") if mode == "peq" else "off",
-            headroom_db=(self.headroom_spin.value() if self.sub_blend_check.isChecked() else None) if mode == "peq" else None,
+            phase_writes="auto" if workflow == "phase" else "off",
+            voicing_variants=("audition" if self.voicing_check.isChecked() else "off") if workflow == "peq" else "off",
+            sub_blend=("recommend" if self.sub_blend_check.isChecked() else "off") if workflow == "peq" else "off",
+            headroom_db=(self.headroom_spin.value() if self.sub_blend_check.isChecked() else None) if workflow == "peq" else None,
             level_calibration="",
         )
 
@@ -556,6 +837,9 @@ class OptimizerWindow(QMainWindow):
 
     def validate_phase_inputs(self):
         return self._validate_workflow("phase", self.phase_validation_text)
+
+    def validate_retarget_inputs(self):
+        return self._validate_workflow("retarget", self.retarget_validation_text)
 
     def _validate_workflow(self, mode: str, output: QTextEdit):
         config = self._current_config(mode=mode)
@@ -598,10 +882,13 @@ class OptimizerWindow(QMainWindow):
         if result["valid"]:
             self.active_mode = mode
             phase_mode = mode == "phase"
-            self.workflow_value.setText(
-                "Sweeps / Phase - preserve PEQ, gated phase writes only"
-                if phase_mode else "PEQ / RTA - Beam search, no phase writes"
-            )
+            tone_options = mode == "peq"
+            labels = {
+                "phase": "Sweeps / Phase - preserve PEQ, gated phase writes only",
+                "retarget": "Retarget - Beam search to new curve, no phase writes",
+                "peq": "PEQ / RTA - Beam search, no phase writes",
+            }
+            self.workflow_value.setText(labels[mode])
             self.preset_combo.setEnabled(not phase_mode)
             self.seconds_spin.setEnabled(not phase_mode)
             self.cpu_slider.setEnabled(not phase_mode)
@@ -610,10 +897,10 @@ class OptimizerWindow(QMainWindow):
             self.cpu_control.setVisible(not phase_mode)
             self.phase_run_value.setVisible(phase_mode)
             self.phase_cpu_value.setVisible(phase_mode)
-            self.voicing_check.setEnabled(not phase_mode)
-            self.sub_blend_check.setEnabled(not phase_mode)
-            self.headroom_spin.setEnabled(not phase_mode and self.sub_blend_check.isChecked())
-            self.tabs.setCurrentIndex(3)
+            self.voicing_check.setEnabled(tone_options)
+            self.sub_blend_check.setEnabled(tone_options)
+            self.headroom_spin.setEnabled(tone_options and self.sub_blend_check.isChecked())
+            self.tabs.setCurrentIndex(self.TAB_RUN)
         return result["valid"]
 
     def _preset_changed(self):
@@ -630,7 +917,12 @@ class OptimizerWindow(QMainWindow):
         if self.process and self.process.state() != QProcess.NotRunning:
             return
         if resume_root is None:
-            validator = self.validate_phase_inputs if self.active_mode == "phase" else self.validate_inputs
+            validators = {
+                "phase": self.validate_phase_inputs,
+                "retarget": self.validate_retarget_inputs,
+                "peq": self.validate_inputs,
+            }
+            validator = validators[self.active_mode]
             if not validator():
                 return
         if resume_root is not None:
@@ -669,7 +961,7 @@ class OptimizerWindow(QMainWindow):
         )
         self.progress.setValue(0)
         self.poll_timer.start(1000)
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentIndex(self.TAB_RUN)
 
     def _read_process_output(self):
         if not self.process:
@@ -740,7 +1032,7 @@ class OptimizerWindow(QMainWindow):
             self.progress.setValue(1000)
             self.run_badge.setText("STOPPED - RESULTS SAVED" if stopped else "COMPLETE")
             self.load_results(summary)
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(self.TAB_RESULTS)
         elif self.config.status not in ("stopped", "memory_stopped"):
             self.config.status = "failed"
             self.config.error = f"Optimizer exited with code {exit_code}"
@@ -760,11 +1052,15 @@ class OptimizerWindow(QMainWindow):
             QMessageBox.warning(self, "Not a GUI run", str(exc))
             return
         self.config = config
-        self.active_mode = getattr(config, "mode", "peq")
+        self.active_mode = config.ui_workflow
         if self.active_mode == "phase":
             self.phase_data_edit.setText(config.data_root)
             self.phase_baseline_edit.setText(config.baseline)
             self.phase_target_edit.setText(config.target)
+        elif self.active_mode == "retarget":
+            self.retarget_data_edit.setText(config.data_root)
+            self.retarget_baseline_edit.setText(config.baseline)
+            self.retarget_target_edit.setText(config.target)
         else:
             self.data_edit.setText(config.data_root)
             self.baseline_edit.setText(config.baseline)
@@ -772,7 +1068,7 @@ class OptimizerWindow(QMainWindow):
         summary = locate_summary(root)
         if summary:
             self.load_results(summary)
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(self.TAB_RESULTS)
         else:
             reply = QMessageBox.question(self, "Resume run", "No merged result exists. Resume this run from its checkpoints?")
             if reply == QMessageBox.Yes:
@@ -803,6 +1099,49 @@ class OptimizerWindow(QMainWindow):
             "remeasure": self.summary.get("remeasure"),
         }
         self.result_details.setPlainText(json.dumps(core, indent=2))
+        mode = str((self.summary.get("search") or {}).get("mode") or "peq")
+        plot = load_response_plot(summary_path)
+        frequencies = plot.get("frequency_hz") or []
+        if mode != "phase" and frequencies:
+            chart = line_chart_data_uri([
+                {
+                    "label": "Before",
+                    "x": frequencies,
+                    "y": plot.get("baseline_error_db"),
+                    "color": "#a34b43",
+                },
+                {
+                    "label": "Predicted candidate",
+                    "x": frequencies,
+                    "y": plot.get("candidate_error_db"),
+                    "color": "#16805d",
+                },
+                {
+                    "label": "Target",
+                    "x": frequencies,
+                    "y": [0.0] * len(frequencies),
+                    "color": "#59636b",
+                    "dashed": True,
+                },
+            ], width=1000, height=300)
+            self.results_chart.set_data_uri(chart, "Response graph data was unavailable.")
+            self.results_chart_note.setText(
+                "The 0 dB line is the target. Before and candidate use one fixed anchor; closer is better."
+            )
+        elif mode == "phase":
+            self.results_chart.clear_chart(
+                "Phase runs are summarized by crossover confidence in the PDF report."
+            )
+            self.results_chart_note.setText(
+                "PEQ and Retarget runs show tonal before/after curves here."
+            )
+        else:
+            self.results_chart.clear_chart(
+                "This older run does not contain full response-plot data."
+            )
+            self.results_chart_note.setText(
+                "New PEQ and Retarget runs automatically save the required plot data."
+            )
         self.open_results_button.setEnabled(True)
         try:
             self.report_path = generate_tuning_report(summary_path)

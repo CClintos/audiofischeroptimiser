@@ -15,9 +15,9 @@
 # REQUIRES (same folder / same env): _tunefit.py, the 8 REW .txt solo/together
 # exports, the target curve, and the baseline .afpx that matches the measurements.
 #
-# MAGNITUDE-ONLY: this scores EQ/gain. It does NOT model all-pass/delay (phase).
-# Keep phase edits (APF) out of the optimizer's search until phase-valid sweeps
-# exist; grafting a verified APF onto the EQ winner is a separate, additive step.
+# PEQ magnitude is always scored. When phase-valid solos reproduce the measured
+# together trace, candidate biquads are also complex-summed; otherwise the scorer
+# automatically retains the conservative measured-residual magnitude model.
 import re
 import os
 import sys
@@ -35,7 +35,14 @@ if not (DATA_ROOT / 'System Sum.txt').exists() and (DATA_ROOT.parent / 'System S
     DATA_ROOT = DATA_ROOT.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DATA_ROOT))
-from _tunefit import peaking_db, erb_smooth, interference_audit, erb_hz, LOGSTEP
+from _tunefit import (
+    LOGSTEP,
+    cascade_complex,
+    erb_hz,
+    erb_smooth,
+    interference_audit,
+    peaking_db,
+)
 
 # ---- config ---------------------------------------------------------------
 REW_DIR = DATA_ROOT
@@ -91,6 +98,7 @@ W = {
     'tonal': 1.0,        # null-masked, vocal-weighted sum RMS  (primary)
     'target_shape': 0.35, # anchor-independent requested contour through presence
     'peak': 0.35,        # positive deviations are more audible than equal dips
+    'narrow_peak': 0.18, # light raw/1/6-oct check catches peaks hidden by ERB smoothing
     'mid_balance': 0.6,  # weighted RMS FL/FR mismatch in the image band
     'tw_balance': 0.2,   # weighted RMS tweeter mismatch
     'balance_bias': 0.12, # broad signed image pull, separate from mismatch RMS
@@ -107,26 +115,70 @@ BALANCE_ABS_SHARE = 0.35
 SOFT_CAP_DB = 3.0        # cascade boost above this starts costing
 VOCAL_BAND = (200.0, 6000.0)
 VOCAL_WEIGHT = 1.8
+COMPLEX_VALIDATION_RMS_DB = 2.5
 TARGET_SHAPE_BAND = (1300.0, 5000.0)
 TARGET_SHAPE_REFERENCE = (1000.0, 1400.0)
 INBAND = (60.0, 16000.0)
 
 
 # ---- load measured data + target (once) -----------------------------------
-def _load_txt(path):
-    f, s = [], []
+def _load_txt_rich(path, min_points=16):
+    """Load a REW-style trace and fail loudly on missing or truncated inputs."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError('Required measurement is missing: %s' % path)
+    columns = [[], [], [], [], []]
+    numeric_rows = 0
     with open(path, encoding='utf-8', errors='replace') as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith('*'):
+        for line_number, line in enumerate(handle, 1):
+            text = line.strip()
+            if not text or text.startswith(('*', '#', ';')):
                 continue
-            p = line.split()
+            parts = text.replace(',', ' ').split()
             try:
-                f.append(float(p[0])); s.append(float(p[1]))
-            except Exception:
-                continue
-    return np.array(f), np.array(s)
+                values = [float(value) for value in parts[:5]]
+            except (ValueError, TypeError):
+                numeric_start = False
+                try:
+                    float(parts[0])
+                    numeric_start = True
+                except (ValueError, TypeError, IndexError):
+                    pass
+                if not numeric_start and any(char.isalpha() for char in text):
+                    continue
+                raise ValueError('Malformed numeric row in %s at line %d' % (path, line_number))
+            if len(values) < 2:
+                raise ValueError('Measurement row needs frequency and SPL in %s at line %d'
+                                 % (path, line_number))
+            numeric_rows += 1
+            for index, value in enumerate(values):
+                columns[index].append(value)
+    if numeric_rows < int(min_points):
+        raise ValueError('Measurement %s is truncated: %d points, need at least %d'
+                         % (path, numeric_rows, min_points))
+    freqs = np.asarray(columns[0], dtype=float)
+    spl = np.asarray(columns[1], dtype=float)
+    if np.any(~np.isfinite(freqs)) or np.any(~np.isfinite(spl)):
+        raise ValueError('Measurement contains non-finite frequency or SPL values: %s' % path)
+    if np.any(freqs <= 0.0) or np.any(np.diff(freqs) <= 0.0):
+        raise ValueError('Measurement frequencies must be positive and strictly increasing: %s' % path)
+    result = {'freq': freqs, 'spl': spl, 'path': str(path)}
+    if len(columns[2]) == numeric_rows:
+        phase = np.asarray(columns[2], dtype=float)
+        if np.all(np.isfinite(phase)):
+            result['phase'] = phase
+    if len(columns[3]) == numeric_rows:
+        coherence = np.asarray(columns[3], dtype=float)
+        if np.all(np.isfinite(coherence)):
+            result['coherence'] = coherence
+    if len(columns[4]) == numeric_rows:
+        result['position_id'] = np.asarray(columns[4], dtype=float)
+    return result
 
+
+def _load_txt(path):
+    trace = _load_txt_rich(path)
+    return trace['freq'], trace['spl']
 
 def _resolve_txt(names):
     if isinstance(names, str):
@@ -135,7 +187,8 @@ def _resolve_txt(names):
         path = REW_DIR / (name + '.txt')
         if path.exists():
             return path
-    return REW_DIR / (names[0] + '.txt')
+    expected = ', '.join(str(REW_DIR / (name + '.txt')) for name in names)
+    raise FileNotFoundError('Missing required measurement; expected one of: ' + expected)
 
 
 def _calibration_offset(role, path):
@@ -174,18 +227,50 @@ def _weighted_rms(values, weights, mask):
     return float(np.sqrt(np.sum(weighted ** 2) / max(den, 1e-30)))
 
 
-def tonal_components(freqs, deviation_db, valid_mask):
-    """Return distinct full-band, presence, and positive-peak metrics."""
+def perceptual_weights(freqs):
+    """Smooth vocal/presence emphasis without hard 200 Hz or 6 kHz edges."""
+    freqs = np.asarray(freqs, dtype=float)
+    weights = np.ones_like(freqs)
+
+    def raised_log_ramp(lo, hi, rising):
+        selected = (freqs > lo) & (freqs < hi)
+        x = np.clip(np.log2(freqs[selected] / lo) / np.log2(hi / lo), 0.0, 1.0)
+        curve = 0.5 - 0.5 * np.cos(np.pi * x)
+        if not rising:
+            curve = 1.0 - curve
+        weights[selected] += (VOCAL_WEIGHT - 1.0) * curve
+
+    weights[(freqs >= 300.0) & (freqs <= 4000.0)] = VOCAL_WEIGHT
+    raised_log_ramp(120.0, 300.0, True)
+    raised_log_ramp(4000.0, 8000.0, False)
+    return weights
+
+
+def _fractional_octave_smooth(freqs, values, fraction=6):
+    freqs = np.asarray(freqs, dtype=float)
+    values = np.asarray(values, dtype=float)
+    log_f = np.log2(freqs)
+    half_width = 1.0 / (2.0 * float(fraction))
+    starts = np.searchsorted(log_f, log_f - half_width, side='left')
+    ends = np.searchsorted(log_f, log_f + half_width, side='right')
+    cumulative = np.concatenate(([0.0], np.cumsum(values)))
+    return (cumulative[ends] - cumulative[starts]) / np.maximum(ends - starts, 1)
+
+
+def tonal_components(freqs, deviation_db, valid_mask, narrow_deviation_db=None):
+    """Return distinct broad tonal, presence, broad-peak and narrow-peak metrics."""
     freqs = np.asarray(freqs, dtype=float)
     dev = np.asarray(deviation_db, dtype=float)
     valid = np.asarray(valid_mask, dtype=bool)
     vocal = (freqs >= VOCAL_BAND[0]) & (freqs <= VOCAL_BAND[1])
-    weights = np.ones_like(freqs)
-    weights[vocal] = VOCAL_WEIGHT
+    weights = perceptual_weights(freqs)
+    narrow = (_fractional_octave_smooth(freqs, dev, 6)
+              if narrow_deviation_db is None else np.asarray(narrow_deviation_db, dtype=float))
     tonal = _weighted_rms(dev, weights, valid)
     anchor = _weighted_rms(dev, np.ones_like(freqs), valid)
     presence = _weighted_rms(dev, np.ones_like(freqs), valid & vocal)
     peak = _weighted_rms(np.maximum(dev, 0.0), weights, valid)
+    narrow_peak = _weighted_rms(np.maximum(narrow, 0.0), weights, valid)
     shape_reference = valid & (freqs >= TARGET_SHAPE_REFERENCE[0]) & (freqs <= TARGET_SHAPE_REFERENCE[1])
     shape_band = valid & (freqs >= TARGET_SHAPE_BAND[0]) & (freqs <= TARGET_SHAPE_BAND[1])
     reference_db = float(np.median(dev[shape_reference])) if np.any(shape_reference) else 0.0
@@ -195,10 +280,12 @@ def tonal_components(freqs, deviation_db, valid_mask):
         'sum_tonal_anchor_db': anchor,
         'presence_error_db': presence,
         'peak_penalty_db': peak,
+        'narrow_peak_penalty_db': narrow_peak,
+        'narrow_peak_max_db': float(np.max(np.maximum(narrow[valid], 0.0)))
+        if np.any(valid) else 0.0,
         'target_shape_error_db': target_shape,
         'target_shape_reference_db': reference_db,
     }
-
 
 def balance_components(freqs, difference_db, band):
     """Return broad signed bias and non-cancelling weighted L/R mismatch."""
@@ -207,8 +294,7 @@ def balance_components(freqs, difference_db, band):
     selected = (freqs >= band[0]) & (freqs <= band[1]) & np.isfinite(diff)
     if not np.any(selected):
         return {'bias_db': 0.0, 'mismatch_rms_db': 0.0, 'mismatch_abs_db': 0.0}
-    weights = np.ones_like(freqs)
-    weights[(freqs >= 700.0) & (freqs <= 5000.0)] = 1.8
+    weights = perceptual_weights(freqs)
     w = weights[selected]
     d = diff[selected]
     return {
@@ -238,6 +324,10 @@ _POSITION_TRACES = {}
 _POSITION_BASELINE = {}
 _SMOOTHER = None
 _BASE_OUTPUT_DB = []
+_TRACE_META = {}
+_COMPLEX_MODELS = {}
+_POSITION_COMPLEX_MODELS = {}
+_PREDICTION_AUDIT = {}
 
 
 def _attrs(t):
@@ -302,39 +392,176 @@ def _smooth(values):
     return _SMOOTHER(values) if _SMOOTHER is not None else erb_smooth(_F, values)
 
 
+def _trace_complex(meta):
+    phase = np.deg2rad(meta['phase'])
+    return 10.0 ** (np.asarray(meta['spl'], dtype=float) / 20.0) * np.exp(1j * phase)
+
+
+def _coherence_mask(meta):
+    if 'coherence' not in meta:
+        return np.ones_like(_F, dtype=bool)
+    coherence = np.asarray(meta['coherence'], dtype=float)
+    if np.nanmax(coherence) > 1.5:
+        coherence = coherence / 100.0
+    return coherence >= 0.60
+
+
+def _complex_agreement(measured_meta, predicted_complex, mask):
+    predicted_db = 20.0 * np.log10(np.maximum(np.abs(predicted_complex), 1e-30))
+    selected = np.asarray(mask, dtype=bool) & np.isfinite(predicted_db)
+    if np.sum(selected) < 12:
+        return float('inf'), 0.0, np.zeros_like(predicted_db)
+    offset = float(np.median(np.asarray(measured_meta['spl'])[selected] - predicted_db[selected]))
+    residual = np.asarray(measured_meta['spl']) - (predicted_db + offset)
+    rms = float(np.sqrt(np.mean(residual[selected] ** 2)))
+    return rms, offset, residual
+
+
+def _align_trace(path, calibration_role):
+    trace = _load_txt_rich(path)
+    log_f = np.log10(_F)
+    aligned = {
+        'spl': np.interp(log_f, np.log10(trace['freq']),
+                         trace['spl'] + _calibration_offset(calibration_role, Path(path))),
+        'path': str(path),
+    }
+    if 'phase' in trace:
+        unwrapped = np.unwrap(np.deg2rad(trace['phase']))
+        aligned['phase'] = np.rad2deg(
+            np.interp(log_f, np.log10(trace['freq']), unwrapped)
+        )
+    if 'coherence' in trace:
+        aligned['coherence'] = np.interp(
+            log_f, np.log10(trace['freq']), trace['coherence']
+        )
+    return aligned
+
+
+def _make_complex_sum_model(trace_meta, roles, measured_role, band):
+    required = list(roles) + [measured_role]
+    if any(role not in trace_meta or 'phase' not in trace_meta[role] for role in required):
+        return None, 'phase column missing'
+    if any(float(np.ptp(np.asarray(trace_meta[role]['phase'], dtype=float))) < 1e-3
+           for role in required):
+        return None, 'phase column is constant or placeholder data'
+    baseline_sum = np.zeros_like(_F, dtype=complex)
+    mask = (_F >= band[0]) & (_F <= band[1])
+    for role in roles:
+        baseline_sum += _trace_complex(trace_meta[role])
+        mask &= _coherence_mask(trace_meta[role])
+    measured = trace_meta[measured_role]
+    mask &= _coherence_mask(measured)
+    alive_band = (_F >= band[0]) & (_F <= band[1])
+    alive_floor = float(np.max(measured['spl'][alive_band])) - 25.0
+    mask &= measured['spl'] >= alive_floor
+    rms, offset, residual = _complex_agreement(measured, baseline_sum, mask)
+    if not np.isfinite(rms) or rms > COMPLEX_VALIDATION_RMS_DB:
+        return None, 'solo/together agreement %.3f dB exceeds %.1f dB' % (
+            rms, COMPLEX_VALIDATION_RMS_DB
+        )
+    return {
+        'roles': tuple(roles),
+        'measured_role': measured_role,
+        'trace_meta': trace_meta,
+        'baseline_sum': baseline_sum,
+        'offset_db': offset,
+        'residual_db': residual,
+        'validation_rms_db': rms,
+        'validation_points': int(np.sum(mask)),
+    }, 'pass'
+
+
+def _build_complex_models(position_specs):
+    mode = os.environ.get('AFPX_COMPLEX_TONAL', 'auto').strip().lower()
+    audit = {'mode': mode, 'pairs': {}, 'positions': {}}
+    if mode in ('0', 'off', 'false', 'disabled'):
+        audit['system'] = {'active': False, 'reason': 'disabled by AFPX_COMPLEX_TONAL'}
+        return {}, {}, audit
+
+    models = {'pairs': {}}
+    for name, (left, right, together, band, _balance) in PAIR_SPECS.items():
+        model, reason = _make_complex_sum_model(_TRACE_META, (left, right), together, band)
+        audit['pairs'][name] = {
+            'active': model is not None,
+            'reason': reason,
+            'validation_rms_db': model['validation_rms_db'] if model else None,
+        }
+        if model is not None:
+            models['pairs'][name] = model
+
+    system_roles = tuple(CH_KEYS) + ('Sub',)
+    system_model, reason = _make_complex_sum_model(
+        _TRACE_META, system_roles, 'System Sum', INBAND
+    )
+    models['system'] = system_model
+    audit['system'] = {
+        'active': system_model is not None,
+        'reason': reason,
+        'validation_rms_db': system_model['validation_rms_db'] if system_model else None,
+    }
+
+    position_models = {}
+    for position, prefixes in position_specs.items():
+        if position not in _POSITION_TRACES:
+            continue
+        meta = {}
+        missing = []
+        for role in system_roles + ('System Sum',):
+            path = _position_path(prefixes, SOLO_FILES[role])
+            if path is None:
+                missing.append(role)
+                continue
+            meta[role] = _align_trace(path, position + ':' + role)
+        if missing:
+            audit['positions'][position] = {
+                'active': False,
+                'reason': 'optional per-position solos missing: ' + ', '.join(missing),
+            }
+            continue
+        model, reason = _make_complex_sum_model(meta, system_roles, 'System Sum', INBAND)
+        audit['positions'][position] = {
+            'active': model is not None,
+            'reason': reason,
+            'validation_rms_db': model['validation_rms_db'] if model else None,
+        }
+        if model is not None:
+            position_models[position] = model
+    return models, position_models, audit
+
 def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
     global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
-    global _BASE_OUTPUT_DB
+    global _BASE_OUTPUT_DB, _TRACE_META, _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT
     if _F is not None:
         return
     raw = {}
     F = None
     for key, nm in SOLO_FILES.items():
         path = _resolve_txt(nm)
-        f, s = _load_txt(path)
-        s = s + _calibration_offset(key, path)
+        trace = _load_txt_rich(path)
+        trace['spl'] = trace['spl'] + _calibration_offset(key, path)
         if F is None:
-            F = f
-        raw[key] = (f, s)
+            F = trace['freq']
+        raw[key] = trace
     F = _optimization_grid(F)
     log_f = np.log10(F)
-    for key, (source_f, source_s) in raw.items():
+    _TRACE_META = {}
+    for key, trace in raw.items():
+        source_f = trace['freq']
+        source_s = trace['spl']
         _T[key] = np.interp(log_f, np.log10(source_f), source_s)
+        aligned = {'spl': _T[key], 'path': trace['path']}
+        if 'phase' in trace:
+            unwrapped = np.unwrap(np.deg2rad(trace['phase']))
+            aligned['phase'] = np.rad2deg(np.interp(log_f, np.log10(source_f), unwrapped))
+        if 'coherence' in trace:
+            aligned['coherence'] = np.interp(log_f, np.log10(source_f), trace['coherence'])
+        _TRACE_META[key] = aligned
     _F = F
     _GRID_TOKEN = (len(F), float(F[0]), float(F[-1]), hash(F.tobytes()))
     _SMOOTHER = _build_smoother(F)
-    tf, ts = [], []
-    with open(TARGET, encoding='utf-8', errors='replace') as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line[0].isalpha() or line.startswith('*'):
-                continue
-            p = line.replace(',', ' ').split()
-            try:
-                tf.append(float(p[0])); ts.append(float(p[1]))
-            except Exception:
-                continue
+    target_trace = _load_txt_rich(TARGET)
+    tf, ts = target_trace['freq'], target_trace['spl']
     tgt = np.interp(np.log10(F), np.log10(np.array(tf)), np.array(ts))
     band = (F >= ANCHOR_BAND[0]) & (F <= ANCHOR_BAND[1])
     _TGT = tgt + float(np.median(_T['System Sum'][band] - tgt[band]))
@@ -370,10 +597,9 @@ def _init():
         path = _position_path(prefixes, SOLO_FILES['System Sum'])
         if path is None:
             continue
-        pf, ps = _load_txt(path)
-        if len(pf) < 16:
-            continue
-        ps = ps + _calibration_offset(position + ':System Sum', path)
+        position_trace = _load_txt_rich(path)
+        pf = position_trace['freq']
+        ps = position_trace['spl'] + _calibration_offset(position + ':System Sum', path)
         measured = np.interp(np.log10(_F), np.log10(pf), ps)
         target = tgt + float(np.median(measured[band] - tgt[band]))
         _POSITION_TRACES[position] = {'system': measured, 'target': target, 'file': str(path)}
@@ -382,6 +608,7 @@ def _init():
         name: tonal_components(_F, _smooth(data['system'] - data['target']), keep)['tonal_masked']
         for name, data in _POSITION_TRACES.items()
     }
+    _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT = _build_complex_models(position_specs)
 
 
 def baseline_band_sets():
@@ -587,36 +814,91 @@ def output_trim_plan(band_sets):
     return {index: trim for index in range(len(CH_KEYS))}
 
 
+def _candidate_transfer(role, band_sets, trim_plan):
+    if role == 'Sub':
+        index = 6
+    elif role in CH_KEYS:
+        index = CH_KEYS.index(role)
+    else:
+        return np.ones_like(_F, dtype=complex)
+    candidate = list(band_sets[index]) if index < len(band_sets) else []
+    baseline = list(_V5[index]) if index < len(_V5) else []
+    denominator = cascade_complex(_F, baseline)
+    transfer = cascade_complex(_F, candidate) / np.where(
+        np.abs(denominator) > 1e-30, denominator, 1.0
+    )
+    return transfer * (10.0 ** (float(trim_plan.get(index, 0.0)) / 20.0))
+
+
+def _model_compatible(model):
+    return (
+        model is not None
+        and len(model.get('baseline_sum', ())) == len(_F)
+        and all(len(meta.get('spl', ())) == len(_F) for meta in model.get('trace_meta', {}).values())
+    )
+
+
+def _predict_complex_model(model, band_sets, trim_plan):
+    candidate_sum = np.zeros_like(_F, dtype=complex)
+    for role in model['roles']:
+        candidate_sum += (
+            _trace_complex(model['trace_meta'][role])
+            * _candidate_transfer(role, band_sets, trim_plan)
+        )
+    predicted_db = 20.0 * np.log10(np.maximum(np.abs(candidate_sum), 1e-30))
+    return predicted_db + model['offset_db'] + model['residual_db']
+
+
+def _predict_position_system(position, band_sets, trim_plan, center_system_delta):
+    model = _POSITION_COMPLEX_MODELS.get(position)
+    if _model_compatible(model):
+        return _predict_complex_model(model, band_sets, trim_plan)
+    return _POSITION_TRACES[position]['system'] + center_system_delta
+
+
 def _predict(band_sets, output_trim_override=None):
-    """band_sets: 8 lists of (F,Q,G). Returns predicted magnitude traces."""
+    """Predict magnitude, using complex sums only after measured validation passes."""
     trim_plan = output_trim_plan(band_sets) if output_trim_override is None else dict(output_trim_override)
     pr = {}
-    for i, k in enumerate(CH_KEYS):
-        pr[k] = _T[k] + (_casc(band_sets[i]) - _BASE_CASCADES[i]) + float(trim_plan.get(i, 0.0))
+    for i, key in enumerate(CH_KEYS):
+        candidate = list(band_sets[i]) if i < len(band_sets) else []
+        pr[key] = _T[key] + (_casc(candidate) - _BASE_CASCADES[i]) + float(trim_plan.get(i, 0.0))
     if len(band_sets) > 6:
         baseline = _BASE_CASCADES[6] if len(_BASE_CASCADES) > 6 else _casc(_V5[6])
         pr['Sub'] = _T['Sub'] + (_casc(band_sets[6]) - baseline) + float(trim_plan.get(6, 0.0))
     else:
         pr['Sub'] = _T['Sub'].copy()
 
-    def ps(a, b):
-        return 10 * np.log10(10 ** (a / 10) + 10 ** (b / 10))
+    def power_sum(a, b):
+        return 10.0 * np.log10(10.0 ** (a / 10.0) + 10.0 ** (b / 10.0))
 
     branch_outputs = []
-    for _name, (left, right, together, _band_range, _balance) in PAIR_SPECS.items():
-        pr[together] = ps(pr[left], pr[right]) + (_T[together] - ps(_T[left], _T[right]))
+    pair_models = _COMPLEX_MODELS.get('pairs', {})
+    for name, (left, right, together, _band_range, _balance) in PAIR_SPECS.items():
+        if name in pair_models and _model_compatible(pair_models[name]):
+            pr[together] = _predict_complex_model(pair_models[name], band_sets, trim_plan)
+        else:
+            incoherent = power_sum(pr[left], pr[right])
+            baseline_incoherent = power_sum(_T[left], _T[right])
+            pr[together] = incoherent + (_T[together] - baseline_incoherent)
         branch_outputs.append(pr[together])
+
+    system_model = _COMPLEX_MODELS.get('system')
+    if _model_compatible(system_model):
+        pr['System Sum'] = _predict_complex_model(system_model, band_sets, trim_plan)
+        pr['_prediction_model'] = 'validated_complex_sum'
+        return pr
 
     old = _T['Sub'].copy()
     for _name, (_left, _right, together, _band_range, _balance) in PAIR_SPECS.items():
-        old = 10 * np.log10(10 ** (old / 10) + 10 ** (_T[together] / 10))
-    rest = np.maximum(10 ** (_T['System Sum'] / 10) - 10 ** (old / 10), 1e-9)
+        old = power_sum(old, _T[together])
+    rest = np.maximum(10.0 ** (_T['System Sum'] / 10.0) - 10.0 ** (old / 10.0), 1e-9)
     new = pr['Sub'].copy()
     for branch in branch_outputs:
-        new = 10 * np.log10(10 ** (new / 10) + 10 ** (branch / 10))
-    pr['System Sum'] = 10 * np.log10(rest + 10 ** (new / 10))
+        new = power_sum(new, branch)
+    pr['System Sum'] = 10.0 * np.log10(rest + 10.0 ** (new / 10.0))
+    pr['_prediction_model'] = 'magnitude_residual_fallback'
     return pr
-
 
 def _changed_band_centers(band_sets):
     """Return frequencies whose hardware-rounded PEQ differs from baseline."""
@@ -674,7 +956,8 @@ def response_audit(band_sets):
     return {
         'anchor_policy': 'target_anchored_once_from_baseline_system_sum',
         'delta_policy': 'candidate_prediction_minus_baseline_prediction_no_reanchoring',
-        'pair_model': 'measured_plus_power_sum_residual',
+        'pair_model': baseline.get('_prediction_model', 'magnitude_residual_fallback'),
+        'complex_validation': _PREDICTION_AUDIT,
         'system_delta_rms_db': round(
             float(np.sqrt(np.mean(system_delta[inband] ** 2))) if np.any(inband) else 0.0,
             4,
@@ -748,20 +1031,28 @@ def _has_fragile_filters(band_sets):
     return False
 
 
-def _spatial_components(pr, band_sets, keep):
-    center_dev = _smooth(pr['System Sum'] - _TGT)
-    center = tonal_components(_F, center_dev, keep)
+def _spatial_components(pr, band_sets, keep, trim_plan=None):
+    trim_plan = {} if trim_plan is None else trim_plan
+    center_raw = pr['System Sum'] - _TGT
+    center_dev = _smooth(center_raw)
+    center_narrow = np.maximum(_fractional_octave_smooth(_F, center_raw, 6), center_raw)
+    center = tonal_components(_F, center_dev, keep, center_narrow)
     tonal_values = [center['tonal_masked']]
     peak_values = [center['peak_penalty_db']]
+    narrow_peak_values = [center['narrow_peak_penalty_db']]
     shape_values = [center['target_shape_error_db']]
     worst_values = [float(np.max(np.abs(center_dev[keep & (_F >= 100) & (_F <= 8000)])))]
     position_tonal = {'center': center['tonal_masked']}
     system_delta = pr['System Sum'] - _T['System Sum']
     for name, data in _POSITION_TRACES.items():
-        dev = _smooth(data['system'] + system_delta - data['target'])
-        parts = tonal_components(_F, dev, keep)
+        position_system = _predict_position_system(name, band_sets, trim_plan, system_delta)
+        raw = position_system - data['target']
+        dev = _smooth(raw)
+        narrow = np.maximum(_fractional_octave_smooth(_F, raw, 6), raw)
+        parts = tonal_components(_F, dev, keep, narrow)
         tonal_values.append(parts['tonal_masked'])
         peak_values.append(parts['peak_penalty_db'])
+        narrow_peak_values.append(parts['narrow_peak_penalty_db'])
         shape_values.append(parts['target_shape_error_db'])
         worst_values.append(float(np.max(np.abs(dev[keep & (_F >= 100) & (_F <= 8000)]))))
         position_tonal[name] = parts['tonal_masked']
@@ -774,6 +1065,10 @@ def _spatial_components(pr, band_sets, keep):
     spatial_peak = (
         0.65 * _weighted_quantile(peak_values, weights, 0.5)
         + 0.35 * max(peak_values)
+    )
+    spatial_narrow_peak = (
+        0.65 * _weighted_quantile(narrow_peak_values, weights, 0.5)
+        + 0.35 * max(narrow_peak_values)
     )
     spatial_shape = (
         0.65 * _weighted_quantile(shape_values, weights, 0.5)
@@ -791,19 +1086,27 @@ def _spatial_components(pr, band_sets, keep):
         if worsenings and max(worsenings) > 0.10:
             fragility += 5.0
             hold_pass = False
+    if not _POSITION_TRACES:
+        spatial_model = 'centre_only'
+    elif len(_POSITION_COMPLEX_MODELS) == len(_POSITION_TRACES):
+        spatial_model = 'validated_complex_per_position'
+    elif _POSITION_COMPLEX_MODELS:
+        spatial_model = 'mixed_complex_and_center_delta'
+    else:
+        spatial_model = 'system_delta'
     return {
         **center,
         'spatial_tonal_db': float(spatial_tonal),
         'spatial_peak_db': float(spatial_peak),
+        'spatial_narrow_peak_db': float(spatial_narrow_peak),
         'target_shape_error_db': float(spatial_shape),
         'spatial_worst_db': float(spatial_worst),
         'spatial_position_count': len(_POSITION_TRACES) + 1,
-        'spatial_model': 'system_delta' if _POSITION_TRACES else 'centre_only',
+        'spatial_model': spatial_model,
         'spatial_position_tonal_db': position_tonal,
         'spatial_fragility_penalty': float(fragility),
         'spatial_hold_pass': hold_pass,
     }
-
 
 def objective(band_sets, output_trim_override=None):
     """The single scalar the optimizer minimizes, plus named components."""
@@ -813,9 +1116,10 @@ def objective(band_sets, output_trim_override=None):
     inb = (_F >= INBAND[0]) & (_F <= INBAND[1])
     keep = inb & ~_NULL_MASK  # nulls MASKED OUT of tonal error + worst-case
 
-    tonal_parts = _spatial_components(pr, band_sets, keep)
+    tonal_parts = _spatial_components(pr, band_sets, keep, trim_plan)
     tonal = tonal_parts['spatial_tonal_db']
     peak = tonal_parts['spatial_peak_db']
+    narrow_peak = tonal_parts['spatial_narrow_peak_db']
     target_shape = tonal_parts['target_shape_error_db']
     worst = tonal_parts['spatial_worst_db']
 
@@ -829,7 +1133,7 @@ def objective(band_sets, output_trim_override=None):
     null_boost = 0.0
     for i in range(len(CH_KEYS)):
         b = _casc(band_sets[i]) + float(trim_plan.get(i, 0.0))
-        head_peak = max(head_peak, round(float(np.max(b)), 2))
+        head_peak = max(head_peak, float(np.max(b)))
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
@@ -843,6 +1147,13 @@ def objective(band_sets, output_trim_override=None):
         'n_front_bands': n_bands,
         'protective_output_trim_db': max(0.0, -min(trim_plan.values())) if trim_plan else 0.0,
         'output_level_gain_db': max(0.0, max(trim_plan.values())) if trim_plan else 0.0,
+        'complex_prediction_active': 1.0 if pr.get('_prediction_model') == 'validated_complex_sum' else 0.0,
+        'complex_pair_count': float(sum(
+            _model_compatible(model) for model in _COMPLEX_MODELS.get('pairs', {}).values()
+        )),
+        'complex_system_validation_rms_db': float(_COMPLEX_MODELS['system']['validation_rms_db'])
+        if _model_compatible(_COMPLEX_MODELS.get('system')) else 0.0,
+        'complex_position_count': float(len(_POSITION_COMPLEX_MODELS)),
     }
     if 'low' in balances:
         comp['low_balance'] = balances['low']['bias_db']
@@ -867,6 +1178,7 @@ def objective(band_sets, output_trim_override=None):
     scalar = (W['tonal'] * tonal
               + W['target_shape'] * target_shape
               + W['peak'] * peak
+              + W['narrow_peak'] * narrow_peak
               + balance_term
               + W['worst'] * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
@@ -888,6 +1200,11 @@ def score_bands(band_sets):
     return objective(band_sets)
 
 
+def prediction_audit():
+    _init()
+    return dict(_PREDICTION_AUDIT)
+
+
 def cache_stats():
     info = _cached_peaking.cache_info()
     return {
@@ -895,6 +1212,9 @@ def cache_stats():
         'peaking_misses': info.misses,
         'peaking_entries': info.currsize,
         'spatial_positions': sorted(_POSITION_TRACES),
+        'complex_pairs': sorted(_COMPLEX_MODELS.get('pairs', {})),
+        'complex_system': _model_compatible(_COMPLEX_MODELS.get('system')),
+        'complex_positions': sorted(_POSITION_COMPLEX_MODELS),
     }
 
 
