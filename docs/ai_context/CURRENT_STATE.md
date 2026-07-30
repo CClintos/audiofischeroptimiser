@@ -101,7 +101,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.4.4` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.4.5` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
@@ -131,6 +131,19 @@ record.
   objective from overlooking a deliberate local target contour.
 - L/R evidence comes from solo traces and combines signed bias with weighted
   absolute/RMS mismatch, so opposite errors cannot cancel in the score.
+- One-sided cuts require a dominant one-sign L/R offset over +/- one octave;
+  more than one sign reversal is classified as alternating comb/aiming evidence
+  and hard-rejected.
+- A one-sided cut cannot deepen a System Sum region that is already below the
+  fixed target. Imaging corrections are weighted primarily from 500 Hz to
+  8 kHz and heavily de-weighted below 400 Hz.
+- New filters must clear 2.5 times the reported local same-rig MMM repeatability
+  floor. Crossover peaks are evaluated as upper-driver-only, lower-driver-only,
+  and whole-front candidates before selection.
+- When optional Together traces are synthesized from solos, candidate branch
+  deltas are applied to the authoritative measured System Sum. The untouched
+  baseline therefore reproduces the measurement exactly even when solo and
+  System Sum captures have different absolute levels.
 - Destructive summation/nulls earn no tonal reward.
 - Penalize positive gain/headroom, wasted or inert filters, unsupported
   asymmetry, deep/narrow corrections, and filter count.
@@ -213,7 +226,7 @@ record.
 
 ## Verified State
 
-- Seventy-four regression tests pass, including objective/target-shape invariants,
+- Eighty-one regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.

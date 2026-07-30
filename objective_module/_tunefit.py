@@ -121,6 +121,133 @@ def audibility_weight(freqs):
     w[hi] = 1.0 - 0.6 * (np.log2(freqs[hi] / 6000.0) / np.log2(16000.0 / 6000.0))
     return np.clip(w, 0.3, 1.0)
 
+
+# --------------------------------------------------------------------------
+# Measurement-repeatability and imaging guardrails.
+#
+# This schedule is deliberately explicit and reportable.  It is based on the
+# same-rig MMM repeatability audit supplied for this optimizer, rather than a
+# claim that every microphone/session has the same noise floor.
+MEASUREMENT_NOISE_MODEL_ID = "user_supplied_mmm_repeatability_v1"
+MEASUREMENT_NOISE_MULTIPLIER = 2.5
+
+
+def measurement_noise_floor_db(freqs, branch="low"):
+    """Return the assumed one-sigma-ish local repeatability floor in dB.
+
+    Low/mid follows the audited rig: about 0.1 dB at 400-500 Hz, rising
+    through 0.6-1.0 dB at 700-1400 Hz and to 1.6 dB above 2 kHz.  Tweeters use
+    the separately measured 0.23-0.46 dB range.  Interpolation is logarithmic
+    in frequency and clamps outside the calibration points.
+    """
+    f = np.maximum(np.asarray(freqs, dtype=float), 1.0)
+    if str(branch).lower() in {"high", "tweeter", "tweeters"}:
+        xp = np.array([1800.0, 3000.0, 6000.0, 10000.0, 16000.0])
+        yp = np.array([0.23, 0.27, 0.34, 0.41, 0.46])
+    else:
+        xp = np.array([200.0, 400.0, 500.0, 700.0, 1400.0, 2200.0, 5000.0])
+        yp = np.array([0.20, 0.10, 0.10, 0.60, 1.00, 1.60, 1.60])
+    return np.interp(np.log10(f), np.log10(xp), yp)
+
+
+def imaging_balance_weight(freqs):
+    """Frequency importance for corrections justified only by L/R imaging.
+
+    Below 400 Hz the car-cabin wavelength makes small interaural magnitude
+    differences weak localization evidence.  The weight rises rapidly into
+    the 500 Hz-8 kHz imaging band and tapers gently above it.
+    """
+    f = np.maximum(np.asarray(freqs, dtype=float), 1.0)
+    xp = np.array([100.0, 250.0, 300.0, 400.0, 500.0, 8000.0, 16000.0])
+    yp = np.array([0.00, 0.00, 0.03, 0.12, 1.00, 1.00, 0.55])
+    return np.interp(np.log10(f), np.log10(xp), yp)
+
+
+def signed_offset_evidence(freqs, difference_db, center_hz, branch="low",
+                           multiplier=MEASUREMENT_NOISE_MULTIPLIER):
+    """Classify broad L/R offset evidence over +/- one octave.
+
+    The already-smoothed L-minus-R trace is sampled on a fixed log grid so
+    dense REW exports do not inflate the sign-change count.  Values inside the
+    local measurement floor are treated as indeterminate.  An eligible offset
+    must retain one dominant sign, change sign at most once, and clear the
+    local repeatability floor by ``multiplier``.
+    """
+    f = np.asarray(freqs, dtype=float)
+    d = np.asarray(difference_db, dtype=float)
+    center = float(center_hz)
+    valid = np.isfinite(f) & np.isfinite(d) & (f > 0.0)
+    if np.count_nonzero(valid) < 3 or center <= 0.0:
+        return {
+            "eligible": False,
+            "reason": "insufficient_lr_data",
+            "sign_changes": 0,
+            "dominant_sign_fraction": 0.0,
+            "offset_db": 0.0,
+            "noise_floor_db": float(measurement_noise_floor_db([center], branch)[0]),
+            "required_deviation_db": float(
+                multiplier * measurement_noise_floor_db([center], branch)[0]
+            ),
+        }
+    fv = f[valid]
+    dv = d[valid]
+    order = np.argsort(fv)
+    fv = fv[order]
+    dv = dv[order]
+    lo = max(float(fv[0]), center / 2.0)
+    hi = min(float(fv[-1]), center * 2.0)
+    if hi <= lo:
+        sample_f = np.array([center])
+    else:
+        sample_f = np.geomspace(lo, hi, 13)
+    sample_d = np.interp(np.log10(sample_f), np.log10(fv), dv)
+    sample_floor = measurement_noise_floor_db(sample_f, branch)
+    signs = np.sign(np.where(np.abs(sample_d) >= sample_floor, sample_d, 0.0))
+    nonzero = signs[signs != 0.0]
+    sign_changes = int(np.count_nonzero(nonzero[1:] != nonzero[:-1])) if len(nonzero) > 1 else 0
+    dominant_fraction = (
+        float(max(np.count_nonzero(nonzero > 0.0), np.count_nonzero(nonzero < 0.0)) / len(nonzero))
+        if len(nonzero) else 0.0
+    )
+    offset = float(np.median(sample_d))
+    floor = float(measurement_noise_floor_db([center], branch)[0])
+    required = float(multiplier * floor)
+    if sign_changes > 1:
+        reason = "alternating_lr_comb"
+    elif dominant_fraction < 0.75:
+        reason = "lr_offset_not_systematic"
+    elif abs(offset) < required:
+        reason = "below_measurement_noise_threshold"
+    else:
+        reason = "systematic_lr_offset"
+    return {
+        "eligible": reason == "systematic_lr_offset",
+        "reason": reason,
+        "sign_changes": sign_changes,
+        "dominant_sign_fraction": dominant_fraction,
+        "offset_db": offset,
+        "noise_floor_db": floor,
+        "required_deviation_db": required,
+    }
+
+
+def measurement_noise_model():
+    """Serializable description included in optimizer and PDF reports."""
+    return {
+        "id": MEASUREMENT_NOISE_MODEL_ID,
+        "required_multiplier": MEASUREMENT_NOISE_MULTIPLIER,
+        "midbass": [
+            {"range_hz": "400-500", "floor_db": "0.10"},
+            {"range_hz": "700-1400", "floor_db": "0.60-1.00"},
+            {"range_hz": "2200+", "floor_db": "1.60"},
+        ],
+        "tweeter": [{"range_hz": "1800-16000", "floor_db": "0.23-0.46"}],
+        "note": (
+            "A new filter must address a repeatable deviation at least 2.5 times "
+            "the local same-rig MMM floor."
+        ),
+    }
+
 def audibility_score(freqs, dev_db, band=(60.0, 16000.0), mask=None, conf=None):
     """One number for 'how audibly wrong is this curve' (lower = better).
     ERB-smooth first (what the ear integrates), weight by sensitivity, RMS.

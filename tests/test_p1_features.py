@@ -152,6 +152,29 @@ class BeamSearchTests(unittest.TestCase):
         self.assertGreater(candidates[0]["G"], 0.0)
         self.assertLessEqual(candidates[0]["Q"], 1.8)
 
+    def test_crossover_peak_is_offered_to_all_three_channel_scopes(self) -> None:
+        freqs = np.geomspace(200.0, 8000.0, 768)
+        flat = np.full_like(freqs, 60.0)
+        inactive = np.full_like(freqs, -100.0)
+        pair = optimizer.power_sum_db([flat, flat])
+        base_system = optimizer.power_sum_db([pair, pair, inactive])
+        peak = 6.0 * np.exp(-0.5 * (np.log2(freqs / 2650.0) / 0.16) ** 2)
+        traces = {
+            "FL High": flat, "FR High": flat,
+            "FL Low": flat, "FR Low": flat,
+            "Tweeters Together": pair, "Mid Bass Together": pair,
+            "Sub": inactive, "System Sum": base_system + peak,
+        }
+
+        pools = stream.find_guided_candidates(freqs, traces, base_system, "safe")
+
+        for group in ("high_crossover_sym", "low_crossover_sym", "front_voicing"):
+            cuts = [
+                candidate for candidate in pools[group]
+                if 2400.0 <= candidate["F"] <= 2900.0 and candidate["G"] < 0.0
+            ]
+            self.assertTrue(cuts, group)
+
     def test_beam_is_deterministic_and_keeps_best_partial_combination(self) -> None:
         first_group = next(iter(optimizer.GROUPS))
         pools = {name: [] for name in optimizer.GROUPS}

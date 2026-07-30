@@ -191,13 +191,14 @@ def find_guided_candidates(freqs, traces, target, profile: str):
     Destructive-summing zones from the together-vs-solo audit are masked from
     tonal candidate generation so PEQ is not asked to fix phase.
     """
-    system_dev = opt.erb_smooth(freqs, traces["System Sum"] - target)
+    raw_system_dev = traces["System Sum"] - target
+    system_dev = opt.erb_smooth(freqs, raw_system_dev)
     masks = interference_masks(freqs, traces)
     audible = opt.audibility_weight(freqs)
     vocal = np.ones_like(freqs)
     vocal[(freqs >= 200.0) & (freqs <= 6000.0)] = 1.8
     peak_mult = np.where(system_dev > 0.0, 2.0, 0.75)
-    balance_w = audible.copy()
+    balance_w = audible * opt.imaging_balance_weight(freqs)
     balance_w[(freqs >= 700.0) & (freqs <= 5000.0)] *= 1.8
     pools = {}
     for group, cfg in opt.GROUPS.items():
@@ -205,7 +206,18 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         q_range = cfg["q_range"]
         gain_range = cfg["gain_range"]
         contribution = branch_contribution(freqs, traces, group)
-        active_driver = contribution >= (10 ** (-6.0 / 10.0))
+        # Near a crossover, keep even a weak branch in the comparison so the
+        # scorer can explicitly choose tweeters, mids/midbass, or both.  A
+        # weak branch still pays the authoritative driver-share penalty.
+        active_limit_db = -24.0 if cfg.get("crossover_scope") else -6.0
+        active_driver = (
+            np.ones_like(contribution, dtype=bool)
+            if cfg.get("crossover_scope")
+            else contribution >= (10 ** (active_limit_db / 10.0))
+        )
+        candidate_contribution = (
+            np.maximum(contribution, 0.25) if cfg.get("crossover_scope") else contribution
+        )
         candidates = []
         if cfg.get("system_transfer"):
             anchor_sel = (
@@ -219,14 +231,59 @@ def find_guided_candidates(freqs, traces, target, profile: str):
             tonal_gain = -0.90 * shape_dev / np.maximum(contribution, 0.55)
             tonal_source = "target_shape"
         else:
-            tonal_strength = np.abs(system_dev) * contribution * audible * vocal * peak_mult
+            tonal_strength = np.abs(system_dev) * candidate_contribution * audible * vocal * peak_mult
             tonal_gain = -0.65 * system_dev / np.maximum(contribution, 0.35)
             tonal_source = "tonal"
         tonal_strength[masks.get(group, False)] = 0.0
         tonal_strength[~active_driver] = 0.0
-        candidates.extend(candidate_peaks(
+        tonal_candidates = candidate_peaks(
             freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, tonal_source, profile
-        ))
+        )
+        guarded_tonal = []
+        for candidate in tonal_candidates:
+            center = float(candidate["F"])
+            branch = str(cfg.get("branch", "low"))
+            noise_branch = "high" if branch == "front" and center >= 1800.0 else branch
+            deviation_curve = shape_dev if cfg.get("system_transfer") else system_dev
+            target_deviation = float(np.interp(
+                np.log10(center),
+                np.log10(freqs),
+                raw_system_dev if cfg.get("crossover_scope") else deviation_curve,
+            ))
+            floor = float(opt.measurement_noise_floor_db([center], noise_branch)[0])
+            required = float(opt.MEASUREMENT_NOISE_MULTIPLIER * floor)
+            if abs(target_deviation) < required:
+                continue
+            if cfg.get("pair") and cfg.get("side") and candidate["G"] < 0.0:
+                pair = opt.PAIR_DEFS[cfg["pair"]]
+                diff = opt.erb_smooth(
+                    freqs, traces[pair["left"]] - traces[pair["right"]]
+                )
+                evidence = opt.signed_offset_evidence(
+                    freqs, diff, center, cfg.get("branch", "low")
+                )
+                imaging_weight = float(opt.imaging_balance_weight([center])[0])
+                hot_side_matches = (
+                    (cfg["side"] == "left" and evidence["offset_db"] > 0.0)
+                    or (cfg["side"] == "right" and evidence["offset_db"] < 0.0)
+                )
+                absolute_system_deviation = float(np.interp(
+                    np.log10(center), np.log10(freqs), system_dev
+                ))
+                if (
+                    not evidence["eligible"]
+                    or imaging_weight < 0.5
+                    or absolute_system_deviation < 0.0
+                    or not hot_side_matches
+                ):
+                    continue
+            candidate.update({
+                "target_deviation_db": target_deviation,
+                "noise_floor_db": floor,
+                "required_deviation_db": required,
+            })
+            guarded_tonal.append(candidate)
+        candidates.extend(guarded_tonal)
 
         if cfg.get("pair") and cfg.get("side"):
             pair = opt.PAIR_DEFS[cfg["pair"]]
@@ -239,21 +296,95 @@ def find_guided_candidates(freqs, traces, target, profile: str):
             bal_strength[~active_driver] = 0.0
             blo, bhi = pair["balance_band"]
             bal_strength[(freqs < blo) | (freqs > bhi)] = 0.0
-            candidates.extend(candidate_peaks(
+            balance_candidates = candidate_peaks(
                 freqs, bal_strength, bal_gain, lo, hi, q_range, gain_range, "balance", profile
-            ))
+            )
+            guarded_balance = []
+            for candidate in balance_candidates:
+                evidence = opt.signed_offset_evidence(
+                    freqs, diff, candidate["F"], cfg.get("branch", "low")
+                )
+                system_at_center = float(np.interp(
+                    np.log10(candidate["F"]), np.log10(freqs), system_dev
+                ))
+                if not evidence["eligible"]:
+                    continue
+                if candidate["G"] < 0.0 and system_at_center < 0.0:
+                    continue
+                candidate.update({
+                    "lr_offset_db": float(evidence["offset_db"]),
+                    "lr_sign_changes": int(evidence["sign_changes"]),
+                    "noise_floor_db": float(evidence["noise_floor_db"]),
+                    "required_deviation_db": float(evidence["required_deviation_db"]),
+                    "system_deviation_db": system_at_center,
+                })
+                guarded_balance.append(candidate)
+            candidates.extend(guarded_balance)
 
         candidates.sort(key=lambda c: -c["strength"])
         deduped = []
         for c in candidates:
             if all(abs(math.log2(c["F"] / d["F"])) >= 1 / 8 or c["source"] != d["source"] for d in deduped):
                 c["branch_share"] = float(np.interp(np.log10(c["F"]), np.log10(freqs), contribution))
-                if c["branch_share"] < 10 ** (-6.0 / 10.0):
+                if (
+                    not cfg.get("crossover_scope")
+                    and c["branch_share"] < 10 ** (active_limit_db / 10.0)
+                ):
                     continue
                 deduped.append(c)
             if len(deduped) >= 14:
                 break
         pools[group] = deduped
+
+    # Use one common crossover centre to make the scope comparison real:
+    # tweeters only, mids/midbass only, and the whole front stage.  Alternate
+    # scopes remain candidates even when their branch-specific noise evidence
+    # is weak; the authoritative scorer then rejects them rather than silently
+    # skipping the requested comparison.
+    high_scope = pools.get("high_crossover_sym", [])
+    crossover_seeds = [
+        candidate for candidate in high_scope
+        if 1800.0 <= candidate["F"] <= 3500.0 and candidate["G"] < 0.0
+    ]
+    if crossover_seeds:
+        seed = max(crossover_seeds, key=lambda item: item["strength"])
+        for group in ("front_voicing", "mid_crossover_sym", "low_crossover_sym"):
+            if group not in pools:
+                continue
+            cfg = opt.GROUPS[group]
+            branch = str(cfg.get("branch", "low"))
+            noise_branch = "high" if branch == "front" else branch
+            qlo, qhi = cfg["q_range"]
+            glo, ghi = cfg["gain_range"]
+            band = opt.rounded_band(
+                seed["F"],
+                float(np.clip(seed["Q"], qlo, qhi)),
+                float(np.clip(seed["G"], glo, ghi)),
+            )
+            if band is None:
+                continue
+            center, q_value, gain = band
+            if any(abs(math.log2(center / item["F"])) < 1 / 48 for item in pools[group]):
+                continue
+            contribution = branch_contribution(freqs, traces, group)
+            floor = float(opt.measurement_noise_floor_db([center], noise_branch)[0])
+            pools[group].append({
+                "F": float(center),
+                "Q": float(q_value),
+                "G": float(gain),
+                "strength": float(seed["strength"]),
+                "width_oct": float(seed["width_oct"]),
+                "branch_share": float(np.interp(
+                    np.log10(center), np.log10(freqs), contribution
+                )),
+                "source": "crossover_scope",
+                "target_deviation_db": float(np.interp(
+                    np.log10(center), np.log10(freqs), raw_system_dev
+                )),
+                "noise_floor_db": floor,
+                "required_deviation_db": float(opt.MEASUREMENT_NOISE_MULTIPLIER * floor),
+            })
+            pools[group].sort(key=lambda item: -item["strength"])
     return pools
 
 

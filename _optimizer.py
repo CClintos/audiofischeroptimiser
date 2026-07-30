@@ -74,10 +74,15 @@ from _tunefit import (
     excess_gd_mask,
     gate_low_frequency_limit,
     headroom_report,
+    imaging_balance_weight,
     interference_audit,
     LOGSTEP,
+    measurement_noise_model,
+    measurement_noise_floor_db,
+    MEASUREMENT_NOISE_MULTIPLIER,
     phase_linearity_residual,
     peaking_db,
+    signed_offset_evidence,
     ms_to_samples,
     optimize_allpass,
     polarity_delay_search,
@@ -264,6 +269,16 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
             "gain_range": gain_sym,
             "max_bands": 2 if explore else 1,
         },
+        "high_crossover_sym": {
+            "channels": (0, 1),
+            "branch": "high",
+            "symmetric_tweeter": True,
+            "crossover_scope": True,
+            "range": (1800.0, 6000.0),
+            "q_range": (0.5, 3.0),
+            "gain_range": gain_sym,
+            "max_bands": 1,
+        },
         "fl_high": {
             "channels": (0,),
             "branch": "high",
@@ -289,6 +304,15 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
     }
     if layout == "3way":
         groups.update({
+            "mid_crossover_sym": {
+                "channels": (2, 3),
+                "branch": "mid",
+                "crossover_scope": True,
+                "range": (1300.0, 6000.0),
+                "q_range": (0.5, 3.0),
+                "gain_range": gain_sym,
+                "max_bands": 1,
+            },
             "mid_sym": {
                 "channels": (2, 3),
                 "branch": "mid",
@@ -352,6 +376,15 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
         })
     else:
         groups.update({
+            "low_crossover_sym": {
+                "channels": (2, 3),
+                "branch": "low",
+                "crossover_scope": True,
+                "range": (1300.0, 3500.0),
+                "q_range": (0.5, 3.0),
+                "gain_range": gain_sym,
+                "max_bands": 1,
+            },
             "low_sym": {
                 "channels": (2, 3),
                 "branch": "low",
@@ -2581,6 +2614,7 @@ def write_report(
         },
         "validation": getattr(args, "validation", []),
         "measurement_session": getattr(args, "measurement_session", {}),
+        "measurement_noise_guard": measurement_noise_model(),
         "phase_diagnostic_cache": getattr(args, "phase_diagnostic_cache", {}),
         "objective_cache": (
             AFPX_OBJECTIVE.cache_stats()
@@ -2607,6 +2641,11 @@ def write_report(
         "peak_penalty_db", "narrow_peak_penalty_db", "balance_penalty_db", "low_balance_rms_db",
         "mid_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
         "filter_count", "guardrail_penalty", "center_tonal_error_db",
+        "balance_guardrail_penalty", "balance_guardrail_violation_count",
+        "measurement_noise_guardrail_penalty",
+        "alternating_lr_comb_violation_count", "summed_hole_violation_count",
+        "noise_floor_violation_count", "low_frequency_imaging_violation_count",
+        "filter_noise_floor_violation_count",
         "spatial_tonal_db", "spatial_peak_db", "spatial_narrow_peak_db", "spatial_worst_db",
         "spatial_fragility_penalty", "spatial_position_count",
         "complex_prediction_active", "complex_pair_count",
@@ -2677,6 +2716,7 @@ def write_report(
             "measurement_session": compact_session,
             "pair_validation": getattr(args, "validation", []),
             "phase_diagnostic_cache": getattr(args, "phase_diagnostic_cache", {}),
+            "measurement_noise_guard": measurement_noise_model(),
         },
         "baseline": baseline_core,
         "baseline_position_tonal_db": base_components.get("spatial_position_tonal_db", {}),

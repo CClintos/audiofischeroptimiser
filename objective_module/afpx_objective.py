@@ -53,8 +53,12 @@ from _tunefit import (
     cascade_complex,
     erb_hz,
     erb_smooth,
+    imaging_balance_weight,
     interference_audit,
+    MEASUREMENT_NOISE_MULTIPLIER,
+    measurement_noise_floor_db,
     peaking_db,
+    signed_offset_evidence,
 )
 
 # ---- config ---------------------------------------------------------------
@@ -323,7 +327,7 @@ def balance_components(freqs, difference_db, band):
     selected = (freqs >= band[0]) & (freqs <= band[1]) & np.isfinite(diff)
     if not np.any(selected):
         return {'bias_db': 0.0, 'mismatch_rms_db': 0.0, 'mismatch_abs_db': 0.0}
-    weights = perceptual_weights(freqs)
+    weights = perceptual_weights(freqs) * imaging_balance_weight(freqs)
     w = weights[selected]
     d = diff[selected]
     return {
@@ -787,7 +791,7 @@ def _asymmetry_penalty(band_sets, total=None):
     return penalty
 
 
-def _guardrail_score(band_sets):
+def _guardrail_score(band_sets, predicted=None):
     added = _added_bands_by_channel(band_sets)
     matched_front = _matched_front_keys(added)
     matched_seen = set()
@@ -798,6 +802,19 @@ def _guardrail_score(band_sets):
     boost_q = 0.0
     n_added = 0
     worst_share = None
+    balance_guard = 0.0
+    measurement_guard = 0.0
+    balance_violations = 0
+    alternating_violations = 0
+    sum_hole_violations = 0
+    noise_floor_violations = 0
+    low_frequency_violations = 0
+    filter_noise_violations = 0
+    pair_by_channel = {}
+    for pair_name, (left, right, _together, _pair_range, _balance_band) in PAIR_SPECS.items():
+        if left in CH_KEYS and right in CH_KEYS:
+            pair_by_channel[CH_KEYS.index(left)] = (pair_name, left, right, CH_KEYS.index(right), "left")
+            pair_by_channel[CH_KEYS.index(right)] = (pair_name, left, right, CH_KEYS.index(left), "right")
     for i, bands in added.items():
         channel_key = CH_KEYS[i]
         for f, q, g in bands:
@@ -808,6 +825,51 @@ def _guardrail_score(band_sets):
             matched_seen.add(key)
             n_added += 1
             shape += 0.012 * abs(g) * q
+            noise_branch = "high" if channel_key.endswith("High") else (
+                "mid" if channel_key.endswith("Mid") else "low"
+            )
+            local_floor = float(measurement_noise_floor_db([f], noise_branch)[0])
+            required_deviation = MEASUREMENT_NOISE_MULTIPLIER * local_floor
+            system_deviation_at_filter = abs(_interp_at(_T['System Sum'] - _TGT, f))
+            predicted_effect = (
+                abs(_interp_at(predicted['System Sum'] - _T['System Sum'], f))
+                if predicted is not None else system_deviation_at_filter
+            )
+            if min(system_deviation_at_filter, predicted_effect) < required_deviation:
+                filter_noise_violations += 1
+                measurement_guard += 1000.0
+            peer = pair_by_channel.get(i)
+            peer_added = added.get(peer[3], []) if peer else []
+            pair_symmetric = any(_band_key(other) == key for other in peer_added)
+            if g < 0.0 and peer and not pair_symmetric:
+                pair_name, left, right, _peer_index, side = peer
+                branch = "high" if pair_name == "high" else pair_name
+                diff = _smooth(_T[left] - _T[right])
+                evidence = signed_offset_evidence(_F, diff, f, branch)
+                system_deviation = _interp_at(_T['System Sum'] - _TGT, f)
+                imaging_weight = float(imaging_balance_weight([f])[0])
+                hot_side_matches = (
+                    (side == "left" and evidence["offset_db"] > 0.0)
+                    or (side == "right" and evidence["offset_db"] < 0.0)
+                )
+                reasons = []
+                if not evidence["eligible"]:
+                    reasons.append(evidence["reason"])
+                if evidence["reason"] == "alternating_lr_comb":
+                    alternating_violations += 1
+                if evidence["reason"] == "below_measurement_noise_threshold":
+                    noise_floor_violations += 1
+                if system_deviation < 0.0:
+                    reasons.append("summed_response_below_target")
+                    sum_hole_violations += 1
+                if imaging_weight < 0.5:
+                    reasons.append("imaging_frequency_too_low")
+                    low_frequency_violations += 1
+                if not hot_side_matches:
+                    reasons.append("cut_not_on_systematically_hotter_side")
+                if reasons:
+                    balance_violations += 1
+                    balance_guard += 1000.0
             if g > 0.0 and q > 1.8:
                 boost_q += 0.08 * g * q * (1.0 + max(0.0, q - 2.0))
             needs_solo_proof = g < -4.0 or q > 2.5
@@ -821,7 +883,10 @@ def _guardrail_score(band_sets):
                 wasted += 0.18 * (-6.0 - share) * (0.5 + abs(g) / 4.0)
     asym = _asymmetry_penalty(band_sets, total_db)
     parsimony = W['added_band'] * n_added
-    total = shape + unsupported + wasted + boost_q + asym + parsimony
+    total = (
+        shape + unsupported + wasted + boost_q + asym + parsimony
+        + balance_guard + measurement_guard
+    )
     return {
         'guardrail_penalty': float(total),
         'shape_penalty': float(shape),
@@ -830,6 +895,14 @@ def _guardrail_score(band_sets):
         'asymmetric_eq_penalty': float(asym),
         'high_q_boost_penalty': float(boost_q),
         'added_band_penalty': float(parsimony),
+        'balance_guardrail_penalty': float(balance_guard),
+        'measurement_noise_guardrail_penalty': float(measurement_guard),
+        'balance_guardrail_violation_count': int(balance_violations),
+        'alternating_lr_comb_violation_count': int(alternating_violations),
+        'summed_hole_violation_count': int(sum_hole_violations),
+        'noise_floor_violation_count': int(noise_floor_violations),
+        'filter_noise_floor_violation_count': int(filter_noise_violations),
+        'low_frequency_imaging_violation_count': int(low_frequency_violations),
         'n_added_front_bands': n_added,
         'n_matched_front_voicing_bands': len(matched_front),
         'worst_driver_share_db': float(worst_share if worst_share is not None else 0.0),
@@ -940,11 +1013,23 @@ def _predict(band_sets, output_trim_override=None):
     old = _T['Sub'].copy()
     for _name, (_left, _right, together, _band_range, _balance) in PAIR_SPECS.items():
         old = power_sum(old, _T[together])
-    rest = np.maximum(10.0 ** (_T['System Sum'] / 10.0) - 10.0 ** (old / 10.0), 1e-9)
     new = pr['Sub'].copy()
     for branch in branch_outputs:
         new = power_sum(new, branch)
-    pr['System Sum'] = 10.0 * np.log10(rest + 10.0 ** (new / 10.0))
+    if _SYNTHETIC_PAIRS:
+        # Optional Together traces are synthesized from the solo drivers.  Their
+        # absolute capture level need not match the separately measured System
+        # Sum, so an inferred positive-power residual may not exist.  Apply only
+        # the modelled branch delta to the authoritative measured System Sum;
+        # this keeps the untouched baseline exact and prevents a magnitude-only
+        # cut from appearing to raise total output.
+        pr['System Sum'] = _T['System Sum'] + (new - old)
+    else:
+        rest = np.maximum(
+            10.0 ** (_T['System Sum'] / 10.0) - 10.0 ** (old / 10.0),
+            1e-9,
+        )
+        pr['System Sum'] = 10.0 * np.log10(rest + 10.0 ** (new / 10.0))
     pr['_prediction_model'] = 'magnitude_residual_fallback'
     return pr
 
@@ -1193,7 +1278,7 @@ def objective(band_sets, output_trim_override=None):
         null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
-    guard = _guardrail_score(band_sets)
+    guard = _guardrail_score(band_sets, pr)
 
     comp = {
         **tonal_parts,

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import numpy as np
 
 import _tunefit as public_tunefit
+import _optimizer as optimizer
 from objective_module import _tunefit as canonical_tunefit
 from objective_module import afpx_objective as objective
 from objective_module.session import ScorerSession
@@ -55,6 +56,87 @@ class PerceptualObjectiveTests(unittest.TestCase):
         self.assertGreater(float(np.max(narrow)), float(np.max(broad)))
         self.assertGreater(parts["narrow_peak_penalty_db"], 0.0)
         self.assertGreater(parts["narrow_peak_max_db"], 2.0)
+
+
+class BalanceGuardrailTests(unittest.TestCase):
+    def test_alternating_lr_comb_is_not_a_correctable_offset(self) -> None:
+        freqs = np.array([700.0, 800.0, 900.0, 1100.0, 1128.0, 1200.0, 1400.0])
+        difference = np.array([-1.4, -1.3, 2.7, 2.9, 3.6, 2.9, -2.3])
+
+        evidence = canonical_tunefit.signed_offset_evidence(
+            freqs, difference, 1128.0, "low"
+        )
+
+        self.assertFalse(evidence["eligible"])
+        self.assertEqual(evidence["reason"], "alternating_lr_comb")
+        self.assertGreater(evidence["sign_changes"], 1)
+
+    def test_broad_one_sign_offset_must_clear_local_floor(self) -> None:
+        freqs = np.geomspace(500.0, 2000.0, 64)
+        systematic = canonical_tunefit.signed_offset_evidence(
+            freqs, np.full_like(freqs, 3.0), 1128.0, "low"
+        )
+        below_floor = canonical_tunefit.signed_offset_evidence(
+            freqs, np.full_like(freqs, 0.7), 1128.0, "low"
+        )
+
+        self.assertTrue(systematic["eligible"])
+        self.assertEqual(systematic["sign_changes"], 0)
+        self.assertFalse(below_floor["eligible"])
+        self.assertEqual(below_floor["reason"], "below_measurement_noise_threshold")
+        self.assertGreater(below_floor["required_deviation_db"], 0.7)
+
+    def test_imaging_balance_is_heavily_deweighted_below_400_hz(self) -> None:
+        low, imaging = canonical_tunefit.imaging_balance_weight([270.0, 1000.0])
+        self.assertLess(low, 0.05)
+        self.assertAlmostEqual(imaging, 1.0, places=10)
+
+    def test_crossover_groups_offer_tweeters_mids_and_both_scopes(self) -> None:
+        groups = optimizer.groups_for_layout("2way")
+        self.assertEqual(groups["high_crossover_sym"]["channels"], (0, 1))
+        self.assertEqual(groups["low_crossover_sym"]["channels"], (2, 3))
+        self.assertEqual(groups["front_voicing"]["channels"], (0, 1, 2, 3))
+        for name in ("high_crossover_sym", "low_crossover_sym", "front_voicing"):
+            lo, hi = groups[name]["range"]
+            self.assertLessEqual(lo, 2650.0)
+            self.assertGreaterEqual(hi, 2650.0)
+
+    def test_symmetric_tweeter_cut_near_crossover_is_not_balance_blocked(self) -> None:
+        freqs = np.geomspace(200.0, 16000.0, 512)
+        target = np.full_like(freqs, 60.0)
+        peak = 2.0 * np.exp(-0.5 * (np.log2(freqs / 2650.0) / 0.20) ** 2)
+        system = target + peak
+        flat = np.full_like(freqs, 60.0)
+        traces = {
+            "FL High": flat,
+            "FR High": flat,
+            "FL Low": flat,
+            "FR Low": flat,
+            "Tweeters Together": flat,
+            "Mid Bass Together": flat,
+            "System Sum": system,
+            "Sub": np.full_like(freqs, -100.0),
+        }
+        candidate = [[] for _ in range(8)]
+        candidate[0] = [(2650.0, 2.0, -1.5)]
+        candidate[1] = [(2650.0, 2.0, -1.5)]
+        with patch.multiple(
+            objective,
+            _F=freqs,
+            _T=traces,
+            _TGT=target,
+            _V5=[[] for _ in range(8)],
+            _BASE_CASCADES=[np.zeros_like(freqs) for _ in range(8)],
+            _TOTAL_DB=system,
+            _SMOOTH_T={},
+            _SMOOTHER=None,
+            CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+        ):
+            guard = objective._guardrail_score(candidate)
+
+        self.assertEqual(guard["balance_guardrail_violation_count"], 0)
+        self.assertEqual(guard["filter_noise_floor_violation_count"], 0)
+        self.assertEqual(guard["balance_guardrail_penalty"], 0.0)
 
 
 class ComplexPredictionGateTests(unittest.TestCase):
@@ -123,6 +205,46 @@ class ComplexPredictionGateTests(unittest.TestCase):
             )
         self.assertIsNone(model)
         self.assertIn("exceeds", reason)
+
+
+class SyntheticPairFallbackTests(unittest.TestCase):
+    def test_synthetic_pairs_preserve_measured_baseline_and_cut_cannot_raise_sum(self) -> None:
+        freqs = np.geomspace(500.0, 5000.0, 128)
+        high = np.full_like(freqs, 70.0)
+        low = np.full_like(freqs, 68.0)
+        sub = np.full_like(freqs, 55.0)
+        high_pair = 10.0 * np.log10(2.0 * 10.0 ** (high / 10.0))
+        low_pair = 10.0 * np.log10(2.0 * 10.0 ** (low / 10.0))
+        measured_system = np.full_like(freqs, 66.0)
+        traces = {
+            "FL High": high, "FR High": high,
+            "FL Low": low, "FR Low": low,
+            "Tweeters Together": high_pair,
+            "Mid Bass Together": low_pair,
+            "Sub": sub,
+            "System Sum": measured_system,
+        }
+        baseline = [[] for _ in range(8)]
+        candidate = [[] for _ in range(8)]
+        candidate[0] = [(2500.0, 2.0, -2.0)]
+        candidate[1] = [(2500.0, 2.0, -2.0)]
+        with patch.multiple(
+            objective,
+            _F=freqs,
+            _T=traces,
+            _V5=baseline,
+            _BASE_CASCADES=[np.zeros_like(freqs) for _ in range(8)],
+            _BASE_OUTPUT_DB=[0.0] * 8,
+            _COMPLEX_MODELS={},
+            _SYNTHETIC_PAIRS={"Tweeters Together", "Mid Bass Together"},
+            CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+        ):
+            predicted_baseline = objective._predict(baseline, {})
+            predicted_candidate = objective._predict(candidate, {})
+
+        np.testing.assert_allclose(predicted_baseline["System Sum"], measured_system)
+        self.assertTrue(np.all(predicted_candidate["System Sum"] <= measured_system + 1e-12))
+        self.assertLess(float(np.min(predicted_candidate["System Sum"] - measured_system)), -1.0)
 
 class ScorerSessionTests(unittest.TestCase):
     def test_sessions_keep_independent_roots_and_modules(self) -> None:

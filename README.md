@@ -166,7 +166,34 @@ The result is not simply the candidate with the most filters or the flattest
 single trace. The search favours the smallest correction that makes a meaningful
 improvement across the evidence available.
 
-### 3. Treat nulls and missing evidence honestly
+### 3. Separate real L/R offsets from cabin combing
+
+A one-sided cut is allowed only when the left-minus-right difference keeps one
+dominant sign across roughly one octave around the proposed filter. If the sign
+alternates more than once, the app treats the pattern as comb filtering,
+driver aiming, or spatial interference rather than a correctable channel-level
+offset.
+
+Balance-only corrections are concentrated in the useful imaging band from
+about 500 Hz to 8 kHz and are heavily de-weighted below 400 Hz. A one-sided cut
+is also rejected when the measured System Sum is already below target at that
+frequency, so a small image-score improvement cannot be bought by deepening a
+tonal hole.
+
+Every new filter must clear the assumed local measurement-repeatability floor.
+The default model uses this rig's same-day MMM repeatability: approximately
+0.1 dB at 400-500 Hz, 0.6-1.0 dB at 700-1400 Hz, up to 1.6 dB above that for
+midbass, and 0.23-0.46 dB through the tweeter range. The required deviation is
+2.5 times the local floor. The exact floor and threshold used are printed in
+the tuning report so a user can judge the assumption rather than trusting a
+hidden constant.
+
+When a proposed correction falls near a crossover, the search compares the
+same region on the upper driver pair, the lower driver pair, and both together.
+The full system score decides which scope earns the filter; it does not
+automatically copy a tweeter correction onto the midbass or midrange.
+
+### 4. Treat nulls and missing evidence honestly
 
 If the measurements show a destructive acoustic cancellation, that region is
 masked from the tonal reward and positive EQ there is penalised. The app does
@@ -175,9 +202,12 @@ not call a deep null a "peak to fix" and boost into it.
 When individual drivers and System Sum are present but a `Together` trace is
 missing, PEQ can still use the measured solo drivers plus system response.
 Pair-summation and null checks for that missing pair are shown as unavailable.
-The app does not invent phase evidence from magnitude data.
+The synthetic pair model contributes only its predicted change to the measured
+System Sum, so the untouched baseline still reproduces the real system
+measurement exactly. The app does not invent phase evidence from magnitude
+data.
 
-### 4. Use a stricter method for phase, delay, and all-pass changes
+### 5. Use a stricter method for phase, delay, and all-pass changes
 
 PEQ is a magnitude workflow. Phase-related changes need a fresh,
 timing-referenced sweep session. Before the app can write polarity, relative

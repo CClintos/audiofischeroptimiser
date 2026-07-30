@@ -22,12 +22,15 @@ GROUP_LABELS = {
     "front_voicing": "Whole front stage (matched voicing)",
     "sub": "Subwoofer",
     "high_sym": "Both tweeters (symmetric)",
+    "high_crossover_sym": "Both tweeters near the crossover",
     "fl_high": "Front L tweeter",
     "fr_high": "Front R tweeter",
     "mid_sym": "Both midrange drivers (symmetric)",
+    "mid_crossover_sym": "Both midrange drivers near the crossover",
     "fl_mid": "Front L midrange",
     "fr_mid": "Front R midrange",
     "low_sym": "Both midbass drivers (symmetric)",
+    "low_crossover_sym": "Both midbass drivers near the crossover",
     "fl_low": "Front L midbass",
     "fr_low": "Front R midbass",
 }
@@ -561,6 +564,7 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     sessions = (summary.get("gates") or {}).get("measurement_session") or {}
     positions = ["centre", *[str(item) for item in sessions.get("spatial_positions") or []]]
     validation = (summary.get("gates") or {}).get("pair_validation") or []
+    noise_guard = (summary.get("gates") or {}).get("measurement_noise_guard") or {}
     warnings = _warning_items(summary, mode)
     filters = _best_filters(summary, summary_path.parent / "optimizer_report.md")
     actions = summary.get("phase_actions") or []
@@ -604,6 +608,22 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
             detail = f"{status}: {item.get('rms_db', '-')} dB RMS against {item.get('threshold_db', '-')} dB limit"
         validation_rows.append((str(item.get("pair", "Pair")).title(), detail))
     validation_html = _table(validation_rows) if validation_rows else "<p>No solo/together validation rows were available.</p>"
+    noise_rows = []
+    for item in noise_guard.get("midbass") or []:
+        noise_rows.append((
+            f"Midbass {item.get('range_hz', '')} Hz",
+            f"{item.get('floor_db', '-')} dB floor",
+        ))
+    for item in noise_guard.get("tweeter") or []:
+        noise_rows.append((
+            f"Tweeter {item.get('range_hz', '')} Hz",
+            f"{item.get('floor_db', '-')} dB floor",
+        ))
+    noise_rows.append((
+        "Filter threshold",
+        f"{noise_guard.get('required_multiplier', 2.5)}x the local floor",
+    ))
+    noise_html = _table(noise_rows)
 
     filter_rows = []
     for group, bands in filters.items():
@@ -804,6 +824,8 @@ img.chart {{ width:100%; margin:7px 0 4px; }} .hero-chart {{ margin-top:10px; }}
 {evidence_visual}
 <h2>Detailed score values</h2>{_component_table(baseline, best_components)}
 <h2>Measurement validation</h2>{validation_html}
+<h2>Measurement repeatability guard</h2>{noise_html}
+<p>{html.escape(str(noise_guard.get('note') or 'Filters below the assumed local measurement floor are rejected.'))}</p>
 <div class="callout"><b>How to read this:</b> {html.escape(confidence_text)}</div></div>
 
 <div class="page"><div class="eyebrow">2 - {'Phase / timing changes' if phase_mode else 'PEQ changes'}</div><h1>{'What Was Written' if phase_mode else 'What Changed In The DSP'}</h1>
