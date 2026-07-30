@@ -7,7 +7,11 @@ work remain available, but neither Codex nor Claude is required to run a tune.
 
 ## Windows App
 
-For a packaged release, open `AudioFischerOptimizer.exe`. From source:
+The current source/package version is **0.4.0**. The version is shown in the
+window title and About tab so screenshots and support reports can be tied to the
+correct build.
+
+For a packaged build, open `AudioFischerOptimizer.exe`. From source:
 
 ```powershell
 .\setup_gui.ps1
@@ -17,20 +21,46 @@ For a packaged release, open `AudioFischerOptimizer.exe`. From source:
 After building, `install_gui.ps1` installs the app for the current Windows user
 and creates a desktop shortcut; it does not require administrator access.
 
-The app opens on a workflow guide, followed by **PEQ / RTA**, **Sweeps / Phase**,
-and **Retarget** as the final tab. PEQ uses the recommended Beam search with phase
-writes disabled. The phase stage uses fresh sweeps and the PEQ result as its
-baseline, preserves PEQ, and writes only gated phase/delay/APF changes. Retarget
-applies the Beam workflow to fresh MMM/RTA measurements and a different supplied
-target. The app also controls CPU and optimizer RAM use, preserves checkpoints,
-safely stops/resumes runs, and loads verified candidates from
-`assistant_summary.json`. See [docs/GUI.md](./docs/GUI.md).
+The app provides three measurement workflows:
 
-Retarget previews the selected target against the built-in reference, normalized at 1 kHz.
-Results shows the fixed-anchor measured-before, predicted-candidate, and target curves, and
-automatically creates `SQ_Tuning_Report.pdf` with the named score
-components, supported changes, warnings, deliberately untouched regions, and
-the required in-car checks. The About tab explains the scoring and workflow.
+- **PEQ / RTA** uses the recommended Beam search with phase writes disabled.
+- **Sweeps / Phase** uses fresh phase-valid sweeps, preserves existing PEQ, and
+  writes only polarity, bounded delay, or residual APF changes that clear the
+  evidence gates.
+- **Retarget** applies the conservative PEQ workflow to fresh MMM/RTA
+  measurements and a different supplied target.
+
+Current desktop features include:
+
+- responsive background validation, report generation, and safe shutdown
+- honest Searching, Merging, Verifying, and Writing Report progress phases
+- process-tree RAM protection with a visible warning if the guard is unavailable
+- a live 2-way/3-way measurement checklist and safe REW folder-template creator
+- fuzzy manual role mapping for non-standard filenames, saved as `role_map.json`
+- remembered workflow paths and a Recent Runs list
+- gated Run/Results tabs with plain-language validation errors and fixes
+- non-clobbering, timestamped candidate exports
+- atomically reserved run folders and active-run claims that prevent two app
+  instances from starting the same run
+- detached background runs that can survive GUI closure and be reattached later
+
+Closing during a run offers **Keep Running and Close**, **Stop Safely and
+Close**, or Cancel. Background runs keep writing their normal checkpoints and
+remain accessible from Recent Runs.
+
+Results leads with improvement versus the loaded baseline rather than the raw
+objective. It includes the baseline as a comparison row, named improvement
+cards, a copyable filter table, warnings, deliberately untouched regions, and
+in-car checks. The interactive response chart provides before/candidate/target
+and optional per-driver predicted-change toggles, hover frequency/dB values,
+added-filter centre markers, and click-to-enlarge. Retarget uses the same chart
+for its normalized 1 kHz target preview.
+
+Loading Results automatically creates `SQ_Tuning_Report.pdf` beside the merged
+candidates. Validation failures expose **Copy Diagnostics**, which copies
+stdout/stderr, the exact job configuration, and the measurement manifest.
+
+See [docs/GUI.md](./docs/GUI.md) for the complete desktop workflow.
 
 For AI-assisted development, start with `AGENTS.md` and
 `docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md`.
@@ -154,7 +184,9 @@ output. This preserves L/R balance and relative crossover phase. If the transfer
 raises the full front cascade peak, the writer applies only the uniform front
 attenuation needed to retain the baseline headroom; it never raises output level.
 
-Expected measurement files:
+Canonical measurement filenames are listed below. They are no longer mandatory:
+if a folder uses names such as `FL High Sweep.txt`, the GUI opens a
+fuzzy-prefilled role-mapping dialog and can remember that naming for later runs.
 
 - `System Sum.txt`
 - `Sub.txt`
@@ -173,6 +205,14 @@ Expected tune file:
 
 ## Main Files
 
+- [optimizer_gui/window.py](./optimizer_gui/window.py): native Windows workflow,
+  run monitoring, interactive Results, and export interface
+- [optimizer_gui/backend.py](./optimizer_gui/backend.py): durable jobs,
+  validation, detached process ownership, run claims, and exports
+- [optimizer_gui/reporting.py](./optimizer_gui/reporting.py): shared result
+  metrics, charts, and local PDF report
+- [optimizer_gui/_version.py](./optimizer_gui/_version.py): single application
+  and package version source
 - [_optimizer.py](./_optimizer.py): core scoring, prediction, AFPX writing, reporting
 - [_optimizer_stream.py](./_optimizer_stream.py): constant-memory multi-worker optimizer
 - [run_optimizer.ps1](./run_optimizer.ps1): one-command validate/run/merge/verify wrapper
@@ -189,6 +229,10 @@ Expected tune file:
 
 Required measurements now fail fast when missing, malformed, non-monotonic, or
 truncated. Optional phase, coherence, and position columns remain supported.
+
+The current regression suite contains 66 tests covering DSP invariants, AFPX
+write safety, measurement-session gates, role mapping, GUI jobs, diagnostics,
+result metrics, collision-safe run folders, and package-version consistency.
 
 The optimizer normalizes REW exports to the 96-points-per-octave grid used by its
 ERB and perceptual scoring math. The streaming search then applies a small

@@ -13,12 +13,15 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--level-calibration", type=Path, default=None)
+    parser.add_argument("--role-map", type=Path, default=None)
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     args = parser.parse_args()
 
     os.environ["AFPX_DATA_ROOT"] = str(args.data_root.resolve())
     os.environ["AFPX_BASELINE"] = str(args.baseline.resolve())
     os.environ["AFPX_TARGET"] = str(args.target.resolve())
+    if args.role_map:
+        os.environ["AFPX_ROLE_MAP"] = str(args.role_map.resolve())
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import _optimizer as optimizer

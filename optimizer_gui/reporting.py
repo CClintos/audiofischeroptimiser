@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication
 
+from .warning_text import warning_info
 
 GROUP_LABELS = {
     "front_voicing": "Whole front stage (matched voicing)",
@@ -30,6 +31,14 @@ GROUP_LABELS = {
     "fl_low": "Front L midbass",
     "fr_low": "Front R midbass",
 }
+
+RESULT_METRICS = (
+    ("tonal_error_db", "Tonal accuracy"),
+    ("presence_error_db", "Vocal region"),
+    ("narrow_peak_penalty_db", "Narrow peaks"),
+    ("balance_penalty_db", "L/R balance"),
+)
+MEANINGFUL_IMPROVEMENT_PERCENT = 1.0
 
 _REPORT_QT_APP: QApplication | None = None
 
@@ -134,24 +143,25 @@ def _component_table(baseline: dict[str, Any], best: dict[str, Any]) -> str:
     )
 
 
-def _warning_items(summary: dict[str, Any], mode: str) -> list[str]:
-    friendly = {
-        "phase_unavailable_peq_only": "Phase data was not available; this report covers PEQ only.",
-        "phase_writes_disabled_timing_reference_missing": (
-            "Timing reference was missing, so no delay, polarity or APF changes were allowed."
-        ),
-    }
-    warnings = []
+def _warning_items(summary: dict[str, Any], mode: str) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
     for item in summary.get("warnings") or []:
-        raw = str(item)
-        warnings.append(friendly.get(raw, raw.replace("_", " ").capitalize()))
+        warnings.append(warning_info(item))
     best = summary.get("best") or {}
     if best.get("left_alone"):
-        warnings.append(str(best["left_alone"]))
+        warnings.append(warning_info(best["left_alone"]))
     if mode == "phase" and summary.get("phase_actions"):
-        warnings.append("Phase changes are model predictions until the affected crossover is re-measured in-car.")
+        warnings.append({
+            "severity": "warning",
+            "colour": "#9a6500",
+            "text": "Phase changes are predictions. Fix: re-measure every affected crossover in-car.",
+        })
     if not warnings:
-        warnings.append("No blocking measurement or candidate warnings were reported.")
+        warnings.append({
+            "severity": "info",
+            "colour": "#2b6684",
+            "text": "No blocking measurement or candidate warnings were reported.",
+        })
     return warnings[:8]
 
 
@@ -327,6 +337,7 @@ def _response_plot(summary: dict[str, Any], full: dict[str, Any]) -> dict[str, A
         "candidate_error_db": [row.get("candidate_error_db") for row in rows],
         "raw_system_delta_db": [row.get("raw_system_delta_db") for row in rows],
         "pairs": {},
+        "drivers": {},
     }
 
 
@@ -338,6 +349,56 @@ def load_response_plot(summary_path: Path) -> dict[str, Any]:
     full_path = summary_path.parent / str(details.get("optimizer_summary", "optimizer_summary.json"))
     return _response_plot(summary, _read_json(full_path))
 
+
+def response_chart_series(plot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build native-GUI series, including opt-in per-driver predicted changes."""
+    frequencies = plot.get("frequency_hz") or []
+    if not frequencies:
+        return []
+    series = [
+        {
+            "label": "Before",
+            "x": frequencies,
+            "y": plot.get("baseline_error_db"),
+            "color": "#a34b43",
+            "visible": True,
+        },
+        {
+            "label": "Candidate",
+            "x": frequencies,
+            "y": plot.get("candidate_error_db"),
+            "color": "#16805d",
+            "visible": True,
+        },
+        {
+            "label": "Target",
+            "x": frequencies,
+            "y": [0.0] * len(frequencies),
+            "color": "#59636b",
+            "dashed": True,
+            "visible": True,
+        },
+    ]
+    driver_colours = (
+        "#7556a8", "#b05f9c", "#2b78a6", "#4b8f3a",
+        "#ba6b24", "#8b6b3f", "#4d7780",
+    )
+    for index, (role, data) in enumerate((plot.get("drivers") or {}).items()):
+        driver_x = data.get("frequency_hz") or frequencies
+        driver_y = data.get("change_db") or []
+        if len(driver_x) < 2 or len(driver_y) < 2:
+            continue
+        series.append({
+            "label": f"{role} change",
+            "x": driver_x,
+            "y": driver_y,
+            "color": driver_colours[index % len(driver_colours)],
+            "visible": False,
+            "driver": True,
+        })
+    return series
+
+
 def _improvement(base: Any, best: Any) -> tuple[float | None, float | None]:
     if not isinstance(base, (int, float)) or not isinstance(best, (int, float)):
         return None, None
@@ -346,16 +407,69 @@ def _improvement(base: Any, best: Any) -> tuple[float | None, float | None]:
     return delta, percent
 
 
-def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
-    metrics = (
-        ("tonal_error_db", "Tonal accuracy"),
-        ("presence_error_db", "Vocal region"),
-        ("narrow_peak_penalty_db", "Narrow peaks"),
-        ("balance_penalty_db", "L/R balance"),
-    )
-    cells = []
-    for key, label in metrics:
+def metric_card_data(
+    baseline: dict[str, Any], best: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return the same named before/after metrics used by the PDF and GUI."""
+    cards = []
+    for key, label in RESULT_METRICS:
         delta, percent = _improvement(baseline.get(key), best.get(key))
+        cards.append({
+            "key": key,
+            "label": label,
+            "delta_db": delta,
+            "percent": percent,
+            "state": (
+                "neutral" if delta is None or abs(delta) <= 0.02
+                else "good" if delta > 0.0 else "warn"
+            ),
+        })
+    return cards
+
+
+def improvement_verdict(
+    baseline: dict[str, Any], best: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe overall improvement without making the raw objective the headline."""
+    delta, percent = _improvement(baseline.get("objective"), best.get("objective"))
+    meaningful = bool(
+        delta is not None and percent is not None
+        and delta > 0.0 and percent >= MEANINGFUL_IMPROVEMENT_PERCENT
+    )
+    if delta is None or percent is None:
+        return {
+            "meaningful": False,
+            "percent": None,
+            "delta": None,
+            "heading": "Improvement versus the current tune is unavailable",
+            "detail": "This older result does not contain comparable baseline metrics.",
+        }
+    if meaningful:
+        return {
+            "meaningful": True,
+            "percent": percent,
+            "delta": delta,
+            "heading": f"{percent:.1f}% improvement versus the current tune",
+            "detail": "The candidate cleared the minimum 1% modelled-improvement threshold.",
+        }
+    return {
+        "meaningful": False,
+        "percent": percent,
+        "delta": delta,
+        "heading": "Not meaningfully better than your current tune",
+        "detail": (
+            f"Modelled improvement is {percent:.1f}%—below the 1% recommendation threshold. "
+            "Keep the baseline unless listening and re-measurement prove a worthwhile advantage."
+        ),
+    }
+
+
+def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
+    cells = []
+    for card in metric_card_data(baseline, best):
+        label = card["label"]
+        delta = card["delta_db"]
+        percent = card["percent"]
         if delta is None:
             value = "Not available"
             detail = ""
@@ -363,7 +477,7 @@ def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
         else:
             value = f"{abs(percent):.0f}% {'better' if delta >= 0 else 'worse'}"
             detail = f"{abs(delta):.2f} dB {'less' if delta >= 0 else 'more'} error"
-            css = "good" if delta > 0.02 else "warn" if delta < -0.02 else "neutral"
+            css = card["state"]
         cells.append(
             f'<td class="metric {css}"><span>{html.escape(label)}</span><br>'
             f'<b>{html.escape(value)}</b><br><small>{html.escape(detail)}</small></td>'
@@ -471,7 +585,15 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         ("Objective improvement", _objective_improvement(baseline.get("objective"), best.get("objective"))),
         ("Phase-valid session", "Yes" if sessions.get("phase_valid") else "No / not required"),
     ])
-    warning_html = "".join(f"<li>{html.escape(item)}</li>" for item in warnings)
+    warning_html = "".join(
+        '<li><b style="color:%s">%s</b> %s</li>'
+        % (
+            item.get("colour", "#9a6500"),
+            html.escape(item.get("severity", "warning").upper()),
+            html.escape(item.get("text", "")),
+        )
+        for item in warnings
+    )
 
     validation_rows = []
     for item in validation:

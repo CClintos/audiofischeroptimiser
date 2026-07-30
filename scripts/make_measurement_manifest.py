@@ -21,6 +21,38 @@ POSITION_PREFIXES = {
     "left": ("Left Ear ", "Left "),
     "right": ("Right Ear ", "Right "),
 }
+ALL_MEASUREMENT_ROLES = (
+    "System Sum", "Sub", "FL High", "FR High", "Tweeters Together",
+    "FL Mid", "FR Mid", "Mids Together",
+    "FL Low", "FR Low", "Mid Bass Together",
+)
+
+
+def load_role_map(role_map: Path | str | None) -> dict[str, str]:
+    if not role_map:
+        return {}
+    path = Path(role_map)
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    values = payload.get("roles", payload) if isinstance(payload, dict) else {}
+    return {
+        str(role): str(filename)
+        for role, filename in dict(values).items()
+        if role in ALL_MEASUREMENT_ROLES and filename
+    }
+
+
+def mapped_measurement(root: Path, role: str, role_map: dict[str, str]) -> Path | None:
+    filename = role_map.get(role)
+    if not filename:
+        return None
+    path = (root / filename).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return path if path.is_file() and path.suffix.lower() == ".txt" else None
 
 
 def first_existing(root: Path, aliases: tuple[str, ...]) -> Path | None:
@@ -126,17 +158,33 @@ def measurement_spec(layout: str) -> dict[str, tuple[str, ...]]:
     return spec
 
 
-def detect_layout(root: Path) -> str:
-    has_mid = all(first_existing(root, aliases) for aliases in (MID_L, MID_R, MID_PAIR))
-    has_low = all(first_existing(root, aliases) for aliases in (LOW_L, LOW_R, LOW_PAIR))
+def detect_layout(root: Path, role_map: dict[str, str] | None = None) -> str:
+    mapped = role_map or {}
+    has_mid = all(
+        mapped_measurement(root, role, mapped) or first_existing(root, aliases)
+        for role, aliases in (
+            ("FL Mid", MID_L), ("FR Mid", MID_R), ("Mids Together", MID_PAIR),
+        )
+    )
+    has_low = all(
+        mapped_measurement(root, role, mapped) or first_existing(root, aliases)
+        for role, aliases in (
+            ("FL Low", LOW_L), ("FR Low", LOW_R), ("Mid Bass Together", LOW_PAIR),
+        )
+    )
     return "front_3way_plus_sub" if has_mid and has_low else "front_2way_plus_sub"
 
 
-def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> dict[str, object]:
-    layout = detect_layout(root)
+def build_manifest(
+    root: Path, baseline: Path | None, target: Path | None,
+    role_map: Path | str | None = None,
+) -> dict[str, object]:
+    mapped_roles = load_role_map(role_map)
+    layout = detect_layout(root, mapped_roles)
     spec = measurement_spec(layout)
     present: list[str] = []
     missing: list[str] = []
+    missing_roles: list[str] = []
     resolved: dict[str, str] = {}
     phase_files: list[str] = []
     coherence_files: list[str] = []
@@ -146,9 +194,10 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
     spatial_bundles: dict[str, dict[str, str]] = {}
 
     for role, aliases in spec.items():
-        found = first_existing(root, aliases)
+        found = mapped_measurement(root, role, mapped_roles) or first_existing(root, aliases)
         if found is None:
             missing.append(aliases[0])
+            missing_roles.append(role)
             continue
         present.append(found.name)
         resolved[role] = str(found)
@@ -223,7 +272,10 @@ def build_manifest(root: Path, baseline: Path | None, target: Path | None) -> di
         "target_exists": bool(target_path and target_path.exists()),
         "measurements_present": sorted(present),
         "measurements_missing": sorted(missing),
+        "missing_roles": missing_roles,
         "resolved_roles": resolved,
+        "role_map": mapped_roles,
+        "available_txt": sorted(path.name for path in root.glob("*.txt") if path.is_file()),
         "detected_layout": layout,
         "phase_available": phase_available,
         "phase_files": sorted(phase_files),
@@ -252,6 +304,9 @@ def compact_manifest(manifest: dict[str, object]) -> dict[str, object]:
         "target_curve": manifest["target_curve"],
         "measurement_count": len(manifest["measurements_present"]),
         "missing": manifest["measurements_missing"],
+        "missing_roles": manifest.get("missing_roles", []),
+        "resolved_roles": manifest.get("resolved_roles", {}),
+        "available_txt": manifest.get("available_txt", []),
         "phase_file_count": len(manifest["phase_files"]),
         "coherence_file_count": len(manifest["coherence_files"]),
         "impulse_file_count": len(manifest["impulse_files"]),
@@ -265,11 +320,12 @@ def main() -> None:
     parser.add_argument("root", nargs="?", default=".", type=Path)
     parser.add_argument("--baseline", type=Path, default=None)
     parser.add_argument("--target", type=Path, default=None)
+    parser.add_argument("--role-map", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=Path("latest_measurement_manifest.json"))
     parser.add_argument("--print-mode", choices=("compact", "full", "none"), default="compact")
     args = parser.parse_args()
 
-    manifest = build_manifest(args.root.resolve(), args.baseline, args.target)
+    manifest = build_manifest(args.root.resolve(), args.baseline, args.target, args.role_map)
     args.out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if args.print_mode != "none":
         payload = manifest if args.print_mode == "full" else compact_manifest(manifest)

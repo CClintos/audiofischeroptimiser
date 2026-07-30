@@ -44,7 +44,7 @@ for _var in (
 
 import numpy as np
 import optuna
-from scripts.make_measurement_manifest import build_manifest
+from scripts.make_measurement_manifest import build_manifest, load_role_map, mapped_measurement
 
 from _make_v3 import (
     add_bands,
@@ -85,6 +85,8 @@ ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("AFPX_DATA_ROOT", str(ROOT)))
 DEFAULT_BASELINE = Path(os.environ.get("AFPX_BASELINE", str(DATA_ROOT / "baseline.afpx")))
 DEFAULT_TARGET = Path(os.environ.get("AFPX_TARGET", str(ROOT / "ResoNix Target Curve 2026.txt")))
+ROLE_MAP_PATH = os.environ.get("AFPX_ROLE_MAP", "")
+ROLE_MAP = load_role_map(ROLE_MAP_PATH)
 OBJECTIVE_PATH = ROOT / "objective_module" / "afpx_objective.py"
 
 
@@ -154,8 +156,20 @@ def _has_any(data_root: Path, aliases: Tuple[str, ...]) -> bool:
 
 
 def detect_front_layout(data_root: Path = DATA_ROOT) -> str:
-    has_mid = _has_any(data_root, MID_ALIASES_L) and _has_any(data_root, MID_ALIASES_R) and _has_any(data_root, MID_PAIR_ALIASES)
-    has_low = _has_any(data_root, LOW_ALIASES_L) and _has_any(data_root, LOW_ALIASES_R) and _has_any(data_root, LOW_PAIR_ALIASES)
+    has_mid = all(
+        mapped_measurement(data_root, role, ROLE_MAP) or _has_any(data_root, aliases)
+        for role, aliases in (
+            ("FL Mid", MID_ALIASES_L), ("FR Mid", MID_ALIASES_R),
+            ("Mids Together", MID_PAIR_ALIASES),
+        )
+    )
+    has_low = all(
+        mapped_measurement(data_root, role, ROLE_MAP) or _has_any(data_root, aliases)
+        for role, aliases in (
+            ("FL Low", LOW_ALIASES_L), ("FR Low", LOW_ALIASES_R),
+            ("Mid Bass Together", LOW_PAIR_ALIASES),
+        )
+    )
     return "3way" if has_mid and has_low else "2way"
 
 
@@ -194,8 +208,10 @@ MEASUREMENT_ALIASES = measurement_aliases_for_layout(FRONT_LAYOUT)
 def resolve_measurement_files(data_root: Path = DATA_ROOT) -> Dict[str, Path]:
     files: Dict[str, Path] = {}
     for name, aliases in MEASUREMENT_ALIASES.items():
-        found = None
+        found = mapped_measurement(data_root, name, ROLE_MAP)
         for alias in aliases:
+            if found is not None:
+                break
             p = data_root / alias
             if p.exists():
                 found = p
@@ -461,7 +477,7 @@ def measurement_session_audit(manifest: Dict[str, object], calibration: Dict[str
 def prepare_measurement_session(baseline: Path, target: Path,
                                 level_calibration_path: Path | None = None) -> Tuple[Dict[str, object], Dict[str, float]]:
     calibration = load_level_calibration(level_calibration_path)
-    manifest = build_manifest(DATA_ROOT.resolve(), baseline, target)
+    manifest = build_manifest(DATA_ROOT.resolve(), baseline, target, ROLE_MAP_PATH or None)
     audit = measurement_session_audit(manifest, calibration)
     if not audit["tonal_valid"]:
         missing = ", ".join(audit["missing_calibration_roles"])

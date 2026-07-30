@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiofischeroptimiser"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Offline REW and AFPX optimizer for Audiotec Fischer DSP systems"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,3 +20,9 @@ dependencies = [
 gui = ["PySide6>=6.8,<7"]
 build = ["PyInstaller>=6.10,<7"]
 test = []
+
+[tool.setuptools.dynamic]
+version = {attr = "optimizer_gui.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["optimizer_gui*"]

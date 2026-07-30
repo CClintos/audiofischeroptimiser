@@ -14,6 +14,7 @@ param(
     [string]$PhaseWrites = "auto",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [string]$RoleMap = "",
     [ValidateSet("off", "recommend")]
     [string]$SubBlend = "off",
     [double]$HeadroomDb = -1,
@@ -35,7 +36,24 @@ if (-not (Test-Path -LiteralPath $targetPath)) { throw "Target curve not found: 
 $env:AFPX_DATA_ROOT = $data
 $env:AFPX_BASELINE = $baselinePath
 $env:AFPX_TARGET = $targetPath
+if ($RoleMap) {
+    $roleMapPath = (Resolve-Path -LiteralPath $RoleMap).Path
+    $env:AFPX_ROLE_MAP = $roleMapPath
+} else {
+    Remove-Item Env:AFPX_ROLE_MAP -ErrorAction SilentlyContinue
+}
 if (-not $Root) { $Root = Join-Path $here ("Optimizer_Run_" + (Get-Date -Format "yyyyMMdd_HHmmss")) }
+New-Item -ItemType Directory -Force -Path $Root | Out-Null
+$runPhases = @("searching", "merging", "verifying", "reporting", "complete")
+function Set-RunPhase([string]$Phase) {
+    foreach ($name in $runPhases) {
+        $marker = Join-Path $Root (".phase_" + $name)
+        if (Test-Path -LiteralPath $marker) {
+            Remove-Item -LiteralPath $marker -Force
+        }
+    }
+    New-Item -ItemType File -Force -Path (Join-Path $Root (".phase_" + $Phase)) | Out-Null
+}
 if ($Workers -le 0) {
     $logical = [Environment]::ProcessorCount
     $Workers = [Math]::Max(1, [Math]::Min(12, [Math]::Floor($logical * 0.60)))
@@ -54,6 +72,8 @@ $launch = @{
 }
 if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
+if ($RoleMap) { $launch.RoleMap = $roleMapPath }
+Set-RunPhase "searching"
 & (Join-Path $here "run_guided_stream_workers.ps1") @launch *> $null
 
 $processFile = Join-Path $Root "worker_processes.json"
@@ -75,6 +95,7 @@ foreach ($row in $workerRows) {
 }
 if ($failed.Count) { throw ($failed -join [Environment]::NewLine) }
 
+Set-RunPhase "merging"
 $phaseCache = Join-Path $Root "phase_diagnostics.json"
 $mergeArgs = @(
     "_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"),
@@ -90,6 +111,7 @@ if ($LevelCalibration) { $mergeArgs += @("--level-calibration", $LevelCalibratio
 $mergeOutput = & $python @mergeArgs 2>&1
 if ($LASTEXITCODE -ne 0) { throw ($mergeOutput -join [Environment]::NewLine) }
 
+Set-RunPhase "verifying"
 $merged = Join-Path $Root "_merged_top"
 $verifyDir = Join-Path $merged "verification"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
@@ -105,4 +127,5 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
 }
 
 $summary = (Resolve-Path -LiteralPath (Join-Path $merged "assistant_summary.json")).Path
+Set-RunPhase "reporting"
 Write-Output $summary

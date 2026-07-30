@@ -21,6 +21,7 @@
 import re
 import os
 import sys
+import json
 import zlib
 import math
 from collections import Counter
@@ -31,7 +32,18 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get('AFPX_DATA_ROOT', str(ROOT.parent)))
-if not (DATA_ROOT / 'System Sum.txt').exists() and (DATA_ROOT.parent / 'System Sum.txt').exists():
+ROLE_MAP_PATH = os.environ.get('AFPX_ROLE_MAP', '')
+try:
+    _role_payload = json.loads(Path(ROLE_MAP_PATH).read_text(encoding='utf-8-sig')) if ROLE_MAP_PATH else {}
+    ROLE_MAP = dict(_role_payload.get('roles', _role_payload))
+except (OSError, ValueError, TypeError):
+    ROLE_MAP = {}
+_mapped_system = DATA_ROOT / str(ROLE_MAP.get('System Sum', ''))
+if (
+    not _mapped_system.is_file()
+    and not (DATA_ROOT / 'System Sum.txt').exists()
+    and (DATA_ROOT.parent / 'System Sum.txt').exists()
+):
     DATA_ROOT = DATA_ROOT.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DATA_ROOT))
@@ -50,7 +62,12 @@ def _has_any(names):
     return any((REW_DIR / (name + '.txt')).exists() for name in names)
 
 
-THREE_WAY = _has_any(('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid')) and _has_any(('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid')) and _has_any(('Both Mids', 'Mids Together', 'Midrange Together')) and _has_any(('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low')) and _has_any(('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low')) and _has_any(('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
+def _has_role(role, names):
+    mapped = ROLE_MAP.get(role)
+    return bool(mapped and (REW_DIR / str(mapped)).is_file()) or _has_any(names)
+
+
+THREE_WAY = _has_role('FL Mid', ('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid')) and _has_role('FR Mid', ('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid')) and _has_role('Mids Together', ('Both Mids', 'Mids Together', 'Midrange Together')) and _has_role('FL Low', ('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low')) and _has_role('FR Low', ('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low')) and _has_role('Mid Bass Together', ('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
 
 if THREE_WAY:
     SOLO_FILES = {
@@ -180,7 +197,16 @@ def _load_txt(path):
     trace = _load_txt_rich(path)
     return trace['freq'], trace['spl']
 
-def _resolve_txt(names):
+def _resolve_txt(names, role=None):
+    mapped = ROLE_MAP.get(role) if role else None
+    if mapped:
+        path = (REW_DIR / str(mapped)).resolve()
+        try:
+            path.relative_to(REW_DIR.resolve())
+        except ValueError:
+            path = None
+        if path is not None and path.is_file() and path.suffix.lower() == '.txt':
+            return path
     if isinstance(names, str):
         names = (names,)
     for name in names:
@@ -537,7 +563,7 @@ def _init():
     raw = {}
     F = None
     for key, nm in SOLO_FILES.items():
-        path = _resolve_txt(nm)
+        path = _resolve_txt(nm, key)
         trace = _load_txt_rich(path)
         trace['spl'] = trace['spl'] + _calibration_offset(key, path)
         if F is None:
@@ -991,7 +1017,15 @@ def report_plot_data(band_sets, max_points=220):
         'candidate_error_db': values(candidate['System Sum'] - _TGT),
         'raw_system_delta_db': values(candidate['System Sum'] - baseline['System Sum']),
         'pairs': {},
+        'drivers': {},
     }
+    for role in (*CH_KEYS, 'Sub'):
+        if role not in baseline or role not in candidate:
+            continue
+        payload['drivers'][role] = {
+            'frequency_hz': values(_F),
+            'change_db': values(candidate[role] - baseline[role]),
+        }
     for name, (left, right, _together, _band_range, balance_band) in PAIR_SPECS.items():
         selected = indices[(_F[indices] >= balance_band[0]) & (_F[indices] <= balance_band[1])]
         payload['pairs'][name] = {

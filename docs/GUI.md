@@ -13,6 +13,9 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
    the baseline. This stage preserves PEQ and searches no new PEQ filters.
 5. Validate the measurement session. Missing files, tonal provenance, phase
    references, and solo/together gates are checked before workers start.
+   When filenames are unfamiliar, map every TXT file to its measurement role in
+   the in-app dialog. The run stores `role_map.json`, and remembered names are
+   suggested automatically in later sessions.
 6. Start the run. Candidate count, objective, worker count, elapsed time, and
    process-tree memory are shown live.
 7. Stop safely when needed. Workers save their current state and partial results,
@@ -27,11 +30,18 @@ the current tune when changing to a different target curve; it preserves phase c
 The selected target is previewed against the built-in reference with both curves
 normalized to 0 dB at 1 kHz, making their tonal-shape difference visible.
 
-Results displays measured-before, predicted-candidate, and target curves using the same
-fixed-anchor response data as the report. Loading Results also creates `SQ_Tuning_Report.pdf` beside the merged
-candidate files. The report summarizes the objective components, exact supported
-changes, confidence warnings, deliberately untouched regions, and re-measure
-checks. The About tab explains the same scoring and safety model in-app.
+Results leads with improvement versus the current tune and the same named metric
+cards used by the PDF. The current baseline appears beside generated candidates,
+and a clear banner warns when the best result does not clear the 1% modelled
+improvement threshold. Added filters are shown in a driver/frequency/Q/gain table
+and can be copied as DSP-entry text. Warnings, deliberately untouched regions,
+and in-car checks have separate readable panels rather than a raw JSON dump.
+
+The response chart has before/candidate/target and optional per-driver predicted
+change toggles, hover frequency/dB readout, filter-centre markers, and
+click-to-enlarge. The Retarget preview uses the same interactive chart. Loading
+Results also creates `SQ_Tuning_Report.pdf` beside the merged candidate files.
+The About tab explains the same scoring and safety model in-app.
 
 Alternative guided/CMA/random search methods remain developer CLI options for
 benchmarking. They are intentionally hidden from the normal GUI.
@@ -41,9 +51,35 @@ changing playback or input level. Advanced level-calibration files remain
 available through the CLI only.
 
 Runs are stored under `Documents\AudioFischer Optimizer Runs` by default. Each
-contains `gui_job.json`, worker checkpoints, logs, merged results, verification
+contains `gui_job.json`, an optional `role_map.json`, worker checkpoints, logs, merged results, verification
 JSON, and `assistant_summary.json`. Open Existing Run resumes an incomplete run
 or displays an already completed one.
+
+Run folders are reserved atomically. If two GUI instances start in the same
+second they receive different suffixed folders, and an active-run claim prevents
+the same folder from being started twice. A stale claim from a process that no
+longer exists is recovered automatically.
+
+The PowerShell runner is detached from the GUI. Closing during a run offers
+**Keep Running and Close**, **Stop Safely and Close**, or Cancel. Background runs
+continue writing their normal checkpoints and can be reattached from Recent Runs.
+
+Home shows a live required-measurement checklist and can create a safe 2-way or
+3-way folder template with empty REW placeholders and instructions. Last-used
+paths are remembered per workflow. Recent runs show their workflow, status, best
+objective, and location, and completed entries open directly into Results.
+
+Run remains unavailable until a workflow validates, and Results remains
+unavailable until a completed run is loaded. Validation and reports translate
+machine warning tokens into severity-coloured explanations with a concrete fix.
+Validation also exposes Copy Diagnostics after an attempt; the copied bundle
+contains preflight stderr/stdout, the exact GUI job configuration, and the
+measurement manifest for support or bug reports.
+
+The optional voicing-audition and sub-level controls include in-app explanations
+and tooltips. Voicing files remain neutral listening alternatives. Sub level is
+recommendation-only and requires calibrated measurement level plus declared
+headroom; it never writes an output-level change.
 
 ## Resource Controls
 
@@ -61,6 +97,10 @@ or displays an already completed one.
 ```
 
 Dependencies are pinned in `requirements-gui.lock.txt`.
+
+The application/package version has one source in
+`optimizer_gui/_version.py`. Packaging reads that value through `pyproject.toml`;
+the same version appears in the window title and About tab for support.
 
 ## Build
 

@@ -57,6 +57,27 @@ record.
 - A native PySide6 Windows GUI opens on a workflow guide and provides drag/drop
   inputs, authoritative preflight, bounded CPU/RAM controls, durable stop/resume,
   compact progress, results review, and AFPX export without Codex.
+- GUI preflight, PDF report generation, and stop escalation run outside the Qt
+  main thread. Validation has a cancel action, and the UI remains responsive
+  while checkpoints are preserved during shutdown.
+- Run progress uses durable Searching, Merging, Verifying, and Writing report
+  markers. Verification reports completed/total candidates instead of leaving
+  the search bar pinned at 100 percent.
+- The Run tab visibly warns and logs when the process-memory guard is
+  unavailable. Candidate exports default to timestamped role names, require an
+  explicit overwrite decision, and can open their containing folder.
+- Missing measurement roles open a fuzzy-prefilled manual mapping dialog over
+  every TXT file. The selected `role_map.json` is stored in the run folder and
+  is consumed by manifest validation, the optimizer, and the independent
+  objective; remembered filename choices seed later dialogs.
+- GUI and PDF warnings share one severity-coloured plain-language catalogue with
+  concrete re-measurement or configuration remedies.
+- Home includes a live 2-way/3-way measurement checklist, a non-overwriting REW
+  folder-template creator, and recent runs. QSettings remembers paths separately
+  for PEQ, Phase, and Retarget.
+- Run and Results tabs are gated until their prerequisites exist. Input changes
+  invalidate only their own workflow, so Retarget edits do not clear a valid PEQ
+  configuration.
 - The GUI exposes Beam only. Developer CLI methods remain available for
   benchmarking. Its PEQ/RTA stage disables phase writes; its Sweeps/Phase stage
   uses one baseline-only candidate so existing PEQ remains byte-identical while
@@ -69,6 +90,22 @@ record.
   component-improvement bars, L/R plots, expected audible effects, filter changes,
   restraint and verification. Phase reports use crossover confidence and ladder
   before/after visuals instead of presenting phase as ordinary tonal EQ.
+- Results replaces the compact-summary JSON dump with shared improvement cards,
+  an explicit below-1-percent no-meaningful-gain warning, a baseline comparison
+  row, a labelled/copyable filter table, warnings, and in-car verification
+  checks.
+- The native response chart supports before/candidate/target and optional
+  per-driver predicted-change series, hover frequency/dB values, added-filter
+  centre markers, and click-to-enlarge. Retarget uses the same chart widget.
+- Failed or malformed preflight attempts retain copyable diagnostics containing
+  stderr/stdout, the exact job configuration, and the measurement manifest.
+- Version `0.4.0` is sourced only from `optimizer_gui/_version.py`; package
+  metadata reads it dynamically, and the GUI title/About panel display it.
+- GUI-launched PowerShell runners are detached and survive an intentional window
+  close. The close prompt can keep the run alive, stop safely, or cancel; active
+  background runs can be reattached from Recent Runs.
+- Run directories are atomically reserved with collision suffixes, and an
+  active-process claim blocks a second GUI instance from starting the same root.
 - Retarget previews the selected target against the built-in reference at a common
   1 kHz anchor. Results shows baseline, predicted candidate, and target from the
   same fixed-anchor response data used by the PDF report.
@@ -170,7 +207,7 @@ record.
 
 ## Verified State
 
-- Fifty-six regression tests pass, including objective/target-shape invariants,
+- Sixty-six regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.

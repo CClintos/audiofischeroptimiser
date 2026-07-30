@@ -23,6 +23,7 @@ param(
     [string]$DataRoot = "",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [string]$RoleMap = "",
     [string]$Baseline = "",
     [string]$Target = "",
     [string]$PythonExe = ""
@@ -53,6 +54,7 @@ $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPa
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
+$roleMapPath = if ($RoleMap -ne "") { (Resolve-Path -LiteralPath $RoleMap).Path } else { "" }
 $phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
 $stopFilePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "stop_requested"
 Remove-Item -LiteralPath $stopFilePath -Force -ErrorAction SilentlyContinue
@@ -74,6 +76,11 @@ $targetPath = (Resolve-Path -LiteralPath $targetPath).Path
 $env:AFPX_DATA_ROOT = $dataRootPath
 $env:AFPX_BASELINE = $baselinePath
 $env:AFPX_TARGET = $targetPath
+if ($roleMapPath -ne "") {
+    $env:AFPX_ROLE_MAP = $roleMapPath
+} else {
+    Remove-Item Env:AFPX_ROLE_MAP -ErrorAction SilentlyContinue
+}
 
 $cacheArgs = @(
     "scripts\prepare_phase_cache.py",
