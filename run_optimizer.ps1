@@ -44,6 +44,16 @@ if ($RoleMap) {
 }
 if (-not $Root) { $Root = Join-Path $here ("Optimizer_Run_" + (Get-Date -Format "yyyyMMdd_HHmmss")) }
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
+$runnerSuccess = Join-Path $Root ".runner_success"
+$runnerFailure = Join-Path $Root ".runner_failed"
+Remove-Item -LiteralPath $runnerSuccess -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $runnerFailure -Force -ErrorAction SilentlyContinue
+trap {
+    $failureText = ($_ | Out-String).Trim()
+    Set-Content -LiteralPath $runnerFailure -Value $failureText -Encoding UTF8
+    [Console]::Error.WriteLine($failureText)
+    exit 1
+}
 $runPhases = @("searching", "merging", "verifying", "reporting", "complete")
 function Set-RunPhase([string]$Phase) {
     foreach ($name in $runPhases) {
@@ -131,4 +141,5 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
 
 $summary = (Resolve-Path -LiteralPath (Join-Path $merged "assistant_summary.json")).Path
 Set-RunPhase "reporting"
+New-Item -ItemType File -Force -Path $runnerSuccess | Out-Null
 Write-Output $summary

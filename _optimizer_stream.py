@@ -730,6 +730,19 @@ def groups_from_json(data) -> GroupBands:
     return groups
 
 
+def replace_checkpoint_with_retry(source: Path, destination: Path, attempts: int = 16) -> None:
+    """Atomically replace a checkpoint despite brief Windows reader locks."""
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(min(0.025 * (2 ** attempt), 0.4))
+
+
 def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int,
                elapsed_seconds: float, args: argparse.Namespace, archive=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -757,9 +770,17 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
             for value, _signature, groups in archive
         ],
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        replace_checkpoint_with_retry(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_state(path: Path, rng: np.random.Generator, component_score=None, archive_size: int = 0):

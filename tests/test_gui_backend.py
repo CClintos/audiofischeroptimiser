@@ -15,7 +15,8 @@ from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
     export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
-    save_role_map, start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
+    locate_summary, runner_completed_successfully, runner_failure_reason, save_role_map,
+    start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
 )
 from optimizer_gui import __version__
 from optimizer_gui.reporting import (
@@ -31,7 +32,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.4.3")
+        self.assertEqual(__version__, "0.4.4")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -52,6 +53,34 @@ class GuiJobTests(unittest.TestCase):
                 claim_run_root(first, os.getpid())
             release_run_claim(first, os.getpid())
             self.assertEqual(active_run_pid(first), 0)
+
+    def test_only_merged_verified_runner_output_counts_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = root / "worker_01"
+            worker.mkdir()
+            (worker / "assistant_summary.json").write_text("{}", encoding="utf-8")
+            self.assertIsNone(locate_summary(root))
+            self.assertFalse(runner_completed_successfully(root))
+
+            merged = root / "_merged_top"
+            merged.mkdir()
+            expected = merged / "assistant_summary.json"
+            expected.write_text("{}", encoding="utf-8")
+            self.assertEqual(locate_summary(root), expected)
+            self.assertFalse(runner_completed_successfully(root))
+            (root / ".runner_success").touch()
+            self.assertTrue(runner_completed_successfully(root))
+
+    def test_runner_failure_reason_translates_checkpoint_file_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".runner_failed").write_text(
+                "PermissionError: stream_state.json was locked", encoding="utf-8",
+            )
+            reason = runner_failure_reason(root)
+        self.assertIn("Windows kept the state file locked", reason)
+        self.assertIn("resumable", reason)
 
     def test_windows_runner_uses_hidden_process_group_without_detached_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

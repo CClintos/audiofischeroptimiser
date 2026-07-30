@@ -26,6 +26,8 @@ APP_NAME = "AudioFischer Optimizer"
 JOB_FILE = "gui_job.json"
 RUN_CLAIM_FILE = ".active_run.json"
 RUN_PHASES = ("searching", "merging", "verifying", "reporting", "complete")
+RUN_SUCCESS_FILE = ".runner_success"
+RUN_FAILURE_FILE = ".runner_failed"
 
 
 def runtime_root() -> Path:
@@ -465,10 +467,31 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
 
 def locate_summary(run_root: Path) -> Path | None:
     preferred = run_root / "_merged_top" / "assistant_summary.json"
-    if preferred.exists():
-        return preferred
-    found = sorted(run_root.rglob("assistant_summary.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return found[0] if found else None
+    return preferred if preferred.is_file() else None
+
+
+def runner_completed_successfully(run_root: Path) -> bool:
+    return (run_root / RUN_SUCCESS_FILE).is_file() and locate_summary(run_root) is not None
+
+
+def runner_failure_reason(run_root: Path) -> str:
+    """Return a compact durable runner failure for the GUI and recent-runs list."""
+    failure_marker = run_root / RUN_FAILURE_FILE
+    log_path = run_root / "gui_runner.log"
+    source = failure_marker if failure_marker.is_file() else log_path
+    try:
+        text = source.read_text(encoding="utf-8-sig", errors="replace").strip()
+    except OSError:
+        text = ""
+    if not text:
+        return "Optimizer stopped before producing a merged and verified result."
+    compact = " ".join(text.split())
+    if "PermissionError" in compact and "stream_state.json" in compact:
+        return (
+            "A worker could not save its checkpoint because Windows kept the state file "
+            "locked. The run remains resumable from its last intact checkpoint."
+        )
+    return compact[-2000:]
 
 
 def load_summary(path: Path) -> dict[str, Any]:

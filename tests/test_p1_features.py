@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -58,6 +60,43 @@ class SpatialObjectiveTests(unittest.TestCase):
 
 
 class CacheTests(unittest.TestCase):
+    def test_checkpoint_replace_retries_a_transient_windows_file_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "stream_state.json"
+            args = SimpleNamespace(
+                seed=1,
+                profile="explore",
+                proposal="beam",
+                mode="peq",
+                filter_cost_scale=0.1,
+                worst_weight=0.1,
+                min_total_bands=0,
+                archive_size=10,
+            )
+            rng = np.random.default_rng(1)
+            groups = {name: [] for name in optimizer.GROUPS}
+            best = [(1.0, optimizer.bands_signature(groups), groups)]
+            real_replace = Path.replace
+            calls = 0
+
+            def transient_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("transient reader lock")
+                return real_replace(source, destination)
+
+            with (
+                patch.object(Path, "replace", transient_replace),
+                patch.object(stream.time, "sleep"),
+            ):
+                stream.save_state(state, best, rng, 5, 1.0, args)
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(
+                json.loads(state.read_text(encoding="utf-8"))["completed_trials"], 5,
+            )
+
     def test_peaking_cache_is_numerically_identical(self) -> None:
         freqs = np.geomspace(20.0, 20000.0, 512)
         token = (len(freqs), float(freqs[0]), float(freqs[-1]), hash(freqs.tobytes()))

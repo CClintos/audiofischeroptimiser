@@ -60,6 +60,11 @@ contains `gui_job.json`, an optional `role_map.json`, worker checkpoints, logs, 
 JSON, and `assistant_summary.json`. Open Existing Run resumes an incomplete run
 or displays an already completed one.
 
+Worker checkpoints use atomic replacement with bounded retrying for transient
+Windows reader locks. A run is marked Complete only after the runner has merged
+the worker states, verified the exported AFPX families, and written its durable
+success marker. Individual worker summaries never count as final results.
+
 Run folders are reserved atomically. If two GUI instances start in the same
 second they receive different suffixed folders, and an active-run claim prevents
 the same folder from being started twice. A stale claim from a process that no
@@ -89,7 +94,8 @@ headroom; it never writes an output-level change.
 ## Resource Controls
 
 - CPU target maps to a bounded worker count, never above 12.
-- RAM limit measures the complete optimizer process tree, not only the GUI.
+- RAM safety stop limit measures the complete optimizer process tree, not only
+  the GUI. It is a ceiling, not a memory allocation target; low usage is normal.
 - Three consecutive over-limit samples request a graceful stop.
 - If workers do not respond within 20 seconds, the process tree is terminated;
   the most recent disk checkpoint remains available.

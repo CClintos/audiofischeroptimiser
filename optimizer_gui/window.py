@@ -34,7 +34,8 @@ from .backend import (
     memory_guard_status, powershell_command, process_is_running,
     process_tree_memory, release_run_claim, save_role_map, stop_process_tree,
     start_detached_process, suggest_measurement_role, timestamped_run_root,
-    update_run_claim, validate_config,
+    runner_completed_successfully, runner_failure_reason, update_run_claim,
+    validate_config,
 )
 from . import __version__
 from .reporting import (
@@ -868,6 +869,14 @@ class OptimizerWindow(QMainWindow):
         self.ram_slider.setValue(50)
         self.ram_label = QLabel("50% of RAM")
         self.ram_slider.valueChanged.connect(lambda value: self.ram_label.setText(f"{value}% of RAM"))
+        ram_help = (
+            "Safety ceiling only. The optimizer does not try to fill this amount of RAM; "
+            "it stops safely if the complete process tree reaches the selected percentage."
+        )
+        self.ram_slider.setToolTip(ram_help)
+        self.ram_label.setToolTip(ram_help)
+        ram_title = QLabel("RAM safety stop limit")
+        ram_title.setToolTip(ram_help)
         ram_box = QHBoxLayout()
         ram_box.addWidget(self.ram_slider, 1)
         ram_box.addWidget(self.ram_label)
@@ -882,7 +891,7 @@ class OptimizerWindow(QMainWindow):
         grid.addWidget(QLabel("CPU target"), 1, 0)
         grid.addWidget(self.cpu_control, 1, 1, 1, 2)
         grid.addWidget(self.phase_cpu_value, 1, 1, 1, 2)
-        grid.addWidget(QLabel("Optimizer RAM limit"), 2, 0)
+        grid.addWidget(ram_title, 2, 0)
         grid.addLayout(ram_box, 2, 1, 1, 2)
         grid.addWidget(QLabel("Workflow"), 3, 0)
         grid.addWidget(self.workflow_value, 3, 1, 1, 2)
@@ -1981,7 +1990,11 @@ class OptimizerWindow(QMainWindow):
         self._read_runner_log()
         if not self._run_is_active():
             if not self.process_finished_handled:
-                exit_code = 0 if locate_summary(Path(self.config.run_root)) else 1
+                exit_code = (
+                    0
+                    if runner_completed_successfully(Path(self.config.run_root))
+                    else 1
+                )
                 self._process_finished(exit_code, None)
             return
         elapsed = max(0.0, time.monotonic() - self.started_monotonic)
@@ -2110,10 +2123,11 @@ class OptimizerWindow(QMainWindow):
             self.tabs.setCurrentIndex(self.TAB_RESULTS)
         elif self.config.status not in ("stopped", "memory_stopped"):
             self.config.status = "failed"
-            self.config.error = f"Optimizer exited with code {exit_code}"
+            self.config.error = runner_failure_reason(Path(self.config.run_root))
             self.config.save()
             self._remember_run(self.config)
             self.run_badge.setText("FAILED")
+            self.phase_label.setText("Failed")
             self.run_log.append(self.config.error)
         self.start_button.setEnabled(True)
 
@@ -2161,7 +2175,12 @@ class OptimizerWindow(QMainWindow):
             self.tabs.setCurrentIndex(self.TAB_RUN)
             return
         summary = locate_summary(root)
-        if summary:
+        legacy_complete = (
+            summary is not None
+            and config.status in ("complete", "stopped_complete")
+            and not (root / ".runner_failed").exists()
+        )
+        if summary and (runner_completed_successfully(root) or legacy_complete):
             if config.status in ("running", "running_detached", "resuming"):
                 config.status = "complete"
                 config.summary_path = str(summary)
@@ -2176,7 +2195,21 @@ class OptimizerWindow(QMainWindow):
             self.tabs.setTabToolTip(self.TAB_RESULTS, "Review and export completed candidates.")
             self.tabs.setCurrentIndex(self.TAB_RESULTS)
         else:
-            reply = QMessageBox.question(self, "Resume run", "No merged result exists. Resume this run from its checkpoints?")
+            failure = runner_failure_reason(root) if (root / ".runner_failed").exists() else ""
+            if failure:
+                config.status = "failed"
+                config.error = failure
+                config.save()
+                self._remember_run(config)
+                self.run_badge.setText("FAILED - RESUMABLE")
+                self.run_log.setPlainText(failure)
+            prompt = (
+                f"The previous run failed before producing a verified result.\n\n{failure}\n\n"
+                "Resume it from the intact checkpoints?"
+                if failure else
+                "No merged result exists. Resume this run from its checkpoints?"
+            )
+            reply = QMessageBox.question(self, "Resume run", prompt)
             if reply == QMessageBox.Yes:
                 self.start_run(root)
 
