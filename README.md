@@ -126,17 +126,79 @@ REW exports can contain frequency/SPL only, or include phase, coherence, and
 position columns. For phase work, keep the microphone fixed and use the same
 acoustic timing reference for the complete session.
 
-## How suggestions are chosen
+## How the tuning methodology and scoring work
 
-The app does not simply flatten a graph. It compares candidate changes with the
-measured system response, target shape, left/right balance, audible peaks,
-driver operating range, filter count, and available headroom. It prefers fewer,
-wider and shallower corrections, with cuts favoured over boosts.
+The app does not try to make a line on a graph as flat as possible. It starts
+with the tune and response you actually measured, predicts the effect of each
+candidate filter on the relevant drivers and the combined system, then compares
+every candidate against the same target and the same current-tune baseline.
 
-This makes the result a shortlist of measured, constrained options—not an
-automatic promise that every curve will sound better in every car. The app shows
-when an option is not meaningfully better than your current tune, so keeping the
-baseline is always a valid result.
+The objective is a single score used throughout the search: lower is better.
+The number is useful for comparing candidates from the same run; it is not a
+universal sound-quality rating for different cars or measurement sessions.
+
+### 1. Start from the measured baseline
+
+The baseline AFPX is decoded so existing filters are part of the model. The
+target is anchored once to the measured System Sum, then kept fixed while every
+candidate is compared. This prevents a candidate from looking better only
+because the target was moved to suit it.
+
+The app models individual drivers first, then recombines their predicted change
+through the measured pair and system response. A one-sided filter is therefore
+not treated as though it changes the whole car by the same number of decibels.
+
+### 2. Score the parts of a useful result
+
+Each candidate is judged on the following evidence together:
+
+| What is scored | Why it matters |
+| --- | --- |
+| System-to-target error | Reduces broad tonal error across the usable listening range. The vocal and presence region is weighted so a bass improvement cannot hide an obvious midrange problem. |
+| Target-shape delivery | Checks whether the requested local contour, especially through the presence region, was actually delivered rather than only improving a full-range average. |
+| Broad and narrow peaks | Penalises audible positive peaks, including narrow issues that broad smoothing can hide. |
+| Left/right balance | Uses the separate driver traces to penalise level mismatch and image pull rather than letting opposite-side errors cancel out. |
+| Worst-case response | Stops a candidate winning because it improves the average while leaving one obvious problem behind. |
+| Optional seat measurements | When centre, left-ear, or right-ear system sums are supplied, the candidate must hold up across them instead of chasing one microphone position. |
+| Headroom and filter cost | Penalises excessive combined boost, unnecessary output gain, too many filters, high-Q corrections, deep cuts, and filters outside a driver's useful range. |
+
+The result is not simply the candidate with the most filters or the flattest
+single trace. The search favours the smallest correction that makes a meaningful
+improvement across the evidence available.
+
+### 3. Treat nulls and missing evidence honestly
+
+If the measurements show a destructive acoustic cancellation, that region is
+masked from the tonal reward and positive EQ there is penalised. The app does
+not call a deep null a "peak to fix" and boost into it.
+
+When individual drivers and System Sum are present but a `Together` trace is
+missing, PEQ can still use the measured solo drivers plus system response.
+Pair-summation and null checks for that missing pair are shown as unavailable.
+The app does not invent phase evidence from magnitude data.
+
+### 4. Use a stricter method for phase, delay, and all-pass changes
+
+PEQ is a magnitude workflow. Phase-related changes need a fresh,
+timing-referenced sweep session. Before the app can write polarity, relative
+delay, or a residual all-pass filter, it checks that the measured solo phase can
+reproduce the measured together/system behaviour in the crossover band. It also
+rejects mixed timing references, weak or ambiguous improvements, and conflicts
+with available impulse evidence.
+
+If those gates do not pass, phase controls stay untouched. The app can still
+complete a PEQ run; it simply does not make a phase claim it cannot support.
+
+### 5. Keep the baseline and verify the output
+
+Your original tune is always retained as a candidate. If a generated option is
+not meaningfully better than the baseline, the results say so rather than
+forcing a change. Every written AFPX candidate is decoded and checked against
+the baseline to confirm that only the permitted fields changed.
+
+This produces a constrained shortlist to test in the car, not an automatic
+promise that a graph will sound better everywhere. Load a candidate, listen,
+and re-measure before making it your final tune.
 
 ## AFPX and PCT6 support
 
