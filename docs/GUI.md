@@ -7,7 +7,9 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 
 1. Start on **Home** and choose the workflow that matches the measurements available.
 2. For a normal tune, open **PEQ / RTA**, drop in magnitude/RTA measurements and
-   the current AFPX, then validate and run. Beam search is used with phase writes disabled.
+   the current AFPX, then validate and run. Each worker begins with a deterministic
+   Beam pass, then makes small data-guided variations until the selected run time
+   ends. Phase writes remain disabled.
 3. Load the selected PEQ result into the DSP and take fresh phase-valid sweeps.
 4. In **Sweeps / Phase**, select the fresh sweep folder and use the PEQ result as
    the baseline. This stage preserves PEQ and searches no new PEQ filters.

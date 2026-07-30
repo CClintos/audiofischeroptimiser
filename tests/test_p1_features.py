@@ -87,6 +87,11 @@ class CacheTests(unittest.TestCase):
 
 
 class BeamSearchTests(unittest.TestCase):
+    def test_peq_beam_continues_with_guided_variations_until_its_deadline(self) -> None:
+        self.assertTrue(stream.beam_uses_timed_guided_continuation("beam", "peq"))
+        self.assertFalse(stream.beam_uses_timed_guided_continuation("beam", "phase"))
+        self.assertFalse(stream.beam_uses_timed_guided_continuation("guided", "peq"))
+
     def test_guided_pool_can_express_broad_matched_front_target_shape(self) -> None:
         freqs = np.geomspace(80.0, 16000.0, 768)
         flat = np.full_like(freqs, 60.0)

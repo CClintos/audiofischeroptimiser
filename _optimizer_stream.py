@@ -355,6 +355,17 @@ def deterministic_beam_combinations(pools, component_score, beam_width: int = 24
     return beam, evaluations
 
 
+def beam_uses_timed_guided_continuation(proposal: str, mode: str) -> bool:
+    """Whether a normal PEQ Beam pass should use the remaining run budget.
+
+    Beam exhausts a finite, deterministic set of candidate combinations quickly.
+    PEQ runs therefore continue from that seeded pass with small, data-guided
+    variations until their requested deadline.  The phase diagnostic stays a
+    deliberately bounded baseline-only pass.
+    """
+    return proposal == "beam" and mode == "peq"
+
+
 def gain_to_unit(gain: float, cfg: Dict[str, object]) -> float:
     glo, ghi = cfg["gain_range"]
     return float(np.clip((float(gain) - glo) / max(float(ghi - glo), 1e-9), 0.0, 1.0))
@@ -1042,6 +1053,11 @@ def main():
             "evaluations": beam_evaluations,
             "retained": len(beam_entries),
             "order_seed": beam_order_seed,
+            "continuation": (
+                "guided_until_deadline"
+                if beam_uses_timed_guided_continuation(args.proposal, args.mode)
+                else "none"
+            ),
         }
     while True:
         now = time.monotonic()
@@ -1051,7 +1067,9 @@ def main():
             break
         if args.max_trials and trials >= args.max_trials:
             break
-        if args.proposal == "beam":
+        if args.proposal == "beam" and not beam_uses_timed_guided_continuation(
+            args.proposal, args.mode
+        ):
             break
         cma_x = None
         if args.proposal == "cmaes":

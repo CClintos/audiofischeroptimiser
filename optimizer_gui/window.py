@@ -872,7 +872,7 @@ class OptimizerWindow(QMainWindow):
         ram_box.addWidget(self.ram_slider, 1)
         ram_box.addWidget(self.ram_label)
 
-        self.workflow_value = QLabel("PEQ / RTA - Beam search")
+        self.workflow_value = QLabel("PEQ / RTA - Beam search + guided continuation")
         self.workflow_value.setObjectName("metricValue")
 
         grid.addWidget(QLabel("Run length"), 0, 0)
@@ -1729,8 +1729,8 @@ class OptimizerWindow(QMainWindow):
             tone_options = mode == "peq"
             labels = {
                 "phase": "Sweeps / Phase - preserve PEQ, gated phase writes only",
-                "retarget": "Retarget - Beam search to new curve, no phase writes",
-                "peq": "PEQ / RTA - Beam search, no phase writes",
+                "retarget": "Retarget - Beam search + guided continuation, no phase writes",
+                "peq": "PEQ / RTA - Beam search + guided continuation, no phase writes",
             }
             self.workflow_value.setText(labels[mode])
             self.preset_combo.setEnabled(not phase_mode)

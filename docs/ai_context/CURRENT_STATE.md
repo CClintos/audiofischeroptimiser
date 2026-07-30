@@ -35,7 +35,9 @@ record.
 - Optional left-ear/right-ear system sums are discovered automatically. The
   scalar combines centre-weighted median, 80th-percentile, and worst-position
   error; narrow/asymmetric filters are penalized when they fail at an ear.
-- The one-command runner defaults to deterministic seed-sharded beam search.
+- The one-command runner starts with deterministic seed-sharded Beam search,
+  then uses the remaining selected PEQ/Retarget run time for data-guided
+  variations. The phase diagnostic remains a short baseline-only pass.
   Guided/CMA remain available for comparisons and fallback runs.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
 - `assistant_summary.json` contains only the decision core; `optimizer_summary.json`
@@ -99,7 +101,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.4.0` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.4.3` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
