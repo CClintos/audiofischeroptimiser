@@ -74,7 +74,10 @@ if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
 Set-RunPhase "searching"
-& (Join-Path $here "run_guided_stream_workers.ps1") @launch *> $null
+& (Join-Path $here "run_guided_stream_workers.ps1") @launch
+if ($LASTEXITCODE -ne 0) {
+    throw "Optimizer worker launch failed. See the run log above for the detailed error."
+}
 
 $processFile = Join-Path $Root "worker_processes.json"
 if (-not (Test-Path -LiteralPath $processFile)) { throw "Worker process manifest was not created." }

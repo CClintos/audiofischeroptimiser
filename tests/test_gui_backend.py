@@ -3,17 +3,19 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
     export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
-    save_role_map, suggest_measurement_role, timestamped_run_root, validate_config,
+    save_role_map, start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
 )
 from optimizer_gui import __version__
 from optimizer_gui.reporting import (
@@ -29,7 +31,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.4.1")
+        self.assertEqual(__version__, "0.4.2")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -50,6 +52,20 @@ class GuiJobTests(unittest.TestCase):
                 claim_run_root(first, os.getpid())
             release_run_claim(first, os.getpid())
             self.assertEqual(active_run_pid(first), 0)
+
+    def test_windows_runner_uses_hidden_process_group_without_detached_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "runner.log"
+            with patch(
+                "optimizer_gui.backend.subprocess.Popen",
+                return_value=SimpleNamespace(pid=1234),
+            ) as popen:
+                pid = start_detached_process("powershell.exe", ["-NoProfile"], Path(tmp), log_path)
+        self.assertEqual(pid, 1234)
+        flags = popen.call_args.kwargs["creationflags"]
+        self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+        self.assertFalse(flags & subprocess.DETACHED_PROCESS)
 
     def test_start_button_boolean_is_not_treated_as_resume_path(self) -> None:
         calls = []

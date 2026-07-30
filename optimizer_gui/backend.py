@@ -138,9 +138,13 @@ def start_detached_process(
         "close_fds": True,
     }
     if os.name == "nt":
+        # A Windows child process does not need DETACHED_PROCESS to survive the
+        # GUI closing. That flag also makes powershell.exe exit silently when
+        # its standard streams are redirected to the run log. A new process
+        # group plus CREATE_NO_WINDOW keeps the runner independent and hidden
+        # without losing the launch error/output.
         kwargs["creationflags"] = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
     else:
