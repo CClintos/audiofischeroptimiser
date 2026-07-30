@@ -44,7 +44,12 @@ for _var in (
 
 import numpy as np
 import optuna
-from scripts.make_measurement_manifest import build_manifest, load_role_map, mapped_measurement
+from scripts.make_measurement_manifest import (
+    build_manifest,
+    load_role_map,
+    mapped_measurement,
+    optional_pair_roles,
+)
 
 from _make_v3 import (
     add_bands,
@@ -133,7 +138,7 @@ def sync_external_objective(baseline: Path | None = None, target: Path | None = 
     if changed:
         for name, value in (
             ("_F", None), ("_T", {}), ("_TGT", None), ("_NULL_MASK", None),
-            ("_V5", None), ("_BASE_OUTPUT_DB", []),
+            ("_V5", None), ("_BASE_OUTPUT_DB", []), ("_SYNTHETIC_PAIRS", set()),
         ):
             if hasattr(AFPX_OBJECTIVE, name):
                 setattr(AFPX_OBJECTIVE, name, value)
@@ -160,14 +165,12 @@ def detect_front_layout(data_root: Path = DATA_ROOT) -> str:
         mapped_measurement(data_root, role, ROLE_MAP) or _has_any(data_root, aliases)
         for role, aliases in (
             ("FL Mid", MID_ALIASES_L), ("FR Mid", MID_ALIASES_R),
-            ("Mids Together", MID_PAIR_ALIASES),
         )
     )
     has_low = all(
         mapped_measurement(data_root, role, ROLE_MAP) or _has_any(data_root, aliases)
         for role, aliases in (
             ("FL Low", LOW_ALIASES_L), ("FR Low", LOW_ALIASES_R),
-            ("Mid Bass Together", LOW_PAIR_ALIASES),
         )
     )
     return "3way" if has_mid and has_low else "2way"
@@ -221,6 +224,10 @@ def resolve_measurement_files(data_root: Path = DATA_ROOT) -> Dict[str, Path]:
 
 
 MEASUREMENT_FILES = resolve_measurement_files()
+OPTIONAL_PAIR_ROLES = optional_pair_roles(
+    "front_3way_plus_sub" if FRONT_LAYOUT == "3way" else "front_2way_plus_sub"
+)
+SYNTHETIC_PAIR_ROLES: set[str] = set()
 
 
 def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str, object]]:
@@ -450,7 +457,12 @@ def measurement_session_audit(manifest: Dict[str, object], calibration: Dict[str
             missing_calibration.append(role)
     tonal_valid = not manifest.get("measurements_missing") and not missing_calibration
     timing_references = list(dict(manifest.get("measurement_conditions", {})).get("timing_references", []))
-    phase_valid = bool(tonal_valid and manifest.get("phase_available") and len(timing_references) == 1)
+    phase_valid = bool(
+        tonal_valid
+        and manifest.get("pair_measurements_complete", True)
+        and manifest.get("phase_available")
+        and len(timing_references) == 1
+    )
     warnings = list(manifest.get("warnings", []))
     if missing_calibration:
         warnings.append("uncalibrated_level_mismatch:" + ",".join(missing_calibration))
@@ -460,6 +472,8 @@ def measurement_session_audit(manifest: Dict[str, object], calibration: Dict[str
         warnings.append("phase_writes_disabled_mixed_timing_references")
     elif not timing_references:
         warnings.append("phase_writes_disabled_timing_reference_missing")
+    if manifest.get("optional_missing_roles"):
+        warnings.append("phase_writes_disabled_pair_measurements_missing")
     return {
         "tonal_valid": bool(tonal_valid),
         "phase_valid": phase_valid,
@@ -572,8 +586,13 @@ def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def load_measurements(level_calibration: Dict[str, float] | None = None) -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
+    global SYNTHETIC_PAIR_ROLES
     level_calibration = level_calibration or {}
-    missing = [str(p) for p in MEASUREMENT_FILES.values() if not p.exists()]
+    SYNTHETIC_PAIR_ROLES = set()
+    missing = [
+        str(path) for role, path in MEASUREMENT_FILES.items()
+        if role not in OPTIONAL_PAIR_ROLES and not path.exists()
+    ]
     if missing:
         raise FileNotFoundError("Missing measurement file(s):\n  " + "\n  ".join(missing))
 
@@ -589,10 +608,24 @@ def load_measurements(level_calibration: Dict[str, float] | None = None) -> Tupl
     for name, path in MEASUREMENT_FILES.items():
         if name == "System Sum":
             continue
+        if name in OPTIONAL_PAIR_ROLES and not path.exists():
+            continue
         measurement = load_rew_export(path)
         measurement["spl"] = measurement["spl"] + calibration_offset(level_calibration, name, path)
         traces[name] = np.interp(log_base, np.log10(measurement["freq"]), measurement["spl"])
         rich[name] = interp_rich_trace(measurement, base_f)
+    for pair in PAIR_DEFS.values():
+        together = str(pair["together"])
+        if together in traces:
+            continue
+        synthesized = power_sum_db([traces[str(pair["left"])], traces[str(pair["right"])]])
+        traces[together] = synthesized
+        rich[together] = {
+            "freq": base_f.copy(),
+            "spl": synthesized.copy(),
+            "synthetic_pair": np.ones_like(base_f),
+        }
+        SYNTHETIC_PAIR_ROLES.add(together)
     return base_f, traces, rich
 
 
@@ -1015,6 +1048,17 @@ def null_masks(freqs: np.ndarray, traces: TraceMap) -> Dict[str, np.ndarray]:
 def pair_sum_validation(freqs: np.ndarray, traces: TraceMap, threshold: float = 2.5) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for name, pair in PAIR_DEFS.items():
+        if pair["together"] in SYNTHETIC_PAIR_ROLES:
+            rows.append({
+                "pair": name,
+                "together": pair["together"],
+                "rms_db": None,
+                "pass": None,
+                "available": False,
+                "reason": "Measured together trace is optional and was not supplied",
+                "threshold_db": float(threshold),
+            })
+            continue
         psum = power_sum_db([traces[pair["left"]], traces[pair["right"]]])
         diff = erb_smooth(freqs, traces[pair["together"]] - psum)
         lo, hi = pair["branch_band"]
@@ -1025,6 +1069,7 @@ def pair_sum_validation(freqs: np.ndarray, traces: TraceMap, threshold: float = 
             "together": pair["together"],
             "rms_db": round(rms, 2),
             "pass": bool(rms <= threshold),
+            "available": True,
             "threshold_db": float(threshold),
         })
     return rows
@@ -2930,7 +2975,7 @@ def main() -> None:
     args.phase_diagnostic_cache = phase_session["cache"]
     args.phase_session = phase_session
     phase_plan = phase_session["writes"]
-    failed_validation = [item for item in args.validation if not item["pass"]]
+    failed_validation = [item for item in args.validation if item.get("pass") is False]
     if failed_validation:
         details = "; ".join(
             f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB"

@@ -87,7 +87,7 @@ def main():
     crossover_rows = phase_session["diagnostics"]
     phase_diagnostic_cache = phase_session["cache"]
     phase_plan = phase_session["writes"]
-    failed_validation = [item for item in validation if not item["pass"]]
+    failed_validation = [item for item in validation if item.get("pass") is False]
     if failed_validation:
         details = "; ".join(
             f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB"

@@ -944,7 +944,7 @@ def main():
     target = raw_target + opt.target_anchor_offset(freqs, traces["System Sum"], raw_target)
     base_xml = opt.decode_afpx(args.baseline)
     args.validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
-    failed_validation = [item for item in args.validation if not item["pass"]]
+    failed_validation = [item for item in args.validation if item.get("pass") is False]
     if failed_validation:
         details = "; ".join(
             f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB"

@@ -11,8 +11,11 @@ optimizer. It is a native PySide6 application and does not use a cloud service.
 3. Load the selected PEQ result into the DSP and take fresh phase-valid sweeps.
 4. In **Sweeps / Phase**, select the fresh sweep folder and use the PEQ result as
    the baseline. This stage preserves PEQ and searches no new PEQ filters.
-5. Validate the measurement session. Missing files, tonal provenance, phase
-   references, and solo/together gates are checked before workers start.
+5. Validate the measurement session. Core files, tonal provenance, phase
+   references, and available solo/together gates are checked before workers start.
+   PEQ requires each individual driver plus Sub and System Sum. Together-pair
+   traces are recommended but optional; missing pairs reduce the available
+   diagnostics and disable phase writes without blocking PEQ.
    When filenames are unfamiliar, map every TXT file to its measurement role in
    the in-app dialog. The run stores `role_map.json`, and remembered names are
    suggested automatically in later sessions.

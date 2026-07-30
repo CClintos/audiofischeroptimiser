@@ -158,18 +158,29 @@ def measurement_spec(layout: str) -> dict[str, tuple[str, ...]]:
     return spec
 
 
+def optional_pair_roles(layout: str) -> set[str]:
+    roles = {"Tweeters Together", "Mid Bass Together"}
+    if layout == "front_3way_plus_sub":
+        roles.add("Mids Together")
+    return roles
+
+
+def core_measurement_roles(layout: str) -> set[str]:
+    return set(measurement_spec(layout)) - optional_pair_roles(layout)
+
+
 def detect_layout(root: Path, role_map: dict[str, str] | None = None) -> str:
     mapped = role_map or {}
     has_mid = all(
         mapped_measurement(root, role, mapped) or first_existing(root, aliases)
         for role, aliases in (
-            ("FL Mid", MID_L), ("FR Mid", MID_R), ("Mids Together", MID_PAIR),
+            ("FL Mid", MID_L), ("FR Mid", MID_R),
         )
     )
     has_low = all(
         mapped_measurement(root, role, mapped) or first_existing(root, aliases)
         for role, aliases in (
-            ("FL Low", LOW_L), ("FR Low", LOW_R), ("Mid Bass Together", LOW_PAIR),
+            ("FL Low", LOW_L), ("FR Low", LOW_R),
         )
     )
     return "front_3way_plus_sub" if has_mid and has_low else "front_2way_plus_sub"
@@ -185,6 +196,8 @@ def build_manifest(
     present: list[str] = []
     missing: list[str] = []
     missing_roles: list[str] = []
+    optional_missing: list[str] = []
+    optional_missing_roles: list[str] = []
     resolved: dict[str, str] = {}
     phase_files: list[str] = []
     coherence_files: list[str] = []
@@ -192,12 +205,17 @@ def build_manifest(
     metadata: dict[str, dict[str, object]] = {}
     impulse_files: dict[str, str] = {}
     spatial_bundles: dict[str, dict[str, str]] = {}
+    optional_roles = optional_pair_roles(layout)
 
     for role, aliases in spec.items():
         found = mapped_measurement(root, role, mapped_roles) or first_existing(root, aliases)
         if found is None:
-            missing.append(aliases[0])
-            missing_roles.append(role)
+            if role in optional_roles:
+                optional_missing.append(aliases[0])
+                optional_missing_roles.append(role)
+            else:
+                missing.append(aliases[0])
+                missing_roles.append(role)
             continue
         present.append(found.name)
         resolved[role] = str(found)
@@ -234,6 +252,8 @@ def build_manifest(
     warnings: list[str] = []
     if missing:
         warnings.append(f"missing_required_measurements:{len(missing)}")
+    if optional_missing_roles:
+        warnings.append("optional_pair_measurements_missing:" + ",".join(optional_missing_roles))
     if not baseline_path or not baseline_path.exists():
         warnings.append("baseline_missing")
     if not target_path or not target_path.exists():
@@ -273,6 +293,9 @@ def build_manifest(
         "measurements_present": sorted(present),
         "measurements_missing": sorted(missing),
         "missing_roles": missing_roles,
+        "optional_measurements_missing": sorted(optional_missing),
+        "optional_missing_roles": optional_missing_roles,
+        "pair_measurements_complete": not optional_missing_roles,
         "resolved_roles": resolved,
         "role_map": mapped_roles,
         "available_txt": sorted(path.name for path in root.glob("*.txt") if path.is_file()),
@@ -291,7 +314,11 @@ def build_manifest(
             "frequency_grid_count": len(grids),
         },
         "warnings": warnings,
-        "safe_mode": "crossover_ladder_available" if phase_available or impulse_available else "magnitude_only_peq",
+        "safe_mode": (
+            "crossover_ladder_available"
+            if not optional_missing_roles and (phase_available or impulse_available)
+            else "magnitude_only_peq"
+        ),
     }
 
 
@@ -305,6 +332,9 @@ def compact_manifest(manifest: dict[str, object]) -> dict[str, object]:
         "measurement_count": len(manifest["measurements_present"]),
         "missing": manifest["measurements_missing"],
         "missing_roles": manifest.get("missing_roles", []),
+        "optional_missing": manifest.get("optional_measurements_missing", []),
+        "optional_missing_roles": manifest.get("optional_missing_roles", []),
+        "pair_measurements_complete": manifest.get("pair_measurements_complete", True),
         "resolved_roles": manifest.get("resolved_roles", {}),
         "available_txt": manifest.get("available_txt", []),
         "phase_file_count": len(manifest["phase_files"]),

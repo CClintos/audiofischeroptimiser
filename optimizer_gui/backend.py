@@ -18,6 +18,7 @@ from typing import Any
 from scripts.make_measurement_manifest import (
     ALL_MEASUREMENT_ROLES, build_manifest, compact_manifest, detect_layout,
     first_existing, load_role_map, mapped_measurement, measurement_spec,
+    optional_pair_roles,
 )
 
 
@@ -577,6 +578,7 @@ def measurement_checklist(
     root = Path(root)
     mapped = load_role_map(role_map)
     layout = detect_layout(root, mapped) if root.is_dir() else "front_2way_plus_sub"
+    optional_roles = optional_pair_roles(layout)
     rows = []
     for role, aliases in measurement_spec(layout).items():
         path = mapped_measurement(root, role, mapped) or first_existing(root, aliases)
@@ -586,6 +588,7 @@ def measurement_checklist(
             "path": str(path) if path else "",
             "ready": bool(path and path.stat().st_size > 0),
             "empty": bool(path and path.stat().st_size == 0),
+            "required": role not in optional_roles,
         })
     return {"layout": layout, "rows": rows}
 
@@ -604,7 +607,10 @@ def create_measurement_template(destination: Path, layout: str) -> list[Path]:
     for path in targets[:-1]:
         path.touch(exist_ok=False)
     readme.write_text(
-        "Replace every empty TXT placeholder with the matching REW text export.\n"
+        "Replace the empty TXT placeholders with the matching REW text exports.\n"
+        "Required for PEQ: System Sum, Sub, and each individual front driver.\n"
+        "Optional but recommended: the left+right Together traces. They unlock measured "
+        "pair-summation, null, and phase validation; PEQ can run without them.\n"
         "Keep the microphone position, source volume, sweep level, and timing reference "
         "consistent for the entire session.\n"
         "Do not rename files after validation unless you validate again.\n",

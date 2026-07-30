@@ -1321,6 +1321,8 @@ class OptimizerWindow(QMainWindow):
         for row in checklist["rows"]:
             if row["ready"]:
                 marker, colour, detail = "&#10003;", "#176b4d", Path(row["path"]).name
+            elif not row.get("required", True):
+                marker, colour, detail = "&#9675;", "#9a6500", f"{row['expected']} (optional)"
             elif row["empty"]:
                 marker, colour, detail = "&#10007;", "#a12622", f"{row['expected']} (empty placeholder)"
             else:
@@ -1662,14 +1664,25 @@ class OptimizerWindow(QMainWindow):
                 f"Spatial positions: {', '.join(compact['spatial_positions']) or 'centre only'}",
             ]
             if compact["missing"]:
-                lines.append("\nMissing:\n- " + "\n- ".join(compact["missing"]))
+                lines.append("\nMissing required:\n- " + "\n- ".join(compact["missing"]))
+            if compact.get("optional_missing"):
+                lines.append(
+                    "\nOptional pair traces not supplied (PEQ can continue):\n- "
+                    + "\n- ".join(compact["optional_missing"])
+                )
             preflight = result.get("preflight") or {}
             for row in preflight.get("pair_validation", []):
-                verdict = "PASS" if row.get("pass") else "FAIL"
-                lines.append(
-                    f"Pair gate {row.get('pair')}: {row.get('rms_db')} dB / "
-                    f"{row.get('threshold_db')} dB - {verdict}"
-                )
+                if row.get("pass") is None:
+                    lines.append(
+                        f"Pair gate {row.get('pair')}: NOT AVAILABLE - "
+                        "using individual drivers plus System Sum for PEQ"
+                    )
+                else:
+                    verdict = "PASS" if row.get("pass") else "FAIL"
+                    lines.append(
+                        f"Pair gate {row.get('pair')}: {row.get('rms_db')} dB / "
+                        f"{row.get('threshold_db')} dB - {verdict}"
+                    )
             audit = preflight.get("measurement_session") or {}
             if audit:
                 lines.append(

@@ -31,7 +31,7 @@ def main() -> None:
     opt.sync_external_objective(args.baseline, args.target, calibration)
     freqs, traces, rich = opt.load_measurements(calibration)
     validation = opt.pair_sum_validation(freqs, traces, threshold=args.validation_threshold)
-    failed = [item for item in validation if not item["pass"]]
+    failed = [item for item in validation if item.get("pass") is False]
     if failed:
         raise SystemExit("Measurement validation gate failed: " + "; ".join(
             f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB" for item in failed

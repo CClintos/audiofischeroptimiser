@@ -10,6 +10,12 @@ WARNING_TEXT: dict[str, dict[str, str]] = {
         "meaning": "The optimizer cannot identify every trace needed for this speaker layout.",
         "remedy": "Map the files to speaker roles, or export the missing measurements from REW.",
     },
+    "optional_pair_measurements_missing": {
+        "severity": "warning",
+        "title": "Optional pair measurements are missing",
+        "meaning": "PEQ will use the individual drivers and measured System Sum, but it cannot verify how the missing left-and-right pair sums acoustically.",
+        "remedy": "You may continue with PEQ. Export the Together traces from REW later to restore pair-null and summation validation.",
+    },
     "baseline_missing": {
         "severity": "error",
         "title": "Baseline tune is missing",
@@ -75,6 +81,12 @@ WARNING_TEXT: dict[str, dict[str, str]] = {
         "title": "Phase writes are disabled",
         "meaning": "No shared timing reference was found in the sweep metadata.",
         "remedy": "Re-measure using REW acoustic timing reference and keep the reference speaker unchanged.",
+    },
+    "phase_writes_disabled_pair_measurements_missing": {
+        "severity": "warning",
+        "title": "Phase writes are disabled",
+        "meaning": "A measured Together trace is missing, so acoustic pair summation cannot be validated.",
+        "remedy": "Capture each missing Together trace with the same microphone position and acoustic timing reference before applying delay, polarity, or APF changes.",
     },
     "large_boosts": {
         "severity": "warning",

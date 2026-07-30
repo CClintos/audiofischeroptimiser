@@ -50,8 +50,15 @@ warnings, and what to verify in the car. Every completed run writes
 
 ## Download or Run
 
-There is currently no prebuilt EXE published in GitHub Releases. To run the app
-from source:
+For the normal Windows app, download the
+[latest Windows package](https://github.com/CClintos/audiofischeroptimiser/releases/latest/download/AudioFischerOptimizer-windows-x64.zip),
+extract the ZIP, and run `AudioFischerOptimizer.exe`. Keep the extracted
+`_internal` folder beside the EXE. No Python installation is required.
+
+All published versions and checksums are available on the
+[GitHub Releases page](https://github.com/CClintos/audiofischeroptimiser/releases).
+
+Developers can run the app from source:
 
 ```powershell
 .\setup_gui.ps1
@@ -168,9 +175,11 @@ Polarity/delay/APF changes may be written only when the crossover ladder clears 
 
 ## Measurement Inputs
 
-Canonical measurement filenames are listed below. They are no longer mandatory:
-if a folder uses names such as `FL High Sweep.txt`, the GUI opens a
+Canonical measurement filenames are listed below. The names themselves are not
+mandatory: if a folder uses names such as `FL High Sweep.txt`, the GUI opens a
 fuzzy-prefilled role-mapping dialog and can remember that naming for later runs.
+
+Required for a PEQ run:
 
 - `System Sum.txt`
 - `Sub.txt`
@@ -178,10 +187,22 @@ fuzzy-prefilled role-mapping dialog and can remember that naming for later runs.
 - `Front R High.txt` or `Front R Tweeter.txt`
 - `Front L Low.txt` or `Front L Mid.txt`
 - `Front R Low.txt` or `Front R Mid.txt`
+
+Recommended pair evidence, but optional for PEQ:
+
 - `Tweeters Together.txt` or `Both Tweeters.txt`
 - `Mid Bass Together.txt` or `Both Mids.txt`
 
-For a true front 3-way system, also provide separate mid and low branch measurements so the optimizer can detect and score `high + mid + low + sub` instead of the simpler 2-way front layout.
+When a pair trace is absent, the optimizer uses the two measured solo drivers
+plus the measured System Sum for conservative magnitude scoring. It clearly
+marks pair-summation/null validation as unavailable and disables phase, delay,
+polarity, and APF writes. Supplying the pair trace restores those evidence
+checks.
+
+For a true front 3-way system, separate left/right mid and low branch
+measurements are required so the optimizer can detect and score
+`high + mid + low + sub`. The corresponding `Mids Together` and
+`Mid Bass Together` traces remain recommended pair evidence.
 
 Expected tune file:
 
@@ -211,8 +232,9 @@ Expected tune file:
 - [pct6.py](./pct6.py): beta `.pct6` decode / encode utility for no-password PC-Tool 6 saves
 - [PCT6_SUPPORT.md](./PCT6_SUPPORT.md): caveats and safe usage notes for `.pct6`
 
-Required measurements now fail fast when missing, malformed, non-monotonic, or
-truncated. Optional phase, coherence, and position columns remain supported.
+Required measurements fail fast when missing, malformed, non-monotonic, or
+truncated. Optional pair traces and phase, coherence, and position data extend
+the available diagnostics without blocking a magnitude-only PEQ run.
 
 The optimizer normalizes REW exports to the 96-points-per-octave grid used by its
 ERB and perceptual scoring math. The streaming search then applies a small

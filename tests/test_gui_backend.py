@@ -12,7 +12,7 @@ from unittest.mock import patch
 from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
-    export_candidate, load_target_curve, powershell_command, release_run_claim,
+    export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
     save_role_map, suggest_measurement_role, timestamped_run_root, validate_config,
 )
 from optimizer_gui import __version__
@@ -29,7 +29,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(__version__, "0.4.1")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -193,6 +193,35 @@ class GuiJobTests(unittest.TestCase):
         )
         self.assertEqual(manifest["detected_layout"], "front_2way_plus_sub")
 
+    def test_together_traces_are_optional_for_peq_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = "\n".join(f"{20 + index} {70 + index / 10}" for index in range(20))
+            for filename in (
+                "System Sum.txt", "Sub.txt", "Front L High.txt", "Front R High.txt",
+                "Front L Low.txt", "Front R Low.txt",
+            ):
+                (root / filename).write_text(rows, encoding="utf-8")
+            baseline = root / "baseline.afpx"
+            target = root / "target.txt"
+            baseline.write_bytes(b"test")
+            target.write_text("20 6\n1000 0\n20000 -4\n", encoding="utf-8")
+
+            manifest = build_manifest(root, baseline, target)
+            checklist = measurement_checklist(root)
+
+        self.assertEqual(manifest["measurements_missing"], [])
+        self.assertEqual(
+            set(manifest["optional_missing_roles"]),
+            {"Tweeters Together", "Mid Bass Together"},
+        )
+        self.assertFalse(manifest["pair_measurements_complete"])
+        self.assertIn("optional_pair_measurements_missing:", " ".join(manifest["warnings"]))
+        optional_rows = [row for row in checklist["rows"] if not row["required"]]
+        self.assertEqual({row["role"] for row in optional_rows}, {
+            "Tweeters Together", "Mid Bass Together",
+        })
+
     def test_independent_objective_consumes_role_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -240,6 +269,9 @@ class GuiJobTests(unittest.TestCase):
         self.assertIn("without touching the volume knob", warning["text"])
         dynamic = warning_info("missing_required_measurements:3")
         self.assertIn("Details: 3", dynamic["text"])
+        optional = warning_info("optional_pair_measurements_missing:Tweeters Together")
+        self.assertEqual(optional["severity"], "warning")
+        self.assertIn("You may continue with PEQ", optional["text"])
 
     def test_results_chart_uses_fixed_anchor_response_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

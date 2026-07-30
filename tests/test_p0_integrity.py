@@ -192,6 +192,63 @@ class MeasurementSessionGateTests(unittest.TestCase):
         self.assertTrue(audit["tonal_valid"])
         self.assertFalse(audit["phase_valid"])
 
+    def test_missing_optional_pair_keeps_tonal_valid_but_disables_phase(self) -> None:
+        manifest = _manifest([0.90] * 8)
+        manifest["optional_missing_roles"] = ["Tweeters Together"]
+        manifest["pair_measurements_complete"] = False
+        audit = optimizer.measurement_session_audit(manifest, {})
+        self.assertTrue(audit["tonal_valid"])
+        self.assertFalse(audit["phase_valid"])
+        self.assertIn("phase_writes_disabled_pair_measurements_missing", audit["warnings"])
+
+    def test_missing_pair_is_synthesized_and_validation_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            freqs = np.geomspace(20.0, 20000.0, 64)
+            paths = {
+                "System Sum": root / "System Sum.txt",
+                "Sub": root / "Sub.txt",
+                "FL High": root / "FL High.txt",
+                "FR High": root / "FR High.txt",
+                "Tweeters Together": root / "missing high pair.txt",
+                "FL Low": root / "FL Low.txt",
+                "FR Low": root / "FR Low.txt",
+                "Mid Bass Together": root / "Mid Bass Together.txt",
+            }
+            for role, path in paths.items():
+                if role == "Tweeters Together":
+                    continue
+                levels = np.full_like(freqs, 60.0 if role != "Sub" else 45.0)
+                path.write_text(
+                    "\n".join(f"{f:.6f} {level:.6f}" for f, level in zip(freqs, levels)),
+                    encoding="utf-8",
+                )
+            pair_defs = {
+                "high": {
+                    "left": "FL High", "right": "FR High",
+                    "together": "Tweeters Together", "branch_band": (2000.0, 16000.0),
+                },
+                "low": {
+                    "left": "FL Low", "right": "FR Low",
+                    "together": "Mid Bass Together", "branch_band": (80.0, 2000.0),
+                },
+            }
+            with patch.multiple(
+                optimizer,
+                MEASUREMENT_FILES=paths,
+                OPTIONAL_PAIR_ROLES={"Tweeters Together", "Mid Bass Together"},
+                PAIR_DEFS=pair_defs,
+            ):
+                loaded_freqs, traces, rich = optimizer.load_measurements({})
+                validation = optimizer.pair_sum_validation(loaded_freqs, traces)
+
+        expected = optimizer.power_sum_db([traces["FL High"], traces["FR High"]])
+        np.testing.assert_allclose(traces["Tweeters Together"], expected)
+        self.assertIn("synthetic_pair", rich["Tweeters Together"])
+        high_row = next(row for row in validation if row["pair"] == "high")
+        self.assertIsNone(high_row["pass"])
+        self.assertFalse(high_row["available"])
+
 
 class PhasePeqProtectionTests(unittest.TestCase):
     def setUp(self) -> None:

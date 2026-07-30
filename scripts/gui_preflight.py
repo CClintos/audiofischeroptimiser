@@ -33,7 +33,7 @@ def main() -> None:
         optimizer.sync_external_objective(args.baseline, args.target, calibration)
         freqs, traces, _rich = optimizer.load_measurements(calibration)
         pairs = optimizer.pair_sum_validation(freqs, traces, args.validation_threshold)
-        failed = [row for row in pairs if not row["pass"]]
+        failed = [row for row in pairs if row.get("pass") is False]
         result = {
             "valid": not failed,
             "measurement_session": session.get("audit", {}),

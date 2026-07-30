@@ -12,8 +12,9 @@
 #   score_afpx(path)        -> parse an .afpx file and score it.
 # CLI: python afpx_objective.py candidate.afpx [candidate2.afpx ...]
 #
-# REQUIRES (same folder / same env): _tunefit.py, the 8 REW .txt solo/together
-# exports, the target curve, and the baseline .afpx that matches the measurements.
+# REQUIRES (same folder / same env): _tunefit.py, individual-driver and system-sum
+# REW exports, the target curve, and the baseline .afpx that matches them.
+# Measured left+right pair exports are recommended but optional for PEQ scoring.
 #
 # PEQ magnitude is always scored. When phase-valid solos reproduce the measured
 # together trace, candidate biquads are also complex-summed; otherwise the scorer
@@ -67,7 +68,7 @@ def _has_role(role, names):
     return bool(mapped and (REW_DIR / str(mapped)).is_file()) or _has_any(names)
 
 
-THREE_WAY = _has_role('FL Mid', ('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid')) and _has_role('FR Mid', ('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid')) and _has_role('Mids Together', ('Both Mids', 'Mids Together', 'Midrange Together')) and _has_role('FL Low', ('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low')) and _has_role('FR Low', ('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low')) and _has_role('Mid Bass Together', ('Mid Bass Together', 'Both Midbass', 'Both Midbasses', 'Both Mid Bass'))
+THREE_WAY = _has_role('FL Mid', ('Front L Mid', 'Front L MID', 'Front L Midrange', 'Front Left Mid')) and _has_role('FR Mid', ('Front R Mid', 'Front R MID', 'Front R Midrange', 'Front Right Mid')) and _has_role('FL Low', ('Front L Low', 'Front L Midbass', 'Front L Mid Bass', 'Front Left Low')) and _has_role('FR Low', ('Front R Low', 'Front R Midbass', 'Front R Mid Bass', 'Front Right Low'))
 
 if THREE_WAY:
     SOLO_FILES = {
@@ -197,7 +198,7 @@ def _load_txt(path):
     trace = _load_txt_rich(path)
     return trace['freq'], trace['spl']
 
-def _resolve_txt(names, role=None):
+def _resolve_txt(names, role=None, required=True):
     mapped = ROLE_MAP.get(role) if role else None
     if mapped:
         path = (REW_DIR / str(mapped)).resolve()
@@ -214,7 +215,9 @@ def _resolve_txt(names, role=None):
         if path.exists():
             return path
     expected = ', '.join(str(REW_DIR / (name + '.txt')) for name in names)
-    raise FileNotFoundError('Missing required measurement; expected one of: ' + expected)
+    if required:
+        raise FileNotFoundError('Missing required measurement; expected one of: ' + expected)
+    return None
 
 
 def _calibration_offset(role, path):
@@ -354,6 +357,7 @@ _TRACE_META = {}
 _COMPLEX_MODELS = {}
 _POSITION_COMPLEX_MODELS = {}
 _PREDICTION_AUDIT = {}
+_SYNTHETIC_PAIRS = set()
 
 
 def _attrs(t):
@@ -558,12 +562,17 @@ def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
     global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
     global _BASE_OUTPUT_DB, _TRACE_META, _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT
+    global _SYNTHETIC_PAIRS
     if _F is not None:
         return
     raw = {}
     F = None
+    pair_roles = {spec[2] for spec in PAIR_SPECS.values()}
+    _SYNTHETIC_PAIRS = set()
     for key, nm in SOLO_FILES.items():
-        path = _resolve_txt(nm, key)
+        path = _resolve_txt(nm, key, required=key not in pair_roles)
+        if path is None:
+            continue
         trace = _load_txt_rich(path)
         trace['spl'] = trace['spl'] + _calibration_offset(key, path)
         if F is None:
@@ -583,6 +592,18 @@ def _init():
         if 'coherence' in trace:
             aligned['coherence'] = np.interp(log_f, np.log10(source_f), trace['coherence'])
         _TRACE_META[key] = aligned
+    for _name, (left, right, together, _band_range, _balance) in PAIR_SPECS.items():
+        if together in _T:
+            continue
+        a = 10.0 ** (_T[left] / 10.0)
+        b = 10.0 ** (_T[right] / 10.0)
+        _T[together] = 10.0 * np.log10(np.maximum(a + b, 1e-30))
+        _TRACE_META[together] = {
+            'spl': _T[together],
+            'path': '',
+            'synthetic_pair': True,
+        }
+        _SYNTHETIC_PAIRS.add(together)
     _F = F
     _GRID_TOKEN = (len(F), float(F[0]), float(F[-1]), hash(F.tobytes()))
     _SMOOTHER = _build_smoother(F)
@@ -605,7 +626,8 @@ def _init():
         return flagged & band & alive
     _NULL_MASK = np.zeros_like(F, dtype=bool)
     for _name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
-        _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
+        if together not in _SYNTHETIC_PAIRS:
+            _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
     with open(BASELINE_AFPX, 'rb') as handle:
         baseline_xml = zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace')
     _V5 = _peqset(baseline_xml)

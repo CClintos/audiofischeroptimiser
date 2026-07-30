@@ -597,11 +597,12 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
 
     validation_rows = []
     for item in validation:
-        status = "PASS" if item.get("pass") else "FAIL"
-        validation_rows.append((
-            str(item.get("pair", "Pair")).title(),
-            f"{status}: {item.get('rms_db', '-')} dB RMS against {item.get('threshold_db', '-')} dB limit",
-        ))
+        if item.get("pass") is None:
+            detail = "NOT AVAILABLE: measured Together trace was not supplied; PEQ used the solo/system fallback"
+        else:
+            status = "PASS" if item.get("pass") else "FAIL"
+            detail = f"{status}: {item.get('rms_db', '-')} dB RMS against {item.get('threshold_db', '-')} dB limit"
+        validation_rows.append((str(item.get("pair", "Pair")).title(), detail))
     validation_html = _table(validation_rows) if validation_rows else "<p>No solo/together validation rows were available.</p>"
 
     filter_rows = []
