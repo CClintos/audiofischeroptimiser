@@ -1,77 +1,86 @@
 # AudioFischer Optimiser
 
-This repo is a local AFPX tuning tool for Helix / Audiotec Fischer DSP systems.
+AudioFischer Optimiser is a local Windows tuning app for Helix and Audiotec
+Fischer DSP systems. Give it a baseline `.afpx` tune, REW measurement exports,
+and a target curve; it searches for conservative improvements and produces
+ranked AFPX candidates to load and test in the car.
 
-The normal user interface is the Windows desktop app. AI-assisted and command-line
-work remain available, but neither Codex nor Claude is required to run a tune.
+The app runs entirely on your PC. Codex or Claude can help with development and
+advanced analysis, but neither is required to use it.
 
-## Windows App
+## What It Does
 
-The current source/package version is **0.4.0**. The version is shown in the
-window title and About tab so screenshots and support reports can be tied to the
-correct build.
+- **Optimises PEQ from real measurements.** It considers tonal accuracy, vocal
+  balance, peaks, left/right matching, filter cost, driver passbands, and
+  optional centre/left-ear/right-ear measurements.
+- **Supports 2-way and 3-way front stages plus subwoofer.** Common REW filenames
+  are recognised automatically, and unfamiliar names can be mapped to speaker
+  roles inside the app.
+- **Handles phase and timing as a separate measured workflow.** With coherent
+  solo/together sweeps, it can evaluate polarity, bounded relative delay, and a
+  residual all-pass filter around a crossover.
+- **Retargets an existing tune.** Take fresh measurements of the current tune,
+  select a different target curve, and optimise supported PEQ toward the new
+  tonal balance.
+- **Produces usable results.** Compare the current tune with the recommended
+  candidate, inspect the response chart and exact filters, export AFPX files,
+  and generate a local PDF tuning report with in-car checks.
+- **Keeps risky areas conservative.** It avoids treating destructive nulls as EQ
+  problems, prefers fewer/wider/shallower filters, never overwrites the baseline,
+  and does not rewrite crossover frequencies or slopes.
 
-For a packaged build, open `AudioFischerOptimizer.exe`. From source:
+AFPX is the primary and verified write path. The repository also includes beta
+`.pct6` container inspection and round-trip tools for newer DSP PC-Tool 6 saves;
+PCT6 output should still be verified in PC-Tool before use.
+
+## Desktop Workflows
+
+1. **PEQ / RTA** - use fresh magnitude or moving-mic measurements to create
+   tonal-correction candidates. Phase controls remain untouched.
+2. **Sweeps / Phase** - after loading the chosen PEQ tune, take fresh
+   phase-valid sweeps and test only evidence-supported polarity, delay, or APF
+   changes while preserving PEQ.
+3. **Retarget** - measure the current tune again and optimise PEQ toward a
+   different supplied target.
+
+Results show improvement versus the current tune, the exact added filters,
+before/candidate/target response curves, optional per-driver predicted changes,
+warnings, and what to verify in the car. Every completed run writes
+`assistant_summary.json` and `SQ_Tuning_Report.pdf` beside the candidate files.
+
+## Download or Run
+
+There is currently no prebuilt EXE published in GitHub Releases. To run the app
+from source:
 
 ```powershell
 .\setup_gui.ps1
 .\start_gui.ps1
 ```
 
-After building, `install_gui.ps1` installs the app for the current Windows user
-and creates a desktop shortcut; it does not require administrator access.
+To build the Windows package locally:
 
-The app provides three measurement workflows:
+```powershell
+.\build_gui.ps1
+```
 
-- **PEQ / RTA** uses the recommended Beam search with phase writes disabled.
-- **Sweeps / Phase** uses fresh phase-valid sweeps, preserves existing PEQ, and
-  writes only polarity, bounded delay, or residual APF changes that clear the
-  evidence gates.
-- **Retarget** applies the conservative PEQ workflow to fresh MMM/RTA
-  measurements and a different supplied target.
+The executable is written to:
 
-Current desktop features include:
+```text
+dist\AudioFischerOptimizer\AudioFischerOptimizer.exe
+```
 
-- responsive background validation, report generation, and safe shutdown
-- honest Searching, Merging, Verifying, and Writing Report progress phases
-- process-tree RAM protection with a visible warning if the guard is unavailable
-- a live 2-way/3-way measurement checklist and safe REW folder-template creator
-- fuzzy manual role mapping for non-standard filenames, saved as `role_map.json`
-- remembered workflow paths and a Recent Runs list
-- gated Run/Results tabs with plain-language validation errors and fixes
-- non-clobbering, timestamped candidate exports
-- atomically reserved run folders and active-run claims that prevent two app
-  instances from starting the same run
-- detached background runs that can survive GUI closure and be reattached later
+Keep the complete `AudioFischerOptimizer` folder together because the EXE uses
+the bundled `_internal` directory. `install_gui.ps1` can install that package
+for the current Windows user and create a desktop shortcut.
 
-Closing during a run offers **Keep Running and Close**, **Stop Safely and
-Close**, or Cancel. Background runs keep writing their normal checkpoints and
-remain accessible from Recent Runs.
+See [docs/GUI.md](./docs/GUI.md) for the measurement workflow and
+[PCT6_SUPPORT.md](./PCT6_SUPPORT.md) for PCT6 limitations.
 
-Results leads with improvement versus the loaded baseline rather than the raw
-objective. It includes the baseline as a comparison row, named improvement
-cards, a copyable filter table, warnings, deliberately untouched regions, and
-in-car checks. The interactive response chart provides before/candidate/target
-and optional per-driver predicted-change toggles, hover frequency/dB values,
-added-filter centre markers, and click-to-enlarge. Retarget uses the same chart
-for its normalized 1 kHz target preview.
+## How It Decides
 
-Loading Results automatically creates `SQ_Tuning_Report.pdf` beside the merged
-candidates. Validation failures expose **Copy Diagnostics**, which copies
-stdout/stderr, the exact job configuration, and the measurement manifest.
-
-See [docs/GUI.md](./docs/GUI.md) for the complete desktop workflow.
-
-For AI-assisted development, start with `AGENTS.md` and
-`docs/ai_context/CURRENT_STATE.md`, then use `REPO_MAP.md`.
-
-It takes your baseline `.afpx` tune plus REW measurement exports, tries many possible PEQ combinations, scores them, and gives you back ranked AFPX tune candidates to test.
-
-The goal is to improve the tune conservatively. PEQ is handled from magnitude data. Crossover correction follows a gated polarity -> delay -> residual APF ladder, and the report warns when confidence is not full.
-
-It also includes beta `.pct6` container support for newer DSP PC-Tool 6 tunes, so the repo can inspect or round-trip those files too. That path is less proven than `.afpx`, and should be treated as a careful utility rather than a blindly trusted writer.
-
-Its scoring system is built to reward tunes that are more likely to sound better, not just look flatter on one graph.
+The scoring system is designed to reward candidates that are more likely to
+sound better, not simply look flatter on one graph.
 
 It scores candidates by:
 
@@ -157,32 +166,7 @@ Please verify the files, run the optimizer locally, merge the results, and give 
 Polarity/delay/APF changes may be written only when the crossover ladder clears its evidence gates. Crossovers remain untouched.
 ```
 
-## How It Scores
-
-It does not just chase a flat mono sum. Its scoring is designed to:
-
-- improve tonal accuracy with smooth perceptual emphasis through the vocal band
-- reproduce deliberate target-shape changes instead of only changing bass or overall RMS
-- improve left/right balance using the solo driver traces
-- penalize broad peaks and separately catch raw / 1/6-octave narrow peaks
-- penalize boosting into destructive nulls
-- penalize unsupported asymmetric EQ
-- penalize unnecessary gain, wasted filters, and deep/narrow corrections
-- write polarity/delay/APF changes only from gated crossover evidence, with warnings when confidence is not full
-- leave crossovers alone
-
-The optimizer is designed to:
-
-- improve tonal accuracy
-- improve left/right balance
-- avoid boosting into destructive nulls
-- keep PEQ conservative and phase writes independently auditable
-- prefer fewer, wider, symmetric, shallower filters unless the solo measurements justify otherwise
-
-Beam can apply a broad, low-Q `front_voicing` transfer identically to every front
-output. This preserves L/R balance and relative crossover phase. If the transfer
-raises the full front cascade peak, the writer applies only the uniform front
-attenuation needed to retain the baseline headroom; it never raises output level.
+## Measurement Inputs
 
 Canonical measurement filenames are listed below. They are no longer mandatory:
 if a folder uses names such as `FL High Sweep.txt`, the GUI opens a
@@ -229,10 +213,6 @@ Expected tune file:
 
 Required measurements now fail fast when missing, malformed, non-monotonic, or
 truncated. Optional phase, coherence, and position columns remain supported.
-
-The current regression suite contains 66 tests covering DSP invariants, AFPX
-write safety, measurement-session gates, role mapping, GUI jobs, diagnostics,
-result metrics, collision-safe run folders, and package-version consistency.
 
 The optimizer normalizes REW exports to the 96-points-per-octave grid used by its
 ERB and perceptual scoring math. The streaming search then applies a small
