@@ -289,8 +289,8 @@ def imaging_balance_weight(freqs):
     the 500 Hz-8 kHz imaging band and tapers gently above it.
     """
     f = np.maximum(np.asarray(freqs, dtype=float), 1.0)
-    xp = np.array([100.0, 250.0, 300.0, 400.0, 500.0, 8000.0, 16000.0])
-    yp = np.array([0.00, 0.00, 0.03, 0.12, 1.00, 1.00, 0.55])
+    xp = np.array([100.0, 300.0, 500.0, 8000.0, 16000.0])
+    yp = np.array([0.00, 0.00, 1.00, 1.00, 0.55])
     return np.interp(np.log10(f), np.log10(xp), yp)
 
 
