@@ -175,6 +175,40 @@ class BeamSearchTests(unittest.TestCase):
             ]
             self.assertTrue(cuts, group)
 
+    def test_beam_selects_tweeter_only_crossover_scope_when_rms_is_lower(self) -> None:
+        band = {
+            "F": 2642.7, "Q": 2.0, "G": -1.5, "strength": 2.0,
+            "width_oct": 0.25, "source": "crossover_scope",
+        }
+        pools = {name: [] for name in optimizer.GROUPS}
+        for group in ("high_crossover_sym", "low_crossover_sym", "front_voicing"):
+            pools[group] = [dict(band)]
+
+        def score(groups):
+            active = [
+                name for name in ("high_crossover_sym", "low_crossover_sym", "front_voicing")
+                if groups.get(name)
+            ]
+            if active == ["high_crossover_sym"]:
+                value = 1.031
+            elif active == ["front_voicing"]:
+                value = 1.053
+            elif active == ["low_crossover_sym"]:
+                value = 1.071
+            elif active:
+                value = 1.090
+            else:
+                value = 1.100
+            return {"objective": value}
+
+        ranked, _ = stream.deterministic_beam_combinations(
+            pools, score, beam_width=12, pool_limit=1
+        )
+        self.assertAlmostEqual(ranked[0][0], 1.031, places=6)
+        self.assertEqual(ranked[0][2]["high_crossover_sym"], [(2642.7, 2.0, -1.5)])
+        self.assertFalse(ranked[0][2]["front_voicing"])
+        self.assertFalse(ranked[0][2]["low_crossover_sym"])
+
     def test_beam_is_deterministic_and_keeps_best_partial_combination(self) -> None:
         first_group = next(iter(optimizer.GROUPS))
         pools = {name: [] for name in optimizer.GROUPS}
