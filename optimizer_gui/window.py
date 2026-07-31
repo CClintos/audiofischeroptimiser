@@ -1698,6 +1698,26 @@ class OptimizerWindow(QMainWindow):
                     f"Tonal session: {'PASS' if audit.get('tonal_valid') else 'FAIL'}  |  "
                     f"Phase session: {'PASS' if audit.get('phase_valid') else 'DISABLED'}"
                 )
+            census = preflight.get("problem_census") or {}
+            worth = census.get("worth_fixing") or []
+            skipped = census.get("deliberately_skipped") or []
+            if worth:
+                lines.append("\nHighest-value problems the run can address:")
+                lines.extend(
+                    f"- {item.get('group')}: {float(item.get('frequency_hz', 0.0)):.0f} Hz "
+                    f"({item.get('source')}, priority {float(item.get('recoverable_error', 0.0)):.2f})"
+                    for item in worth[:5]
+                )
+            if skipped:
+                lines.append("\nDeliberately skipped before search:")
+                lines.extend(
+                    f"- {item.get('reason')} at "
+                    + (
+                        f"{float(item.get('frequency_hz')):.0f} Hz"
+                        if item.get("frequency_hz") is not None else "the affected pair band"
+                    )
+                    for item in skipped[:5]
+                )
             if result["errors"]:
                 lines.append("\nBlocked:\n- " + "\n- ".join(result["errors"]))
             if result["valid"]:

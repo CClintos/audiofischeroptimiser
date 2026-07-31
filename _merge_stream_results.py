@@ -74,6 +74,39 @@ def main():
     )
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     worker_dirs = sorted(p for p in args.root.glob("worker_*") if p.is_dir())
+    worker_state_payloads = []
+    for worker in worker_dirs:
+        state_path = worker / "stream_state.json"
+        if state_path.is_file():
+            try:
+                worker_state_payloads.append(json.loads(state_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    proposal_audits = [
+        dict(payload.get("proposal_audit", {}))
+        for payload in worker_state_payloads if payload.get("proposal_audit")
+    ]
+    args.proposal_audit = proposal_audits[0] if proposal_audits else {}
+    convergence_rows = [
+        dict(payload.get("convergence", {}))
+        for payload in worker_state_payloads if payload.get("convergence")
+    ]
+    if convergence_rows:
+        args.convergence = {
+            "workers": convergence_rows,
+            "verdict": (
+                "still_improving"
+                if any(row.get("verdict") == "still_improving" for row in convergence_rows)
+                else "stalled"
+                if all(row.get("verdict") == "stalled" for row in convergence_rows)
+                else "deterministic_plateau"
+            ),
+            "stalled_seconds": max(
+                float(row.get("stalled_seconds", 0.0)) for row in convergence_rows
+            ),
+        }
+    else:
+        args.convergence = {}
     items = []
     for worker in worker_dirs:
         items.extend(load_worker_best(worker))

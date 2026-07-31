@@ -154,11 +154,12 @@ def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, 
     idxs.sort(key=lambda i: -strength[i])
 
     chosen = []
-    min_sep_oct = 1 / 5
     for i in idxs:
+        strong = strength[i] >= max(2.5, thresh * 4.0)
+        min_sep_oct = 1 / 12 if strong else 1 / 5
         if all(abs(math.log2(freqs[i] / freqs[j])) >= min_sep_oct for j in chosen):
             chosen.append(i)
-        if len(chosen) >= 12:
+        if len(chosen) >= 18:
             break
 
     candidates = []
@@ -254,6 +255,16 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         guarded_tonal = []
         for candidate in tonal_candidates:
             center = float(candidate["F"])
+            if (
+                cfg.get("pair") and cfg.get("side")
+                and pair_states[cfg["pair"]]["state"] == opt.MASK_UNKNOWN
+            ):
+                suppressions.append({
+                    "group": group,
+                    "frequency_hz": center,
+                    "reason": "interference_evidence_unknown",
+                })
+                continue
             branch = str(cfg.get("branch", "low"))
             noise_branch = "high" if branch == "front" and center >= 1800.0 else branch
             deviation_curve = shape_dev if cfg.get("system_transfer") else system_dev
@@ -377,7 +388,8 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         candidates.sort(key=lambda c: -c["strength"])
         deduped = []
         for c in candidates:
-            if all(abs(math.log2(c["F"] / d["F"])) >= 1 / 8 or c["source"] != d["source"] for d in deduped):
+            separation = 1 / 16 if c["strength"] >= 2.5 else 1 / 8
+            if all(abs(math.log2(c["F"] / d["F"])) >= separation or c["source"] != d["source"] for d in deduped):
                 c["branch_share"] = float(np.interp(np.log10(c["F"]), np.log10(freqs), contribution))
                 if (
                     not cfg.get("crossover_scope")
@@ -385,7 +397,9 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                 ):
                     continue
                 deduped.append(c)
-            if len(deduped) >= 14:
+            recoverable = sum(max(0.0, float(item["strength"])) for item in deduped)
+            adaptive_cap = int(np.clip(6 + round(recoverable / 2.0), 8, 24))
+            if len(deduped) >= adaptive_cap:
                 break
         pools[group] = deduped
 
@@ -438,12 +452,33 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                 "required_deviation_db": float(opt.MEASUREMENT_NOISE_MULTIPLIER * floor),
             })
             pools[group].sort(key=lambda item: -item["strength"])
+    worth_fixing = sorted(
+        (
+            {
+                "group": group,
+                "frequency_hz": float(item["F"]),
+                "gain_db": float(item["G"]),
+                "source": str(item["source"]),
+                "recoverable_error": float(item["strength"]),
+            }
+            for group, items in pools.items() for item in items
+        ),
+        key=lambda item: -item["recoverable_error"],
+    )[:10]
+    skipped = sorted(
+        suppressions,
+        key=lambda item: -abs(float(item.get("deviation_db", item.get("system_deviation_db", 0.0)) or 0.0)),
+    )[:10]
     LAST_PROPOSAL_AUDIT = {
         "mask_evidence": pair_states,
         "blocking_pairs": [
             name for name, item in pair_states.items() if item["state"] == opt.MASK_UNKNOWN
         ],
         "suppressions": suppressions,
+        "problem_census": {
+            "worth_fixing": worth_fixing,
+            "deliberately_skipped": skipped,
+        },
     }
     return pools
 
@@ -497,8 +532,27 @@ def guided_groups(rng: np.random.Generator, profile: str, pools) -> GroupBands:
     return groups
 
 
+def search_budgets(pools, pool_limit: int, beam_width: int) -> dict[str, dict[str, int]]:
+    recoverable = {
+        group: sum(max(0.0, float(item.get("strength", 0.0))) for item in items)
+        for group, items in pools.items()
+    }
+    total = sum(recoverable.values())
+    active = max(1, sum(value > 0.0 for value in recoverable.values()))
+    budgets = {}
+    for group in opt.GROUPS:
+        share = recoverable.get(group, 0.0) / total if total > 0.0 else 0.0
+        budgets[group] = {
+            "pool_limit": int(np.clip(round(2 + pool_limit * active * share), 2, max(2, pool_limit * 2))),
+            "beam_width": int(np.clip(round(4 + beam_width * active * share), 4, max(4, beam_width * 2))),
+        }
+    return budgets
+
+
 def deterministic_beam_combinations(pools, component_score, beam_width: int = 24,
-                                    pool_limit: int = 6, deadline: float | None = None,
+                                    pool_limit: int | dict[str, int] = 6,
+                                    beam_budgets: dict[str, dict[str, int]] | None = None,
+                                    deadline: float | None = None,
                                     order_seed: int | None = None, stop_requested=None):
     """Build exact guided-band combinations while retaining best partial tunes."""
     empty = {group: [] for group in opt.GROUPS}
@@ -511,7 +565,14 @@ def deterministic_beam_combinations(pools, component_score, beam_width: int = 24
         group_names = [group_names[index] for index in order_rng.permutation(len(group_names))]
     for group in group_names:
         cfg = opt.GROUPS[group]
-        candidates = sorted(pools.get(group, []), key=lambda item: -item["strength"])[:max(0, pool_limit)]
+        group_pool_limit = (
+            int(pool_limit.get(group, 0)) if isinstance(pool_limit, dict)
+            else int((beam_budgets or {}).get(group, {}).get("pool_limit", pool_limit))
+        )
+        group_beam_width = int(
+            (beam_budgets or {}).get(group, {}).get("beam_width", beam_width)
+        )
+        candidates = sorted(pools.get(group, []), key=lambda item: -item["strength"])[:max(0, group_pool_limit)]
         bands = [opt.rounded_band(item["F"], item["Q"], item["G"]) for item in candidates]
         bands = [band for band in bands if band is not None]
         options = [()]
@@ -542,7 +603,7 @@ def deterministic_beam_combinations(pools, component_score, beam_width: int = 24
         unique = {}
         for entry in sorted(expanded, key=lambda item: (item[0], item[1])):
             unique.setdefault(entry[1], entry)
-        beam = list(unique.values())[:max(1, int(beam_width))]
+        beam = list(unique.values())[:max(1, group_beam_width)]
     return beam, evaluations
 
 
@@ -960,6 +1021,8 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
             {"objective": float(value), "groups": serializable_groups(groups)}
             for value, _signature, groups in archive
         ],
+        "proposal_audit": getattr(args, "proposal_audit", {}),
+        "convergence": getattr(args, "convergence", {}),
     }
     tmp = path.with_name(
         f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
@@ -1191,6 +1254,11 @@ def main():
         guided_pools = {group: [] for group in opt.GROUPS}
     else:
         guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
+    args.proposal_audit = dict(LAST_PROPOSAL_AUDIT)
+    (args.out / "problem_census.json").parent.mkdir(parents=True, exist_ok=True)
+    (args.out / "problem_census.json").write_text(
+        json.dumps(args.proposal_audit, indent=2), encoding="utf-8"
+    )
     cma_proposal = None
     if args.proposal == "cmaes":
         cma_proposal = CmaProposal(
@@ -1246,13 +1314,25 @@ def main():
     next_checkpoint = start + max(10, args.checkpoint_seconds)
     trials = 0
     args.beam = None
+    baseline_value = float(baseline_score["components"]["objective"])
+    convergence_events = [{
+        "elapsed_seconds": 0.0,
+        "objective": baseline_value,
+        "phase": "baseline",
+    }]
+    best_value_seen = min((item[0] for item in best), default=baseline_value)
+    last_improvement_time = start
     if args.proposal == "beam":
         beam_order_seed = args.seed + completed_before
+        adaptive_budgets = search_budgets(
+            guided_pools, args.beam_pool_limit, args.beam_width
+        )
         beam_entries, beam_evaluations = deterministic_beam_combinations(
             guided_pools,
             component_score,
             beam_width=args.beam_width,
             pool_limit=args.beam_pool_limit,
+            beam_budgets=adaptive_budgets,
             deadline=(start + args.seconds) if args.seconds else None,
             order_seed=beam_order_seed,
             stop_requested=stop_requested,
@@ -1264,16 +1344,31 @@ def main():
                 archive, archive_scores, item, components, args.archive_size
             )
         trials += beam_evaluations
+        beam_best = min((item[0] for item in beam_entries), default=best_value_seen)
+        if beam_best < best_value_seen:
+            best_value_seen = beam_best
+            last_improvement_time = time.monotonic()
+        convergence_events.append({
+            "elapsed_seconds": float(time.monotonic() - start),
+            "objective": float(best_value_seen),
+            "phase": "deterministic_beam_complete",
+        })
         args.beam = {
             "width": args.beam_width,
             "pool_limit": args.beam_pool_limit,
             "evaluations": beam_evaluations,
             "retained": len(beam_entries),
             "order_seed": beam_order_seed,
+            "adaptive_group_budgets": adaptive_budgets,
             "continuation": (
                 "guided_until_deadline"
                 if beam_uses_timed_guided_continuation(args.proposal, args.mode)
                 else "none"
+            ),
+            "transition": (
+                "deterministic_to_guided"
+                if beam_uses_timed_guided_continuation(args.proposal, args.mode)
+                else "deterministic_complete"
             ),
         }
     while True:
@@ -1305,6 +1400,14 @@ def main():
             value = 1e6 + float(components["positive_gain_penalty_db"])
         signature = opt.bands_signature(groups)
         item = (value, signature, groups)
+        if value + 1e-12 < best_value_seen:
+            best_value_seen = value
+            last_improvement_time = now
+            convergence_events.append({
+                "elapsed_seconds": float(now - start),
+                "objective": float(value),
+                "phase": "guided_improvement",
+            })
         best = insert_best(best, item, args.keep)
         archive, archive_scores = insert_archive(archive, archive_scores, item, components, args.archive_size)
         if cma_x is not None:
@@ -1338,6 +1441,19 @@ def main():
 
     args._completed_trials = completed_before + trials
     args._elapsed_seconds = elapsed_before + (time.monotonic() - start)
+    stalled_seconds = max(0.0, time.monotonic() - last_improvement_time)
+    args.convergence = {
+        "events": convergence_events,
+        "last_improvement_elapsed_seconds": float(
+            max(0.0, last_improvement_time - start)
+        ),
+        "stalled_seconds": float(stalled_seconds),
+        "verdict": (
+            "stalled" if stalled_seconds >= 360.0
+            else "still_improving" if len(convergence_events) > 2
+            else "deterministic_plateau"
+        ),
+    }
     archive, archive_scores = prune_archive(archive, archive_scores, args.archive_size)
     save_state(state_path, best, rng, args._completed_trials, args._elapsed_seconds, args, archive=archive)
     final_entries = combine_unique_entries(best, archive)

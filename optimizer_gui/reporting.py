@@ -565,6 +565,7 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     positions = ["centre", *[str(item) for item in sessions.get("spatial_positions") or []]]
     validation = (summary.get("gates") or {}).get("pair_validation") or []
     noise_guard = (summary.get("gates") or {}).get("measurement_noise_guard") or {}
+    search_audit = summary.get("search") or {}
     warnings = _warning_items(summary, mode)
     filters = _best_filters(summary, summary_path.parent / "optimizer_report.md")
     actions = summary.get("phase_actions") or []
@@ -635,6 +636,29 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         f"{noise_guard.get('required_multiplier', 2.5)}x the local floor",
     ))
     noise_html = _table(noise_rows)
+    census = search_audit.get("problem_census") or {}
+    worth_rows = [
+        (
+            f"{item.get('group', 'Group')} @ {float(item.get('frequency_hz', 0.0)):.0f} Hz",
+            f"{item.get('source', 'tonal')} - priority {float(item.get('recoverable_error', 0.0)):.2f}",
+        )
+        for item in (census.get("worth_fixing") or [])[:10]
+    ]
+    skipped_rows = [
+        (
+            str(item.get("reason", "suppressed")).replace("_", " "),
+            (
+                f"{float(item.get('frequency_hz')):.0f} Hz"
+                if item.get("frequency_hz") is not None else "affected driver band"
+            ),
+        )
+        for item in (census.get("deliberately_skipped") or [])[:10]
+    ]
+    census_html = (
+        "<h3>Worth fixing</h3>" + (_table(worth_rows) if worth_rows else "<p>No eligible correction centres were found.</p>")
+        + "<h3>Deliberately skipped</h3>"
+        + (_table(skipped_rows) if skipped_rows else "<p>No proposal suppressions were recorded.</p>")
+    )
 
     filter_rows = []
     for group, bands in filters.items():
@@ -837,6 +861,7 @@ img.chart {{ width:100%; margin:7px 0 4px; }} .hero-chart {{ margin-top:10px; }}
 <h2>Measurement validation</h2>{validation_html}
 <h2>Measurement repeatability guard</h2>{noise_html}
 <p>{html.escape(str(noise_guard.get('note') or 'Filters below the assumed local measurement floor are rejected.'))}</p>
+<h2>Pre-search problem census</h2>{census_html}
 <div class="callout"><b>How to read this:</b> {html.escape(confidence_text)}</div></div>
 
 <div class="page"><div class="eyebrow">2 - {'Phase / timing changes' if phase_mode else 'PEQ changes'}</div><h1>{'What Was Written' if phase_mode else 'What Changed In The DSP'}</h1>

@@ -203,7 +203,7 @@ class MaskIntegrityTests(unittest.TestCase):
             pools = optimizer_stream.find_guided_candidates(freqs, traces, target, "safe")
         self.assertEqual(states["low"]["state"], canonical_tunefit.MASK_UNKNOWN)
         self.assertFalse(np.any(masks["fl_low"]))
-        self.assertFalse(any(item["source"] == "balance" for item in pools["fl_low"]))
+        self.assertFalse(any(item["G"] < 0.0 for item in pools["fl_low"]))
 
     def test_measured_destructive_pair_is_detected(self) -> None:
         freqs = np.geomspace(300.0, 3000.0, 512)

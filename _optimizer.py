@@ -2765,6 +2765,8 @@ def write_report(
         "validation": getattr(args, "validation", []),
         "measurement_session": getattr(args, "measurement_session", {}),
         "measurement_noise_guard": measurement_noise_model(),
+        "proposal_audit": getattr(args, "proposal_audit", {}),
+        "convergence": getattr(args, "convergence", {}),
         "phase_diagnostic_cache": getattr(args, "phase_diagnostic_cache", {}),
         "objective_cache": (
             AFPX_OBJECTIVE.cache_stats()
@@ -2898,6 +2900,14 @@ def write_report(
             "proposal": getattr(args, "proposal", ""),
             "beam": getattr(args, "beam", None),
             "refinement": getattr(args, "refinement", None),
+            "seed": getattr(args, "seed", None),
+            "problem_census": dict(getattr(args, "proposal_audit", {})).get(
+                "problem_census", {}
+            ),
+            "suppressions": dict(getattr(args, "proposal_audit", {})).get(
+                "suppressions", []
+            )[:50],
+            "convergence": getattr(args, "convergence", {}),
         },
         "phase_actions": compact_phase_actions,
         "complex_crossover_verification": (

@@ -209,6 +209,43 @@ class BeamSearchTests(unittest.TestCase):
         self.assertFalse(ranked[0][2]["front_voicing"])
         self.assertFalse(ranked[0][2]["low_crossover_sym"])
 
+    def test_adaptive_peak_spacing_keeps_strong_2671_hz_neighbour(self) -> None:
+        freqs = np.geomspace(1800.0, 3600.0, 2048)
+        strength = (
+            7.0 * np.exp(-0.5 * (np.log2(freqs / 2400.0) / 0.025) ** 2)
+            + 8.0 * np.exp(-0.5 * (np.log2(freqs / 2671.0) / 0.025) ** 2)
+        )
+        candidates = stream.candidate_peaks(
+            freqs,
+            strength,
+            -0.25 * strength,
+            1800.0,
+            3600.0,
+            (0.5, 6.0),
+            (-6.0, 0.0),
+            "tonal",
+            "safe",
+        )
+        centres = [item["F"] for item in candidates]
+        self.assertTrue(any(abs(center - 2400.0) < 80.0 for center in centres))
+        self.assertTrue(any(abs(center - 2671.0) < 80.0 for center in centres))
+
+    def test_recoverable_error_allocates_more_search_budget(self) -> None:
+        pools = {name: [] for name in optimizer.GROUPS}
+        pools["high_crossover_sym"] = [
+            {"strength": 8.0}, {"strength": 6.0}, {"strength": 4.0}
+        ]
+        pools["sub"] = [{"strength": 0.5}]
+        budgets = stream.search_budgets(pools, pool_limit=6, beam_width=24)
+        self.assertGreater(
+            budgets["high_crossover_sym"]["pool_limit"],
+            budgets["sub"]["pool_limit"],
+        )
+        self.assertGreater(
+            budgets["high_crossover_sym"]["beam_width"],
+            budgets["sub"]["beam_width"],
+        )
+
     def test_beam_is_deterministic_and_keeps_best_partial_combination(self) -> None:
         first_group = next(iter(optimizer.GROUPS))
         pools = {name: [] for name in optimizer.GROUPS}

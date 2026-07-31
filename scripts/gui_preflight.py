@@ -25,6 +25,7 @@ def main() -> None:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import _optimizer as optimizer
+    import _optimizer_stream as optimizer_stream
 
     try:
         session, calibration = optimizer.prepare_measurement_session(
@@ -32,12 +33,21 @@ def main() -> None:
         )
         optimizer.sync_external_objective(args.baseline, args.target, calibration)
         freqs, traces, _rich = optimizer.load_measurements(calibration)
+        raw_target = optimizer.load_target(args.target, freqs)
+        target = raw_target + optimizer.target_anchor_offset(
+            freqs, traces["System Sum"], raw_target
+        )
+        optimizer_stream.configure_profile("safe")
+        optimizer_stream.find_guided_candidates(freqs, traces, target, "safe")
         pairs = optimizer.pair_sum_validation(freqs, traces, args.validation_threshold)
         failed = [row for row in pairs if row.get("pass") is False]
         result = {
             "valid": not failed,
             "measurement_session": session.get("audit", {}),
             "pair_validation": pairs,
+            "problem_census": optimizer_stream.LAST_PROPOSAL_AUDIT.get(
+                "problem_census", {}
+            ),
             "errors": [
                 f"{row['pair']} solo/together validation is {row['rms_db']} dB; limit is {row['threshold_db']} dB"
                 for row in failed
