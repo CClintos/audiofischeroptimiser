@@ -17,6 +17,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication
 
 from .warning_text import warning_info
+from . import theme
 
 GROUP_LABELS = {
     "front_voicing": "Whole front stage (matched voicing)",
@@ -363,29 +364,26 @@ def response_chart_series(plot: dict[str, Any]) -> list[dict[str, Any]]:
             "label": "Before",
             "x": frequencies,
             "y": plot.get("baseline_error_db"),
-            "color": "#a34b43",
+            "color": theme.SERIES_BASELINE,
             "visible": True,
         },
         {
             "label": "Candidate",
             "x": frequencies,
             "y": plot.get("candidate_error_db"),
-            "color": "#16805d",
+            "color": theme.SERIES_CANDIDATE,
             "visible": True,
         },
         {
             "label": "Target",
             "x": frequencies,
             "y": [0.0] * len(frequencies),
-            "color": "#59636b",
+            "color": theme.SERIES_TARGET,
             "dashed": True,
             "visible": True,
         },
     ]
-    driver_colours = (
-        "#7556a8", "#b05f9c", "#2b78a6", "#4b8f3a",
-        "#ba6b24", "#8b6b3f", "#4d7780",
-    )
+    driver_colours = theme.DRIVER_SERIES
     for index, (role, data) in enumerate((plot.get("drivers") or {}).items()):
         driver_x = data.get("frequency_hz") or frequencies
         driver_y = data.get("change_db") or []

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QScrollArea, QSlider, QSpinBox, QStyle, QTabWidget, QTableWidget,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QToolButton, QToolTip, QVBoxLayout, QWidget,
 )
 
@@ -43,6 +43,7 @@ from .reporting import (
     metric_card_data, response_chart_series,
 )
 from .warning_text import warning_info
+from . import theme
 from scripts.make_measurement_manifest import ALL_MEASUREMENT_ROLES
 from scripts.verify_achieved_response import verify_run
 
@@ -234,7 +235,7 @@ class _ChartCanvas(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#ffffff"))
+        painter.fillRect(self.rect(), QColor(theme.BG_PANEL))
         if not self.static_pixmap.isNull():
             scaled = self.static_pixmap.scaled(
                 self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
@@ -247,34 +248,34 @@ class _ChartCanvas(QWidget):
             return
         clean = self._clean_series()
         if not clean:
-            painter.setPen(QColor("#667079"))
+            painter.setPen(QColor(theme.TEXT_MUTED))
             painter.drawText(self.rect(), Qt.AlignCenter | Qt.TextWordWrap, self.placeholder)
             return
         rect, x_min, x_max, y_min, y_max, point = self._geometry(clean)
-        painter.setPen(QPen(QColor("#d9dde1"), 1))
+        painter.setPen(QPen(QColor(theme.CHART_GRID), 1))
         for index in range(5):
             value = y_min + (y_max - y_min) * index / 4
             y = point(x_min, value).y()
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
-            painter.setPen(QColor("#59636b"))
+            painter.setPen(QColor(theme.CHART_AXIS_TEXT))
             painter.drawText(QRectF(2, y - 9, 52, 18), Qt.AlignRight | Qt.AlignVCenter, f"{value:+.1f}")
-            painter.setPen(QPen(QColor("#d9dde1"), 1))
+            painter.setPen(QPen(QColor(theme.CHART_GRID), 1))
         for frequency in (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000):
             if x_min <= frequency <= x_max:
                 x = point(frequency, 0).x()
                 painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
                 label = f"{frequency // 1000}k" if frequency >= 1000 else str(frequency)
-                painter.setPen(QColor("#59636b"))
+                painter.setPen(QColor(theme.CHART_AXIS_TEXT))
                 painter.drawText(QRectF(x - 22, rect.bottom() + 4, 44, 20), Qt.AlignHCenter, label)
-                painter.setPen(QPen(QColor("#d9dde1"), 1))
+                painter.setPen(QPen(QColor(theme.CHART_GRID), 1))
         if y_min <= 0 <= y_max:
-            painter.setPen(QPen(QColor("#8a9298"), 1, Qt.DashLine))
+            painter.setPen(QPen(QColor(theme.CHART_ZERO_LINE), 1, Qt.DashLine))
             y = point(x_min, 0).y()
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
         for frequency in self.markers:
             if x_min <= frequency <= x_max:
                 x = point(frequency, 0).x()
-                painter.setPen(QPen(QColor("#d08a00"), 1, Qt.DotLine))
+                painter.setPen(QPen(QColor(theme.CHART_MARKER), 1, Qt.DotLine))
                 painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
                 painter.drawEllipse(QPointF(x, rect.top() + 6), 3, 3)
         for item, points in clean:
@@ -283,15 +284,15 @@ class _ChartCanvas(QWidget):
             path.moveTo(first)
             for x_value, y_value in points[1:]:
                 path.lineTo(point(x_value, y_value))
-            pen = QPen(QColor(str(item.get("color") or "#16805d")), 2.2)
+            pen = QPen(QColor(str(item.get("color") or theme.SERIES_CANDIDATE)), 2.2)
             if item.get("dashed"):
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             painter.drawPath(path)
-        painter.setPen(QColor("#59636b"))
+        painter.setPen(QColor(theme.CHART_AXIS_TEXT))
         painter.drawText(QRectF(2, 0, 54, 18), Qt.AlignRight, "dB")
         painter.drawText(
-            QRectF(rect.right() - 82, rect.bottom() + 4, 82, 20),
+            QRectF(self.width() - 96, 0, 94, 18),
             Qt.AlignRight, "Frequency (Hz)",
         )
 
@@ -359,7 +360,7 @@ class ChartLabel(QWidget):
         for index, item in enumerate(self._series):
             checkbox = QCheckBox(str(item.get("label") or f"Series {index + 1}"))
             checkbox.setChecked(bool(item.get("visible", True)))
-            checkbox.setStyleSheet(f"color:{item.get('color', '#30363b')};")
+            checkbox.setStyleSheet(f"color:{item.get('color', theme.TEXT_PRIMARY)};")
             checkbox.toggled.connect(
                 lambda checked, row=index: self._toggle_series(row, checked)
             )
@@ -503,25 +504,47 @@ class OptimizerWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_home_tab(), "Home")
-        self.tabs.addTab(self._build_inputs_tab(), "1  PEQ / RTA")
-        self.tabs.addTab(self._build_phase_tab(), "2  Sweeps / Phase")
-        self.tabs.addTab(self._build_run_tab(), "3  Run")
-        self.tabs.addTab(self._build_results_tab(), "4  Results")
+        self.tabs.addTab(self._build_inputs_tab(), "PEQ / RTA")
+        self.tabs.addTab(self._build_phase_tab(), "Sweeps / Phase")
+        self.tabs.addTab(self._build_run_tab(), "Run")
+        self.tabs.addTab(self._build_results_tab(), "Results")
         self.tabs.addTab(self._build_verify_tab(), "Verify")
         self.tabs.addTab(self._build_about_tab(), "About")
         self.tabs.addTab(self._build_retarget_tab(), "Retarget")
-        self.tabs.setTabEnabled(self.TAB_RUN, False)
+        self._tab_steps = {
+            self.TAB_PEQ: 1, self.TAB_PHASE: 2, self.TAB_RUN: 3, self.TAB_RESULTS: 4,
+        }
+        self._set_tab_enabled(self.TAB_RUN, False)
         self.tabs.setTabToolTip(self.TAB_RUN, "Validate one workflow before opening Run.")
-        self.tabs.setTabEnabled(self.TAB_RESULTS, False)
+        self._set_tab_enabled(self.TAB_RESULTS, False)
         self.tabs.setTabToolTip(self.TAB_RESULTS, "Complete or open a run before viewing Results.")
+        for index in self._tab_steps:
+            self._update_step_badge(index, self.tabs.isTabEnabled(index))
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
+
+    def _set_tab_enabled(self, index: int, enabled: bool):
+        self.tabs.setTabEnabled(index, enabled)
+        self._update_step_badge(index, enabled)
+
+    def _update_step_badge(self, index: int, enabled: bool):
+        step = self._tab_steps.get(index)
+        if step is not None:
+            self.tabs.setTabIcon(index, theme.step_badge_icon(step, active=enabled))
+
+    def _card(self, *, accent: bool = False) -> tuple[QFrame, QVBoxLayout]:
+        frame = QFrame()
+        frame.setObjectName("cardAccent" if accent else "card")
+        card_layout = QVBoxLayout(frame)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(8)
+        return frame, card_layout
 
     def _build_home_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(28, 26, 28, 24)
-        layout.setSpacing(16)
+        layout.setSpacing(18)
 
         heading = QLabel("Choose the right workflow")
         heading.setObjectName("sectionTitle")
@@ -534,83 +557,97 @@ class OptimizerWindow(QMainWindow):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        folder_card, folder_layout = self._card()
         folder_title = QLabel("Measurement folder readiness")
         folder_title.setObjectName("workflowTitle")
-        layout.addWidget(folder_title)
+        folder_title.setStyleSheet("margin-top:0;")
+        folder_layout.addWidget(folder_title)
         home_row, self.home_measurement_edit = self._path_row(
             "folder", self._browse_home_measurements,
         )
         self.home_measurement_edit.pathDropped.connect(self._home_folder_selected)
         self.home_measurement_edit.textChanged.connect(self._update_home_checklist)
-        layout.addWidget(home_row)
+        folder_layout.addWidget(home_row)
         template_line = QHBoxLayout()
         self.template_layout_combo = QComboBox()
         self.template_layout_combo.addItem("2-way front + sub", "front_2way_plus_sub")
         self.template_layout_combo.addItem("3-way front + sub", "front_3way_plus_sub")
         template_button = QPushButton("Create Measurement Folder Template")
-        template_button.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+        template_button.setIcon(theme.make_icon("folder-plus"))
         template_button.clicked.connect(self._create_measurement_template)
         template_line.addWidget(self.template_layout_combo)
         template_line.addWidget(template_button)
         template_line.addStretch()
-        layout.addLayout(template_line)
+        folder_layout.addLayout(template_line)
         self.home_checklist = QLabel("Choose a measurement folder to see the required files.")
         self.home_checklist.setWordWrap(True)
         self.home_checklist.setTextFormat(Qt.RichText)
-        layout.addWidget(self.home_checklist)
+        folder_layout.addWidget(self.home_checklist)
+        layout.addWidget(folder_card)
 
+        peq_card, peq_layout = self._card(accent=True)
         peq_title = QLabel("1. PEQ / RTA - start here")
         peq_title.setObjectName("workflowTitle")
-        layout.addWidget(peq_title)
+        peq_title.setStyleSheet("margin-top:0;")
+        peq_layout.addWidget(peq_title)
         peq_text = QLabel(
             "Use fresh moving-mic or magnitude measurements to tune tonal balance and L/R response. "
             "This stage writes PEQ only and preserves delay, polarity, crossovers and APFs."
         )
         peq_text.setWordWrap(True)
-        layout.addWidget(peq_text)
+        peq_layout.addWidget(peq_text)
         peq_button = QPushButton("Open PEQ / RTA")
         peq_button.setObjectName("primary")
-        peq_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        peq_button.setIcon(theme.make_icon("arrow-right", theme.TEXT_ON_ACCENT))
         peq_button.clicked.connect(
             lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_PEQ)
         )
-        layout.addWidget(peq_button, 0, Qt.AlignLeft)
+        peq_layout.addWidget(peq_button, 0, Qt.AlignLeft)
+        layout.addWidget(peq_card)
 
+        phase_card, phase_layout = self._card()
         phase_title = QLabel("2. Sweeps / Phase - after PEQ")
         phase_title.setObjectName("workflowTitle")
-        layout.addWidget(phase_title)
+        phase_title.setStyleSheet("margin-top:0;")
+        phase_layout.addWidget(phase_title)
         phase_text = QLabel(
             "Load the selected PEQ result into the DSP, take fresh phase-valid sweeps, then use this "
             "stage for supported polarity, delay and residual APF changes. Existing PEQ is preserved."
         )
         phase_text.setWordWrap(True)
-        layout.addWidget(phase_text)
+        phase_layout.addWidget(phase_text)
         phase_button = QPushButton("Open Sweeps / Phase")
-        phase_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        phase_button.setIcon(theme.make_icon("arrow-right"))
         phase_button.clicked.connect(
             lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_PHASE)
         )
-        layout.addWidget(phase_button, 0, Qt.AlignLeft)
+        phase_layout.addWidget(phase_button, 0, Qt.AlignLeft)
+        layout.addWidget(phase_card)
 
+        retarget_card, retarget_layout = self._card()
         retarget_title = QLabel("Retarget - use later when changing the tonal curve")
         retarget_title.setObjectName("workflowTitle")
-        layout.addWidget(retarget_title)
+        retarget_title.setStyleSheet("margin-top:0;")
+        retarget_layout.addWidget(retarget_title)
         retarget_text = QLabel(
             "Use fresh MMM/RTA measurements of the current tune plus a different target curve. "
             "It creates a new PEQ candidate without changing phase controls or the baseline."
         )
         retarget_text.setWordWrap(True)
-        layout.addWidget(retarget_text)
+        retarget_layout.addWidget(retarget_text)
         retarget_button = QPushButton("Open Retarget")
-        retarget_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        retarget_button.setIcon(theme.make_icon("arrow-right"))
         retarget_button.clicked.connect(
             lambda _checked=False: self.tabs.setCurrentIndex(self.TAB_RETARGET)
         )
-        layout.addWidget(retarget_button, 0, Qt.AlignLeft)
+        retarget_layout.addWidget(retarget_button, 0, Qt.AlignLeft)
+        layout.addWidget(retarget_card)
 
+        recent_card, recent_layout = self._card()
         recent_title = QLabel("Recent runs")
         recent_title.setObjectName("workflowTitle")
-        layout.addWidget(recent_title)
+        recent_title.setStyleSheet("margin-top:0;")
+        recent_layout.addWidget(recent_title)
         self.recent_runs_table = QTableWidget(0, 5)
         self.recent_runs_table.setHorizontalHeaderLabels(
             ["Date", "Workflow", "Status", "Best objective", "Path"]
@@ -624,7 +661,9 @@ class OptimizerWindow(QMainWindow):
         self.recent_runs_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.recent_runs_table.setMaximumHeight(175)
         self.recent_runs_table.cellDoubleClicked.connect(self._open_recent_run)
-        layout.addWidget(self.recent_runs_table)
+        recent_layout.addWidget(self.recent_runs_table)
+        layout.addWidget(recent_card)
+
         layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -636,9 +675,7 @@ class OptimizerWindow(QMainWindow):
         edit = DropLineEdit(mode)
         edit.setPlaceholderText("Drop a folder here" if mode == "folder" else "Drop a file here")
         button = QToolButton()
-        button.setIcon(self.style().standardIcon(
-            QStyle.SP_DirOpenIcon if mode == "folder" else QStyle.SP_FileIcon
-        ))
+        button.setIcon(theme.make_icon("folder-open" if mode == "folder" else "file"))
         button.setToolTip("Browse")
         button.clicked.connect(browse_slot)
         box = QWidget()
@@ -676,10 +713,10 @@ class OptimizerWindow(QMainWindow):
 
         actions = QHBoxLayout()
         self.validate_button = QPushButton("Validate RTA / Prepare PEQ")
-        self.validate_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.validate_button.setIcon(theme.make_icon("check"))
         self.validate_button.clicked.connect(self.validate_inputs)
         self.resume_button = QPushButton("Open Existing Run")
-        self.resume_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.resume_button.setIcon(theme.make_icon("folder-open"))
         self.resume_button.clicked.connect(self._open_existing_run)
         self.copy_peq_diagnostics = QPushButton("Copy Diagnostics")
         self.copy_peq_diagnostics.clicked.connect(
@@ -727,7 +764,7 @@ class OptimizerWindow(QMainWindow):
 
         actions = QHBoxLayout()
         self.validate_retarget_button = QPushButton("Validate / Prepare Retarget")
-        self.validate_retarget_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.validate_retarget_button.setIcon(theme.make_icon("check"))
         self.validate_retarget_button.clicked.connect(self.validate_retarget_inputs)
         self.copy_retarget_diagnostics = QPushButton("Copy Diagnostics")
         self.copy_retarget_diagnostics.clicked.connect(
@@ -803,7 +840,7 @@ class OptimizerWindow(QMainWindow):
 
         action_line = QHBoxLayout()
         self.validate_phase_button = QPushButton("Validate Sweeps / Prepare Phase")
-        self.validate_phase_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.validate_phase_button.setIcon(theme.make_icon("check"))
         self.validate_phase_button.clicked.connect(self.validate_phase_inputs)
         self.phase_use_peq_button = QPushButton("Use Latest PEQ Result")
         self.phase_use_peq_button.clicked.connect(self._use_latest_peq_result)
@@ -1004,15 +1041,15 @@ class OptimizerWindow(QMainWindow):
         action_line = QHBoxLayout()
         self.start_button = QPushButton("Start Optimizer")
         self.start_button.setObjectName("primary")
-        self.start_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_button.setIcon(theme.make_icon("play", theme.TEXT_ON_ACCENT))
         self.start_button.clicked.connect(self._start_clicked)
         self.start_button.setEnabled(False)
         self.cancel_button = QPushButton("Stop Safely")
-        self.cancel_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.cancel_button.setIcon(theme.make_icon("stop", theme.DANGER))
         self.cancel_button.clicked.connect(self.cancel_run)
         self.cancel_button.setEnabled(False)
         self.open_run_button = QPushButton("Open Run Folder")
-        self.open_run_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.open_run_button.setIcon(theme.make_icon("folder-open"))
         self.open_run_button.clicked.connect(self._open_run_folder)
         self.open_run_button.setEnabled(False)
         action_line.addWidget(self.start_button)
@@ -1162,15 +1199,15 @@ class OptimizerWindow(QMainWindow):
 
         result_actions = QHBoxLayout()
         self.export_button = QPushButton("Export Selected AFPX")
-        self.export_button.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.export_button.setIcon(theme.make_icon("export"))
         self.export_button.clicked.connect(self._export_selected)
         self.export_button.setEnabled(False)
         self.open_results_button = QPushButton("Open Results Folder")
-        self.open_results_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.open_results_button.setIcon(theme.make_icon("folder-open"))
         self.open_results_button.clicked.connect(self._open_results_folder)
         self.open_results_button.setEnabled(False)
         self.open_report_button = QPushButton("Open Tuning Report")
-        self.open_report_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.open_report_button.setIcon(theme.make_icon("report"))
         self.open_report_button.clicked.connect(self._open_report)
         self.open_report_button.setEnabled(False)
         self.record_decision_button = QPushButton("Record Listening Decision")
@@ -1330,12 +1367,12 @@ class OptimizerWindow(QMainWindow):
         frequencies = system.get("frequency_hz") or []
         self.verify_chart.set_series([
             {
-                "label": "Predicted", "frequency_hz": frequencies,
-                "db": system.get("predicted_db") or [], "color": "#2878b5",
+                "label": "Predicted", "x": frequencies,
+                "y": system.get("predicted_db") or [], "color": theme.SERIES_PREDICTED,
             },
             {
-                "label": "Achieved", "frequency_hz": frequencies,
-                "db": system.get("achieved_db") or [], "color": "#16805d",
+                "label": "Achieved", "x": frequencies,
+                "y": system.get("achieved_db") or [], "color": theme.SERIES_CANDIDATE,
             },
         ])
         verdict = str(payload.get("verdict", "")).replace("_", " ").title()
@@ -1400,37 +1437,7 @@ class OptimizerWindow(QMainWindow):
         return page
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #f5f6f7; color: #202327; font-size: 13px; }
-            QLabel#title { font-size: 25px; font-weight: 700; color: #14171a; }
-            QLabel#subtitle { color: #626a73; }
-            QLabel#badge { background: #e1e5e9; color: #394047; padding: 6px 11px; border-radius: 4px; font-weight: 700; }
-            QLabel#warning { background: #fff4d9; border-left: 4px solid #d08a00; padding: 9px; color: #5e470f; }
-            QLabel#resultBanner { background: #e8f4ee; border-left: 4px solid #16805d; padding: 10px; color: #23473a; font-weight: 650; }
-            QFrame#metricCard { background: #ffffff; border: 1px solid #dfe3e6; border-radius: 4px; }
-            QLabel#metricName { color: #68717a; font-size: 11px; }
-            QLabel#metricValue { color: #15191d; font-size: 18px; font-weight: 650; }
-            QLabel#sectionTitle { font-size: 18px; font-weight: 650; }
-            QLabel#workflowTitle { font-size: 15px; font-weight: 650; color: #202327; margin-top: 8px; }
-            QLabel#workflowSummary { font-size: 15px; font-weight: 650; color: #202327; }
-            QLabel#chart { background: white; border: 1px solid #d8dde1; color: #68717a; padding: 4px; }
-            QLabel#chartNote { color: #68717a; font-size: 11px; }
-            QScrollArea#runScroll, QWidget#runContent { background: white; }
-            QTabWidget::pane { border: 1px solid #d9dde1; background: white; }
-            QTabBar::tab { background: #e9ecef; border: 1px solid #d9dde1; padding: 9px 14px; }
-            QTabBar::tab:selected { background: white; border-bottom-color: white; font-weight: 650; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget {
-                background: white; border: 1px solid #cbd1d6; border-radius: 3px; padding: 6px;
-            }
-            QPushButton, QToolButton { background: #edf0f2; border: 1px solid #c5cbd0; border-radius: 4px; padding: 7px 12px; }
-            QPushButton:hover, QToolButton:hover { background: #e2e7ea; }
-            QPushButton#primary { background: #176b4d; color: white; border-color: #12563e; font-weight: 650; }
-            QPushButton#primary:hover { background: #125b41; }
-            QPushButton:disabled { color: #9ca3aa; background: #f0f1f2; }
-            QProgressBar { border: 1px solid #cbd1d6; background: white; height: 16px; text-align: center; }
-            QProgressBar::chunk { background: #23805f; }
-            QHeaderView::section { background: #edf0f2; border: 0; border-bottom: 1px solid #cbd1d6; padding: 7px; font-weight: 650; }
-        """)
+        self.setStyleSheet(theme.build_stylesheet())
 
     def _set_defaults(self):
         target = default_target()
@@ -1495,7 +1502,7 @@ class OptimizerWindow(QMainWindow):
             self.home_measurement_edit.setText(data.text())
         if workflow == self.active_mode:
             self.start_button.setEnabled(False)
-            self.tabs.setTabEnabled(self.TAB_RUN, False)
+            self._set_tab_enabled(self.TAB_RUN, False)
             self.tabs.setTabToolTip(self.TAB_RUN, "Validate this workflow before opening Run.")
             self.run_badge.setText("NEEDS VALIDATION")
 
@@ -1534,13 +1541,13 @@ class OptimizerWindow(QMainWindow):
         lines = [f"<b>Detected layout: {html.escape(layout_name)}</b>"]
         for row in checklist["rows"]:
             if row["ready"]:
-                marker, colour, detail = "&#10003;", "#176b4d", Path(row["path"]).name
+                marker, colour, detail = "&#10003;", theme.ACCENT_LINE, Path(row["path"]).name
             elif not row.get("required", True):
-                marker, colour, detail = "&#9675;", "#9a6500", f"{row['expected']} (optional)"
+                marker, colour, detail = "&#9675;", theme.WARN, f"{row['expected']} (optional)"
             elif row["empty"]:
-                marker, colour, detail = "&#10007;", "#a12622", f"{row['expected']} (empty placeholder)"
+                marker, colour, detail = "&#10007;", theme.DANGER, f"{row['expected']} (empty placeholder)"
             else:
-                marker, colour, detail = "&#10007;", "#a12622", row["expected"]
+                marker, colour, detail = "&#10007;", theme.DANGER, row["expected"]
             lines.append(
                 f'<span style="color:{colour};font-weight:600">{marker}</span> '
                 f"{html.escape(row['role'])}: {html.escape(detail)}"
@@ -1638,7 +1645,7 @@ class OptimizerWindow(QMainWindow):
             "label": selected.get("file", "New target"),
             "x": selected.get("frequency_hz"),
             "y": selected.get("relative_db"),
-            "color": "#16805d",
+            "color": theme.SERIES_CANDIDATE,
         }]
         try:
             same_target = selected_path.resolve() == default_target().resolve()
@@ -1649,7 +1656,7 @@ class OptimizerWindow(QMainWindow):
                 "label": "Built-in ResoNix 2026",
                 "x": reference.get("frequency_hz"),
                 "y": reference.get("relative_db"),
-                "color": "#a34b43",
+                "color": theme.SERIES_BASELINE,
                 "dashed": True,
             })
         self.retarget_target_chart.set_series(
@@ -1944,7 +1951,7 @@ class OptimizerWindow(QMainWindow):
                     warning_rows.append(
                         '<div style="margin-top:8px;color:%s"><b>%s</b><br>%s</div>'
                         % (
-                            info["colour"],
+                            theme.severity_colour(info["severity"]),
                             html.escape(info["severity"].upper()),
                             html.escape(info["text"]),
                         )
@@ -1978,7 +1985,7 @@ class OptimizerWindow(QMainWindow):
             self.voicing_check.setEnabled(tone_options)
             self.sub_blend_check.setEnabled(tone_options)
             self.headroom_spin.setEnabled(tone_options and self.sub_blend_check.isChecked())
-            self.tabs.setTabEnabled(self.TAB_RUN, True)
+            self._set_tab_enabled(self.TAB_RUN, True)
             self.tabs.setTabToolTip(self.TAB_RUN, "Run the validated workflow.")
             self.tabs.setCurrentIndex(self.TAB_RUN)
             self._update_home_checklist()
@@ -2424,7 +2431,7 @@ class OptimizerWindow(QMainWindow):
                 f"Reattached to background run:\n{root}\nProcess: {active_pid}"
             )
             self.poll_timer.start(1000)
-            self.tabs.setTabEnabled(self.TAB_RUN, True)
+            self._set_tab_enabled(self.TAB_RUN, True)
             self.tabs.setCurrentIndex(self.TAB_RUN)
             return
         summary = locate_summary(root)
@@ -2444,7 +2451,7 @@ class OptimizerWindow(QMainWindow):
                 self._remember_run(config)
             release_run_claim(root)
             self.load_results(summary)
-            self.tabs.setTabEnabled(self.TAB_RESULTS, True)
+            self._set_tab_enabled(self.TAB_RESULTS, True)
             self.tabs.setTabToolTip(self.TAB_RESULTS, "Review and export completed candidates.")
             self.tabs.setCurrentIndex(self.TAB_RESULTS)
         else:
@@ -2467,7 +2474,7 @@ class OptimizerWindow(QMainWindow):
                 self.start_run(root)
 
     def load_results(self, summary_path: Path):
-        self.tabs.setTabEnabled(self.TAB_RESULTS, True)
+        self._set_tab_enabled(self.TAB_RESULTS, True)
         self.tabs.setTabToolTip(self.TAB_RESULTS, "Review and export completed candidates.")
         self.summary_path = summary_path
         self.summary = load_summary(summary_path)
@@ -2495,11 +2502,11 @@ class OptimizerWindow(QMainWindow):
         self.result_heading.setText(verdict["heading"])
         self.improvement_banner.setText(verdict["detail"])
         self.improvement_banner.setStyleSheet(
-            "background:#e8f4ee;border-left:4px solid #16805d;padding:10px;"
-            "color:#23473a;font-weight:650;"
+            f"background:{theme.ACCENT_SOFT_BG};border-left:4px solid {theme.ACCENT_LINE};padding:10px;"
+            f"color:{theme.ACCENT_SOFT_TEXT};font-weight:650;"
             if verdict["meaningful"] else
-            "background:#fff1e8;border-left:4px solid #c45c28;padding:10px;"
-            "color:#6b351d;font-weight:650;"
+            f"background:{theme.WARN_SOFT_BG};border-left:4px solid {theme.WARN};padding:10px;"
+            f"color:{theme.WARN_TEXT};font-weight:650;"
         )
         for index, card in enumerate(metric_card_data(baseline, best_components)):
             delta = card["delta_db"]
@@ -2511,9 +2518,9 @@ class OptimizerWindow(QMainWindow):
                 detail = f"{abs(delta):.2f} dB {'less' if delta >= 0 else 'more'} error"
             self.result_metric_values[index].setText(value)
             self.result_metric_values[index].setStyleSheet({
-                "good": "color:#16805d;",
-                "warn": "color:#b34c37;",
-                "neutral": "color:#59636b;",
+                "good": f"color:{theme.ACCENT_LINE};",
+                "warn": f"color:{theme.DANGER};",
+                "neutral": f"color:{theme.TEXT_MUTED};",
             }[card["state"]])
             self.result_metric_details[index].setText(detail)
 
@@ -2544,7 +2551,7 @@ class OptimizerWindow(QMainWindow):
             warning_rows.append(
                 '<p style="color:%s"><b>%s</b><br>%s</p>'
                 % (
-                    info["colour"], html.escape(info["severity"].upper()),
+                    theme.severity_colour(info["severity"]), html.escape(info["severity"].upper()),
                     html.escape(info["text"]),
                 )
             )
@@ -2852,6 +2859,9 @@ class OptimizerWindow(QMainWindow):
 
 
 def run_gui() -> int:
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
