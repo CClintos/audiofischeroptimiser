@@ -54,7 +54,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.5.1")
+        self.assertEqual(__version__, "0.6.0")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
