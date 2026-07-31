@@ -15,7 +15,7 @@ from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
     export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
-    locate_summary, runner_completed_successfully, runner_failure_reason, save_role_map,
+    locate_summary, record_run_decision, runner_completed_successfully, runner_failure_reason, save_role_map,
     start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
 )
 from optimizer_gui import __version__
@@ -107,11 +107,15 @@ class GuiJobTests(unittest.TestCase):
 
     def test_job_round_trip_and_worker_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = RunConfig("data", "base.afpx", "target.txt", tmp, cpu_percent=100)
+            config = RunConfig(
+                "data", "base.afpx", "target.txt", tmp,
+                cpu_percent=100, seed=12345,
+            )
             config.save()
             loaded = RunConfig.load(Path(tmp))
             self.assertEqual(loaded.data_root, "data")
             self.assertLessEqual(loaded.workers, 12)
+            self.assertEqual(loaded.seed, 12345)
 
     def test_phase_mode_is_single_worker_and_explicit(self) -> None:
         config = RunConfig("data", "base.afpx", "target.txt", "run", mode="phase", cpu_percent=80)
@@ -137,13 +141,15 @@ class GuiJobTests(unittest.TestCase):
     def test_command_passes_explicit_user_choices(self) -> None:
         config = RunConfig(
             "C:\\Measurements", "C:\\Measurements\\base.afpx", "C:\\target.txt",
-            "C:\\run", voicing_variants="audition", sub_blend="recommend", headroom_db=3.0,
+            "C:\\run", voicing_variants="audition", sub_blend="recommend",
+            headroom_db=3.0, seed=24680,
         )
         program, args = powershell_command(config, executable="C:\\python.exe")
         self.assertEqual(program, "powershell.exe")
         self.assertIn("audition", args)
         self.assertIn("recommend", args)
         self.assertIn("C:\\python.exe", args)
+        self.assertEqual(args[args.index("-StartSeed") + 1], "24680")
 
     def test_command_passes_role_map_to_runner(self) -> None:
         config = RunConfig(
@@ -373,11 +379,18 @@ class GuiJobTests(unittest.TestCase):
             (worker / "stream_state.json").write_text(json.dumps({
                 "completed_trials": 42, "elapsed_seconds": 5,
                 "best": [{"objective": 3.25}],
+                "convergence": {
+                    "verdict": "still_improving",
+                    "stalled_seconds": 1.5,
+                    "events": [{"elapsed_seconds": 4.0, "objective": 3.25}],
+                },
             }), encoding="utf-8")
             progress = collect_progress(root)
             self.assertEqual(progress["trials"], 42)
             self.assertEqual(progress["best_objective"], 3.25)
             self.assertEqual(progress["phase"], "searching")
+            self.assertEqual(progress["convergence"]["verdict"], "still_improving")
+            self.assertEqual(progress["convergence"]["events"][0]["objective"], 3.25)
 
             (root / ".phase_merging").touch()
             self.assertEqual(collect_progress(root)["phase"], "merging")
@@ -399,6 +412,28 @@ class GuiJobTests(unittest.TestCase):
             self.assertEqual(rows[0]["role"], "Current tune (baseline)")
             self.assertFalse(rows[0]["exportable"])
             self.assertEqual(rows[1]["role"], "Balanced")
+
+    def test_listening_decision_links_latest_achieved_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            verification = root / "verification"
+            verification.mkdir()
+            (verification / "verification_20260731_010203.json").write_text(
+                json.dumps({
+                    "verdict": "confirmed",
+                    "system": {"difference_rms_db": 0.18},
+                }),
+                encoding="utf-8",
+            )
+            path = record_run_decision(
+                root, "family_balanced.afpx", "Kept - clearly better",
+                "Stable centre image.",
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            entry = payload["entries"][0]
+            self.assertEqual(entry["candidate"], "family_balanced.afpx")
+            self.assertEqual(entry["verification"]["verdict"], "confirmed")
+            self.assertEqual(entry["verification"]["system_difference_rms_db"], 0.18)
 
     def test_export_uses_run_timestamp_and_never_clobbers_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,6 +5,7 @@ param(
     [string]$Root = "",
     [int]$Seconds = 1200,
     [int]$Workers = 0,
+    [int]$StartSeed = 20260711,
     [ValidateSet("peq", "phase")]
     [string]$Mode = "peq",
     [ValidateSet("guided", "beam", "cmaes", "mixed", "random")]
@@ -76,6 +77,7 @@ if ($Mode -eq "phase") {
 }
 $launch = @{
     Root = $Root; Workers = $Workers; Seconds = $Seconds; Proposal = $Proposal
+    StartSeed = $StartSeed
     Mode = $Mode
     DataRoot = $data; Baseline = $baselinePath; Target = $targetPath
     ValidationThreshold = $ValidationThreshold; PhaseWrites = $PhaseWrites

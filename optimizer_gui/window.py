@@ -32,7 +32,7 @@ from .backend import (
     default_target, discover_baseline, export_candidate, load_summary,
     load_target_curve, locate_summary, measurement_checklist,
     memory_guard_status, powershell_command, process_is_running,
-    process_tree_memory, release_run_claim, save_role_map, stop_process_tree,
+    process_tree_memory, record_run_decision, release_run_claim, save_role_map, stop_process_tree,
     start_detached_process, suggest_measurement_role, timestamped_run_root,
     runner_completed_successfully, runner_failure_reason, update_run_claim,
     validate_config,
@@ -1006,6 +1006,27 @@ class OptimizerWindow(QMainWindow):
             cell.addWidget(widget)
             status_grid.addLayout(cell, 0, col)
         layout.addLayout(status_grid)
+        self.convergence_label = QLabel(
+            "Convergence: waiting for the first worker checkpoint."
+        )
+        self.convergence_label.setObjectName("chartNote")
+        self.convergence_label.setWordWrap(True)
+        layout.addWidget(self.convergence_label)
+        self.convergence_table = QTableWidget(0, 2)
+        self.convergence_table.setHorizontalHeaderLabels(
+            ["Elapsed", "Best objective"]
+        )
+        self.convergence_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+        self.convergence_table.verticalHeader().setVisible(False)
+        self.convergence_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.convergence_table.setSelectionMode(QTableWidget.NoSelection)
+        self.convergence_table.setMaximumHeight(145)
+        self.convergence_table.setToolTip(
+            "Recent objective improvements from the live worker checkpoints."
+        )
+        layout.addWidget(self.convergence_table)
 
         self.run_log = QTextEdit()
         self.run_log.setReadOnly(True)
@@ -1100,9 +1121,17 @@ class OptimizerWindow(QMainWindow):
         self.open_report_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         self.open_report_button.clicked.connect(self._open_report)
         self.open_report_button.setEnabled(False)
+        self.record_decision_button = QPushButton("Record Listening Decision")
+        self.record_decision_button.clicked.connect(self._record_listening_decision)
+        self.record_decision_button.setEnabled(False)
+        self.repeat_run_button = QPushButton("Repeat This Run")
+        self.repeat_run_button.clicked.connect(self._repeat_loaded_run)
+        self.repeat_run_button.setEnabled(False)
         result_actions.addWidget(self.export_button)
         result_actions.addWidget(self.open_report_button)
         result_actions.addWidget(self.open_results_button)
+        result_actions.addWidget(self.record_decision_button)
+        result_actions.addWidget(self.repeat_run_button)
         result_actions.addStretch()
         layout.addLayout(result_actions)
 
@@ -2179,6 +2208,34 @@ class OptimizerWindow(QMainWindow):
         self.trial_value.setText(f"{progress['trials']:,}")
         objective = progress["best_objective"]
         self.best_value.setText("-" if objective is None else f"{objective:.5f}")
+        convergence = progress.get("convergence") or {}
+        verdict = str(convergence.get("verdict", "deterministic_plateau"))
+        stalled = float(convergence.get("stalled_seconds", 0.0))
+        convergence_text = {
+            "still_improving": "Still improving; a longer run may find more.",
+            "stalled": f"No improvement for {stalled / 60.0:.1f} minutes; the search is stalled.",
+            "deterministic_plateau": "Deterministic pass complete; waiting for a guided improvement.",
+        }.get(verdict, verdict.replace("_", " ").title())
+        self.convergence_label.setText("Convergence: " + convergence_text)
+        events = sorted(
+            (
+                event for event in convergence.get("events", [])
+                if "elapsed_seconds" in event and "objective" in event
+            ),
+            key=lambda event: float(event["elapsed_seconds"]),
+        )[-8:]
+        self.convergence_table.setRowCount(len(events))
+        for row, event in enumerate(events):
+            elapsed_event = max(0, round(float(event["elapsed_seconds"])))
+            elapsed_text = (
+                f"{elapsed_event // 60:02d}:{elapsed_event % 60:02d}"
+            )
+            self.convergence_table.setItem(
+                row, 0, QTableWidgetItem(elapsed_text)
+            )
+            self.convergence_table.setItem(
+                row, 1, QTableWidgetItem(f"{float(event['objective']):.5f}")
+            )
         pid = self.process_pid
         rss, total, memory_error = process_tree_memory(pid)
         if total:
@@ -2361,6 +2418,8 @@ class OptimizerWindow(QMainWindow):
         self.summary_path = summary_path
         self.summary = load_summary(summary_path)
         self.verify_run_edit.setText(str(summary_path.parent))
+        self.repeat_run_button.setEnabled(True)
+        self.record_decision_button.setEnabled(True)
         rows = candidate_files(self.summary, summary_path)
         self.result_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
@@ -2621,6 +2680,79 @@ class OptimizerWindow(QMainWindow):
     def _open_run_folder(self):
         if self.config:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.config.run_root))
+
+    def _loaded_run_root(self) -> Path | None:
+        if not self.summary_path:
+            return None
+        folder = self.summary_path.parent
+        return folder.parent if folder.name == "_merged_top" else folder
+
+    def _record_listening_decision(self):
+        root = self._loaded_run_root()
+        if root is None:
+            return
+        row = self.result_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "Choose a candidate",
+                "Select the tune you actually loaded before recording the decision.",
+            )
+            return
+        role_item = self.result_table.item(row, 0)
+        file_item = self.result_table.item(row, 2)
+        candidate = file_item.text() if file_item else (
+            role_item.text() if role_item else "Unknown candidate"
+        )
+        verdict, accepted = QInputDialog.getItem(
+            self, "Listening decision", "What was the result?",
+            [
+                "Kept - clearly better",
+                "Kept - small improvement",
+                "Rejected - tonal balance",
+                "Rejected - imaging",
+                "Rejected - other",
+                "Not yet evaluated",
+            ],
+            0, False,
+        )
+        if not accepted:
+            return
+        notes, accepted = QInputDialog.getMultiLineText(
+            self, "Listening notes",
+            "Optional notes (music, image, tonality, measurement conditions):",
+        )
+        if not accepted:
+            return
+        path = record_run_decision(root, candidate, verdict, notes)
+        QMessageBox.information(
+            self, "Decision saved",
+            f"The listening decision was added to:\n{path}",
+        )
+
+    def _repeat_loaded_run(self):
+        root = self._loaded_run_root()
+        if root is None or not (root / "gui_job.json").is_file():
+            QMessageBox.warning(
+                self, "Run configuration unavailable",
+                "This result does not have a reusable gui_job.json.",
+            )
+            return
+        if self._run_is_active():
+            QMessageBox.information(
+                self, "Optimizer already running",
+                "Stop or finish the active run before repeating another one.",
+            )
+            return
+        config = RunConfig.load(root)
+        new_root = timestamped_run_root(root.parent)
+        config.run_root = str(new_root)
+        config.status = "ready"
+        config.summary_path = ""
+        config.error = ""
+        config.started_at = ""
+        config.completed_at = ""
+        config.save()
+        self.start_run(new_root)
 
     def _open_results_folder(self):
         if self.summary_path:

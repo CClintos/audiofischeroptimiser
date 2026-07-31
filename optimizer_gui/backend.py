@@ -250,6 +250,7 @@ class RunConfig:
     headroom_db: float | None = None
     level_calibration: str = ""
     role_map: str = ""
+    seed: int = 20260711
     status: str = "ready"
     summary_path: str = ""
     error: str = ""
@@ -408,6 +409,7 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
         "-Workers", str(config.workers),
         "-Mode", config.mode,
         "-Proposal", config.proposal,
+        "-StartSeed", str(config.seed),
         "-PhaseWrites", config.phase_writes,
         "-VoicingVariants", config.voicing_variants,
         "-SubBlend", config.sub_blend,
@@ -420,6 +422,47 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
     if config.role_map:
         args.extend(["-RoleMap", config.role_map])
     return "powershell.exe", args
+
+
+def record_run_decision(run_root: Path, candidate: str, verdict: str,
+                        notes: str = "") -> Path:
+    root = Path(run_root).resolve()
+    path = root / "decision_ledger.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    entries = list(payload.get("entries") or [])
+    verification_files = sorted((root / "verification").glob("verification_*.json"))
+    verification = None
+    if verification_files:
+        try:
+            latest = json.loads(verification_files[-1].read_text(encoding="utf-8-sig"))
+            verification = {
+                "file": str(verification_files[-1]),
+                "verdict": latest.get("verdict"),
+                "system_difference_rms_db": (
+                    (latest.get("system") or {}).get("difference_rms_db")
+                ),
+            }
+        except (OSError, ValueError, TypeError):
+            verification = None
+    entries.append({
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "candidate": candidate,
+        "verdict": verdict,
+        "notes": notes,
+        "verification": verification,
+    })
+    payload = {
+        "schema": "audiofischer-decision-ledger-v1",
+        "run_folder": str(root),
+        "entries": entries,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 
 def worker_executable() -> str:
@@ -452,6 +495,26 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
         (name for name in reversed(RUN_PHASES) if (run_root / f".phase_{name}").exists()),
         "searching",
     )
+    convergence_rows = [
+        dict(state.get("convergence") or {}) for state in states
+        if state.get("convergence")
+    ]
+    convergence = {
+        "verdict": (
+            "still_improving"
+            if any(row.get("verdict") == "still_improving" for row in convergence_rows)
+            else "stalled"
+            if convergence_rows and all(row.get("verdict") == "stalled" for row in convergence_rows)
+            else "deterministic_plateau"
+        ),
+        "stalled_seconds": max(
+            (float(row.get("stalled_seconds", 0.0)) for row in convergence_rows),
+            default=0.0,
+        ),
+        "events": [
+            event for row in convergence_rows for event in (row.get("events") or [])
+        ],
+    }
     return {
         "workers_reporting": len(states),
         "trials": sum(int(state.get("completed_trials", 0)) for state in states),
@@ -462,6 +525,7 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
         "phase": phase,
         "verified_candidates": verified,
         "verification_candidates": candidates,
+        "convergence": convergence,
     }
 
 

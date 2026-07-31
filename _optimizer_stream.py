@@ -1417,6 +1417,19 @@ def main():
         if best and args.checkpoint_seconds and now >= next_checkpoint:
             args._completed_trials = completed_before + trials
             args._elapsed_seconds = elapsed_before + (now - start)
+            stalled_seconds_now = max(0.0, now - last_improvement_time)
+            args.convergence = {
+                "events": list(convergence_events),
+                "last_improvement_elapsed_seconds": float(
+                    max(0.0, last_improvement_time - start)
+                ),
+                "stalled_seconds": float(stalled_seconds_now),
+                "verdict": (
+                    "stalled" if stalled_seconds_now >= 360.0
+                    else "still_improving" if len(convergence_events) > 2
+                    else "deterministic_plateau"
+                ),
+            }
             archive, archive_scores = prune_archive(archive, archive_scores, args.archive_size)
             save_state(
                 state_path, best, rng, args._completed_trials, args._elapsed_seconds, args, archive=archive
