@@ -523,6 +523,10 @@ class OptimizerWindow(QMainWindow):
         outer.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
 
+    def _set_badge(self, text: str):
+        self.run_badge.setText(text)
+        self.run_badge.setStyleSheet(theme.badge_style(text))
+
     def _set_tab_enabled(self, index: int, enabled: bool):
         self.tabs.setTabEnabled(index, enabled)
         self._update_step_badge(index, enabled)
@@ -649,6 +653,7 @@ class OptimizerWindow(QMainWindow):
         recent_title.setStyleSheet("margin-top:0;")
         recent_layout.addWidget(recent_title)
         self.recent_runs_table = QTableWidget(0, 5)
+        self.recent_runs_table.setAlternatingRowColors(True)
         self.recent_runs_table.setHorizontalHeaderLabels(
             ["Date", "Workflow", "Status", "Best objective", "Path"]
         )
@@ -1097,6 +1102,7 @@ class OptimizerWindow(QMainWindow):
         self.convergence_label.setWordWrap(True)
         layout.addWidget(self.convergence_label)
         self.convergence_table = QTableWidget(0, 2)
+        self.convergence_table.setAlternatingRowColors(True)
         self.convergence_table.setHorizontalHeaderLabels(
             ["Elapsed", "Best objective"]
         )
@@ -1187,6 +1193,7 @@ class OptimizerWindow(QMainWindow):
         candidate_title.setObjectName("workflowTitle")
         layout.addWidget(candidate_title)
         self.result_table = QTableWidget(0, 3)
+        self.result_table.setAlternatingRowColors(True)
         self.result_table.setHorizontalHeaderLabels(["Choice", "Decision score", "File"])
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1235,6 +1242,7 @@ class OptimizerWindow(QMainWindow):
         filter_heading.addWidget(self.copy_filters_button)
         layout.addLayout(filter_heading)
         self.filter_table = QTableWidget(0, 4)
+        self.filter_table.setAlternatingRowColors(True)
         self.filter_table.setHorizontalHeaderLabels(
             ["Driver / group", "Frequency", "Q", "Gain"],
         )
@@ -1504,7 +1512,7 @@ class OptimizerWindow(QMainWindow):
             self.start_button.setEnabled(False)
             self._set_tab_enabled(self.TAB_RUN, False)
             self.tabs.setTabToolTip(self.TAB_RUN, "Validate this workflow before opening Run.")
-            self.run_badge.setText("NEEDS VALIDATION")
+            self._set_badge("NEEDS VALIDATION")
 
     def _input_changed(self):
         self._workflow_input_changed(self.active_mode)
@@ -1820,7 +1828,7 @@ class OptimizerWindow(QMainWindow):
         button.setText("Cancel Validation")
         button.clicked.connect(self.cancel_validation)
         output.setPlainText("Validating measurements and tune data...")
-        self.run_badge.setText("VALIDATING")
+        self._set_badge("VALIDATING")
         self._show_busy("Validating inputs")
         self.validation_context = (mode, output, button, original_text, callback, config)
         task = BackgroundTask(lambda cancelled: validate_config(config, cancelled))
@@ -1850,7 +1858,7 @@ class OptimizerWindow(QMainWindow):
         if result.get("cancelled"):
             output.setPlainText("Validation cancelled. No optimizer run was started.")
             self.start_button.setEnabled(False)
-            self.run_badge.setText("VALIDATION CANCELLED")
+            self._set_badge("VALIDATION CANCELLED")
             return
         compact = result.get("compact") or {}
         missing_roles = list(compact.get("missing_roles") or [])
@@ -1866,7 +1874,7 @@ class OptimizerWindow(QMainWindow):
                 "The role-mapping dialog will open next."
             )
             self.start_button.setEnabled(False)
-            self.run_badge.setText("ROLE MAPPING NEEDED")
+            self._set_badge("ROLE MAPPING NEEDED")
             return
         if result["compact"]:
             layout_label = {
@@ -1961,7 +1969,7 @@ class OptimizerWindow(QMainWindow):
         else:
             output.setPlainText("\n".join(result["errors"]))
         self.start_button.setEnabled(bool(result["valid"]))
-        self.run_badge.setText("VALIDATED" if result["valid"] else "INPUT BLOCKED")
+        self._set_badge("VALIDATED" if result["valid"] else "INPUT BLOCKED")
         if result["valid"]:
             self.validated_signatures[mode] = self._config_signature(config)
             self.validated_configs[mode] = config
@@ -2003,7 +2011,7 @@ class OptimizerWindow(QMainWindow):
         self._diagnostics_button(mode).setEnabled(True)
         output.setPlainText(f"Validation failed:\n{error}")
         self.start_button.setEnabled(False)
-        self.run_badge.setText("VALIDATION FAILED")
+        self._set_badge("VALIDATION FAILED")
 
     def _validation_finished(self):
         if not self.validation_context:
@@ -2057,7 +2065,7 @@ class OptimizerWindow(QMainWindow):
                 "Role mapping was not saved. Validation remains blocked until the "
                 "required measurements are mapped."
             )
-            self.run_badge.setText("INPUT BLOCKED")
+            self._set_badge("INPUT BLOCKED")
             return
         mapped = dialog.mapping
         three_way_roles = {
@@ -2179,7 +2187,7 @@ class OptimizerWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.open_run_button.setEnabled(True)
-        self.run_badge.setText("RUNNING")
+        self._set_badge("RUNNING")
         memory_line = (
             f"Memory stop limit: {config.ram_percent}% of physical RAM"
             if self.memory_guard_available else
@@ -2320,7 +2328,7 @@ class OptimizerWindow(QMainWindow):
         stop_file = Path(self.config.run_root) / "stop_requested" if self.config else None
         if stop_file:
             stop_file.write_text(self.stop_requested_reason, encoding="ascii")
-        self.run_badge.setText("STOPPING SAFELY")
+        self._set_badge("STOPPING SAFELY")
         self.phase_label.setText("Stopping safely")
         self.cancel_button.setEnabled(False)
         self._show_busy("Stopping safely and preserving checkpoints")
@@ -2351,7 +2359,7 @@ class OptimizerWindow(QMainWindow):
         self.shutdown_task = None
         self._hide_busy()
         if not self._run_is_active():
-            self.run_badge.setText("STOPPED - RESUMABLE")
+            self._set_badge("STOPPED - RESUMABLE")
             self.phase_label.setText("Stopped")
         if self.close_after_stop:
             self.close_after_stop = False
@@ -2378,7 +2386,7 @@ class OptimizerWindow(QMainWindow):
             self.config.error = ""
             self.config.save()
             self._remember_run(self.config)
-            self.run_badge.setText("WRITING REPORT")
+            self._set_badge("WRITING REPORT")
             self.load_results(summary)
             self.tabs.setCurrentIndex(self.TAB_RESULTS)
         elif self.config.status not in ("stopped", "memory_stopped"):
@@ -2386,7 +2394,7 @@ class OptimizerWindow(QMainWindow):
             self.config.error = runner_failure_reason(Path(self.config.run_root))
             self.config.save()
             self._remember_run(self.config)
-            self.run_badge.setText("FAILED")
+            self._set_badge("FAILED")
             self.phase_label.setText("Failed")
             self.run_log.append(self.config.error)
         self.start_button.setEnabled(True)
@@ -2426,7 +2434,7 @@ class OptimizerWindow(QMainWindow):
             self.start_button.setEnabled(False)
             self.cancel_button.setEnabled(True)
             self.open_run_button.setEnabled(True)
-            self.run_badge.setText("RUNNING IN BACKGROUND")
+            self._set_badge("RUNNING IN BACKGROUND")
             self.run_log.setPlainText(
                 f"Reattached to background run:\n{root}\nProcess: {active_pid}"
             )
@@ -2461,7 +2469,7 @@ class OptimizerWindow(QMainWindow):
                 config.error = failure
                 config.save()
                 self._remember_run(config)
-                self.run_badge.setText("FAILED - RESUMABLE")
+                self._set_badge("FAILED - RESUMABLE")
                 self.run_log.setPlainText(failure)
             prompt = (
                 f"The previous run failed before producing a verified result.\n\n{failure}\n\n"
@@ -2613,7 +2621,7 @@ class OptimizerWindow(QMainWindow):
         self.open_report_button.setEnabled(False)
         self.phase_label.setText("Writing report")
         self.progress.setRange(0, 0)
-        self.run_badge.setText("WRITING REPORT")
+        self._set_badge("WRITING REPORT")
         self._show_busy("Writing tuning report")
         task = BackgroundTask(lambda _cancelled: generate_tuning_report(summary_path))
         self.report_task = task
@@ -2633,7 +2641,7 @@ class OptimizerWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setValue(1000)
         self.phase_label.setText("Complete")
-        self.run_badge.setText(
+        self._set_badge(
             "STOPPED - RESULTS SAVED" if self.stop_requested_reason else "COMPLETE"
         )
 
@@ -2651,7 +2659,7 @@ class OptimizerWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setValue(1000)
         self.phase_label.setText("Complete")
-        self.run_badge.setText("COMPLETE - REPORT FAILED")
+        self._set_badge("COMPLETE - REPORT FAILED")
 
     def _report_finished(self):
         self.report_task = None
@@ -2867,6 +2875,11 @@ def run_gui() -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationName("AudioFischer Optimizer")
     app.setFont(QFont("Segoe UI", 9))
+    app.setStyle("Fusion")
+    theme.apply_palette(app)
+    app_icon = theme.make_app_icon()
+    app.setWindowIcon(app_icon)
     window = OptimizerWindow()
+    window.setWindowIcon(app_icon)
     window.show()
     return app.exec()

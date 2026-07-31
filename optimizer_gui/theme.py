@@ -20,6 +20,9 @@ BG_PANEL = "#1b1f23"       # cards, tab pane, table/tree backgrounds
 BG_RAISED = "#242a2f"      # input fields, buttons at rest
 BORDER = "#343b41"
 BORDER_STRONG = "#454d54"
+CARD_HIGHLIGHT = "#3d444b"  # subtle top-edge highlight standing in for a drop shadow
+                            # (QGraphicsDropShadowEffect on cards with several child
+                            # labels causes visible per-child compositing seams - avoid it)
 
 # ---- text -------------------------------------------------------------------
 TEXT_PRIMARY = "#e8eaec"   # 14.9:1 on BG_BASE, 13.7:1 on BG_PANEL
@@ -40,7 +43,10 @@ WARN_SOFT_BG = "#3a2c12"
 WARN_TEXT = "#f4cf8e"          # 9.1:1 on WARN_SOFT_BG
 DANGER = "#eb5457"             # 4.7:1 on BG_PANEL, 5.1:1 on BG_BASE
 DANGER_SOFT_BG = "#3a1618"
+DANGER_TEXT = "#f4a7a9"        # 8.4:1 on DANGER_SOFT_BG
 INFO = "#5b9bd5"               # 5.6:1 on BG_PANEL
+INFO_SOFT_BG = "#12283a"
+INFO_TEXT = "#a9d2f0"          # 9.5:1 on INFO_SOFT_BG
 
 # ---- chart tokens (live GUI charts only; PDF stays on its own palette) -----
 CHART_GRID = "#2c3236"
@@ -68,6 +74,113 @@ def severity_colour(severity: str) -> str:
     return {"error": DANGER, "warning": WARN, "info": INFO}.get(severity, TEXT_MUTED)
 
 
+# Ordered (first match wins) keyword -> state mapping for the run_badge label.
+# Checked case-insensitively against the badge's own text so every status
+# string window.py already sets (READY, RUNNING, VALIDATED, FAILED, ...)
+# gets a state without a second source of truth to keep in sync.
+_BADGE_RULES = (
+    ("REPORT FAILED", "warn"),
+    ("FAILED", "danger"),
+    ("BLOCKED", "danger"),
+    ("RUNNING", "info"),
+    ("VALIDATING", "info"),
+    ("WRITING", "info"),
+    ("STOPPING", "info"),
+    ("COMPLETE", "good"),
+    ("VALIDATED", "good"),
+    ("CANCELLED", "warn"),
+    ("STOPPED", "warn"),
+    ("NEEDS", "warn"),
+    ("MAPPING", "warn"),
+)
+_BADGE_LOOK = {
+    "good": (ACCENT_SOFT_BG, ACCENT_LINE, ACCENT_SOFT_TEXT),
+    "warn": (WARN_SOFT_BG, WARN, WARN_TEXT),
+    "danger": (DANGER_SOFT_BG, DANGER, DANGER_TEXT),
+    "info": (INFO_SOFT_BG, INFO, INFO_TEXT),
+}
+
+
+def badge_style(text: str) -> str:
+    """Inline stylesheet for the top-right status badge, colour-coded by state.
+
+    Returns "" for the neutral/default state so the static QLabel#badge QSS
+    rule in build_stylesheet() applies instead of an inline override.
+    """
+    upper = text.upper()
+    for keyword, state in _BADGE_RULES:
+        if keyword in upper:
+            bg, border, fg = _BADGE_LOOK[state]
+            return (
+                f"background:{bg}; color:{fg}; border:1px solid {border}; "
+                "padding:6px 11px; border-radius:4px; font-weight:700;"
+            )
+    return ""
+
+
+def apply_palette(app) -> None:
+    """Dark QPalette so Qt-drawn native chrome (QMessageBox, QInputDialog,
+    QComboBox popups, disabled-state text) matches the theme instead of
+    falling back to a light OS palette. Pair with QApplication.setStyle
+    ("Fusion") - the native Windows style mostly ignores QPalette/QSS for
+    sliders, checkboxes, and spin/combo arrows.
+    """
+    from PySide6.QtGui import QPalette
+
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: BG_BASE,
+        QPalette.ColorRole.WindowText: TEXT_PRIMARY,
+        QPalette.ColorRole.Base: BG_RAISED,
+        QPalette.ColorRole.AlternateBase: BG_PANEL,
+        QPalette.ColorRole.Text: TEXT_PRIMARY,
+        QPalette.ColorRole.Button: BG_RAISED,
+        QPalette.ColorRole.ButtonText: TEXT_PRIMARY,
+        QPalette.ColorRole.BrightText: DANGER,
+        QPalette.ColorRole.Highlight: ACCENT_FILL,
+        QPalette.ColorRole.HighlightedText: TEXT_ON_ACCENT,
+        QPalette.ColorRole.ToolTipBase: BG_RAISED,
+        QPalette.ColorRole.ToolTipText: TEXT_PRIMARY,
+        QPalette.ColorRole.PlaceholderText: TEXT_MUTED,
+        QPalette.ColorRole.Link: ACCENT_LINE,
+    }
+    for role, colour in roles.items():
+        palette.setColor(role, QColor(colour))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(BORDER_STRONG))
+    app.setPalette(palette)
+
+
+
+
+def make_app_icon() -> QIcon:
+    """A simple EQ-bars monogram for the window/taskbar icon."""
+    icon = QIcon()
+    for px in (16, 24, 32, 48, 64, 128, 256):
+        pixmap = QPixmap(px, px)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(ACCENT_FILL))
+        radius = px * 0.22
+        painter.drawRoundedRect(QRectF(0, 0, px, px), radius, radius)
+        painter.setBrush(QColor(TEXT_ON_ACCENT))
+        bars = (0.30, 0.62, 0.46, 0.74, 0.62, 0.50)
+        count = len(bars)
+        gap = px * 0.08
+        bar_width = (px - gap * (count + 1)) / count
+        base_y = px * 0.78
+        for index, height_ratio in enumerate(bars):
+            height = px * 0.56 * height_ratio + px * 0.08
+            x = gap + index * (bar_width + gap)
+            rect = QRectF(x, base_y - height, bar_width, height)
+            painter.drawRoundedRect(rect, bar_width * 0.3, bar_width * 0.3)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
 def build_stylesheet() -> str:
     return f"""
         QMainWindow, QWidget {{ background: {BG_BASE}; color: {TEXT_PRIMARY}; font-size: 13px; }}
@@ -79,10 +192,13 @@ def build_stylesheet() -> str:
             color: {WARN_TEXT}; }}
         QLabel#resultBanner {{ background: {ACCENT_SOFT_BG}; border-left: 4px solid {ACCENT_LINE}; padding: 10px;
             color: {ACCENT_SOFT_TEXT}; font-weight: 650; }}
-        QFrame#card {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
+        QFrame#card {{ background: {BG_PANEL}; border: 1px solid {BORDER};
+            border-top: 1px solid {CARD_HIGHLIGHT}; border-radius: 8px; }}
         QFrame#cardAccent {{ background: {BG_PANEL}; border: 1px solid {BORDER};
-            border-left: 3px solid {ACCENT_LINE}; border-radius: 8px; }}
-        QFrame#metricCard {{ background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 6px; }}
+            border-top: 1px solid {CARD_HIGHLIGHT}; border-left: 3px solid {ACCENT_LINE};
+            border-radius: 8px; }}
+        QFrame#metricCard {{ background: {BG_PANEL}; border: 1px solid {BORDER};
+            border-top: 1px solid {CARD_HIGHLIGHT}; border-radius: 6px; }}
         QLabel#metricName {{ color: {TEXT_MUTED}; font-size: 11px; text-transform: uppercase; }}
         QLabel#metricValue {{ color: {TEXT_PRIMARY}; font-size: 19px; font-weight: 700;
             font-family: {FONT_MONO}; }}
@@ -105,9 +221,37 @@ def build_stylesheet() -> str:
         QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {{
             border: 1px solid {ACCENT_LINE};
         }}
-        QTableWidget {{ gridline-color: {BORDER}; }}
+        QTableWidget {{ gridline-color: {BORDER}; alternate-background-color: {BG_PANEL};
+            selection-background-color: {ACCENT_FILL}; selection-color: {TEXT_ON_ACCENT}; }}
         QComboBox QAbstractItemView {{ background: {BG_RAISED}; color: {TEXT_PRIMARY};
             selection-background-color: {ACCENT_FILL}; border: 1px solid {BORDER}; }}
+        QComboBox::drop-down {{ border: none; width: 24px; }}
+        QComboBox::down-arrow {{ image: none; width: 0; height: 0;
+            border-left: 4px solid transparent; border-right: 4px solid transparent;
+            border-top: 5px solid {TEXT_MUTED}; margin-right: 8px; }}
+        QSpinBox::up-button, QDoubleSpinBox::up-button {{
+            subcontrol-origin: border; subcontrol-position: top right; width: 18px;
+            border-left: 1px solid {BORDER}; background: {BG_RAISED}; border-top-right-radius: 3px; }}
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            subcontrol-origin: border; subcontrol-position: bottom right; width: 18px;
+            border-left: 1px solid {BORDER}; background: {BG_RAISED}; border-bottom-right-radius: 3px; }}
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: none; width: 0; height: 0;
+            border-left: 3px solid transparent; border-right: 3px solid transparent;
+            border-bottom: 4px solid {TEXT_MUTED}; }}
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: none; width: 0; height: 0;
+            border-left: 3px solid transparent; border-right: 3px solid transparent;
+            border-top: 4px solid {TEXT_MUTED}; }}
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{ background: #2b323a; }}
+        QSlider::groove:horizontal {{ height: 4px; background: {BORDER}; border-radius: 2px; }}
+        QSlider::sub-page:horizontal {{ background: {ACCENT_LINE}; border-radius: 2px; }}
+        QSlider::add-page:horizontal {{ background: {BORDER}; border-radius: 2px; }}
+        QSlider::handle:horizontal {{ background: {TEXT_PRIMARY}; border: 2px solid {ACCENT_LINE};
+            width: 14px; height: 14px; margin: -6px 0; border-radius: 8px; }}
+        QSlider::handle:horizontal:hover {{ background: {ACCENT_LINE}; }}
+        QMenu {{ background: {BG_RAISED}; color: {TEXT_PRIMARY}; border: 1px solid {BORDER}; }}
+        QMenu::item {{ padding: 5px 22px; }}
+        QMenu::item:selected {{ background: {ACCENT_FILL}; color: {TEXT_ON_ACCENT}; }}
         QPushButton, QToolButton {{ background: {BG_RAISED}; color: {TEXT_PRIMARY}; border: 1px solid {BORDER};
             border-radius: 4px; padding: 7px 12px; }}
         QPushButton:hover, QToolButton:hover {{ background: #2b323a; border-color: {BORDER_STRONG}; }}
@@ -121,7 +265,12 @@ def build_stylesheet() -> str:
         QProgressBar::chunk {{ background: {ACCENT_LINE}; border-radius: 3px; }}
         QHeaderView::section {{ background: {BG_RAISED}; color: {TEXT_MUTED}; border: 0;
             border-bottom: 1px solid {BORDER}; padding: 7px; font-weight: 650; }}
-        QCheckBox {{ color: {TEXT_PRIMARY}; }}
+        QCheckBox {{ color: {TEXT_PRIMARY}; spacing: 8px; }}
+        QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 3px;
+            border: 1px solid {BORDER_STRONG}; background: {BG_RAISED}; }}
+        QCheckBox::indicator:hover {{ border-color: {ACCENT_LINE}; }}
+        QCheckBox::indicator:checked {{ background: {ACCENT_FILL}; border-color: {ACCENT_FILL}; }}
+        QCheckBox::indicator:disabled {{ border-color: {BORDER}; background: {BG_PANEL}; }}
         QToolTip {{ background: {BG_RAISED}; color: {TEXT_PRIMARY}; border: 1px solid {BORDER}; padding: 4px; }}
         QScrollBar:vertical {{ background: {BG_BASE}; width: 12px; margin: 0; }}
         QScrollBar::handle:vertical {{ background: {BORDER_STRONG}; border-radius: 5px; min-height: 24px; }}

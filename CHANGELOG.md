@@ -4,6 +4,46 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-07-31 - Native-chrome polish, status badge, app icon
+
+Second pass on top of the dark theme below. UI/styling only.
+
+- Forced `QApplication.setStyle("Fusion")` plus a matching dark `QPalette`
+  (`theme.apply_palette()`) in `run_gui()`. The native "windowsvista" style
+  mostly ignores QSS/palette for sliders, checkboxes, and combo/spin arrows -
+  Fusion is what actually makes the QSS below take effect, and it also makes
+  Qt-drawn dialogs (`QMessageBox`, `QInputDialog`) pick up the dark palette
+  instead of popping up light. Native OS dialogs (`QFileDialog`'s file/folder
+  picker) are unaffected by design - that's the real Windows picker, not Qt's.
+- Re-themed the actual widget chrome in `theme.build_stylesheet()`: `QSlider`
+  groove/handle, `QCheckBox` indicator (filled square, no image asset needed),
+  `QComboBox` drop-down arrow, `QSpinBox`/`QDoubleSpinBox` up/down buttons,
+  `QMenu`. All done with QSS border-triangle tricks / solid fills - no new
+  image or font dependency.
+- Added `theme.badge_style()`: keyword-matches the run_badge's own text
+  (`RUNNING`, `FAILED`, `VALIDATED`, `NEEDS ...`, etc.) to a good/warn/danger/
+  info colour, via a new `self._set_badge()` wrapper in `window.py` that
+  replaced all 17 raw `self.run_badge.setText(...)` call sites. One status
+  string is the only source of truth; no separate state enum to keep in sync.
+- Added `theme.make_app_icon()`: a small EQ-bars monogram (drawn with
+  `QPainter`, no asset file), wired into `setWindowIcon()` on both the
+  `QApplication` and the main window. Replaces the default Python/Qt icon in
+  the title bar and taskbar. Not yet wired into `AudioFischerOptimizer.spec`
+  for the packaged `.exe`'s file icon - that's a separate follow-up if wanted.
+- Added `setAlternatingRowColors(True)` to all four `QTableWidget`s
+  (`result_table`, `filter_table`, `recent_runs_table`, `convergence_table`).
+- Tried `QGraphicsDropShadowEffect` on the card frames for elevation and
+  **reverted it** - applying a graphics effect to a QFrame with several plain
+  child QLabels forces per-child compositing and left visible rectangular
+  seams around each line of text (very noticeable in the Results tab's metric
+  cards). Do not reintroduce `QGraphicsDropShadowEffect` on any card/frame that
+  contains multiple plain child widgets without checking for this artifact
+  first. Replaced it with a one-line `border-top` highlight
+  (`theme.CARD_HIGHLIGHT`) on `QFrame#card`/`#cardAccent`/`#metricCard` - a
+  much cheaper elevation cue with no compositing involved.
+- Verified by re-rendering the affected tabs via `QWidget.grab()` before and
+  after the shadow revert, and running the full test suite (97/97 pass).
+
 ## 2026-07-31 - Dark pro-audio GUI theme
 
 UI/styling only. No changes to `objective_module/`, `_optimizer.py`, or
