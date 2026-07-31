@@ -44,6 +44,7 @@ from .reporting import (
 )
 from .warning_text import warning_info
 from scripts.make_measurement_manifest import ALL_MEASUREMENT_ROLES
+from scripts.verify_achieved_response import verify_run
 
 
 class TaskSignals(QObject):
@@ -410,8 +411,9 @@ class OptimizerWindow(QMainWindow):
     TAB_PHASE = 2
     TAB_RUN = 3
     TAB_RESULTS = 4
-    TAB_ABOUT = 5
-    TAB_RETARGET = 6
+    TAB_VERIFY = 5
+    TAB_ABOUT = 6
+    TAB_RETARGET = 7
 
     def __init__(self):
         super().__init__()
@@ -439,6 +441,7 @@ class OptimizerWindow(QMainWindow):
         self.validation_diagnostics: dict[str, dict] = {}
         self.report_task: BackgroundTask | None = None
         self.shutdown_task: BackgroundTask | None = None
+        self.verify_task: BackgroundTask | None = None
         self.close_after_stop = False
         self.current_run_phase = ""
         self.pending_role_dialog: tuple[str, QTextEdit, RunConfig, dict] | None = None
@@ -503,6 +506,7 @@ class OptimizerWindow(QMainWindow):
         self.tabs.addTab(self._build_phase_tab(), "2  Sweeps / Phase")
         self.tabs.addTab(self._build_run_tab(), "3  Run")
         self.tabs.addTab(self._build_results_tab(), "4  Results")
+        self.tabs.addTab(self._build_verify_tab(), "Verify")
         self.tabs.addTab(self._build_about_tab(), "About")
         self.tabs.addTab(self._build_retarget_tab(), "Retarget")
         self.tabs.setTabEnabled(self.TAB_RUN, False)
@@ -1154,6 +1158,124 @@ class OptimizerWindow(QMainWindow):
         scroll.setWidget(content)
         outer.addWidget(scroll)
         return page
+
+    def _build_verify_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 26, 28, 24)
+        layout.setSpacing(14)
+        heading = QLabel("Verify predicted response against a post-load measurement")
+        heading.setObjectName("sectionTitle")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        note = QLabel(
+            "Load the recommended AFPX in PC-Tool, capture the same REW roles again, "
+            "then select that folder here. Capture level is aligned, but response-shape "
+            "differences remain visible."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        self.verify_run_edit = DropLineEdit("folder")
+        self.verify_post_edit = DropLineEdit("folder")
+        run_row = QHBoxLayout()
+        run_row.addWidget(self.verify_run_edit, 1)
+        run_browse = QPushButton("Browse")
+        run_browse.clicked.connect(lambda: self._browse_verify_folder(self.verify_run_edit))
+        run_row.addWidget(run_browse)
+        post_row = QHBoxLayout()
+        post_row.addWidget(self.verify_post_edit, 1)
+        post_browse = QPushButton("Browse")
+        post_browse.clicked.connect(lambda: self._browse_verify_folder(self.verify_post_edit))
+        post_row.addWidget(post_browse)
+        run_widget = QWidget()
+        run_widget.setLayout(run_row)
+        post_widget = QWidget()
+        post_widget.setLayout(post_row)
+        form.addRow("Completed run", run_widget)
+        form.addRow("Post-load REW folder", post_widget)
+        layout.addLayout(form)
+        action_row = QHBoxLayout()
+        self.verify_button = QPushButton("Compare Predicted vs Achieved")
+        self.verify_button.clicked.connect(self._start_achieved_verification)
+        action_row.addWidget(self.verify_button)
+        action_row.addStretch()
+        layout.addLayout(action_row)
+        self.verify_status = QLabel("No post-load verification has been run.")
+        self.verify_status.setObjectName("resultBanner")
+        self.verify_status.setWordWrap(True)
+        layout.addWidget(self.verify_status)
+        self.verify_chart = ChartLabel(
+            "Choose a completed run and post-load measurements to see predicted vs achieved."
+        )
+        self.verify_chart.setMinimumHeight(300)
+        layout.addWidget(self.verify_chart, 1)
+        self.verify_details = QTextEdit()
+        self.verify_details.setReadOnly(True)
+        self.verify_details.setMaximumHeight(150)
+        layout.addWidget(self.verify_details)
+        return page
+
+    def _browse_verify_folder(self, field: QLineEdit):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose folder", field.text().strip() or str(Path.home())
+        )
+        if folder:
+            field.setText(folder)
+
+    def _start_achieved_verification(self):
+        run_folder = Path(self.verify_run_edit.text().strip())
+        post_folder = Path(self.verify_post_edit.text().strip())
+        if not run_folder.is_dir() or not post_folder.is_dir():
+            QMessageBox.warning(
+                self, "Verification inputs missing",
+                "Choose a completed run folder and the post-load REW measurement folder.",
+            )
+            return
+        self.verify_button.setEnabled(False)
+        self.verify_status.setText("Comparing predicted and achieved response...")
+        self._show_busy("Verifying achieved response")
+        task = BackgroundTask(
+            lambda _cancel: verify_run(run_folder, post_folder)
+        )
+        self.verify_task = task
+        task.signals.result.connect(self._achieved_verification_ready)
+        task.signals.error.connect(self._achieved_verification_failed)
+        task.signals.finished.connect(self._achieved_verification_finished)
+        self.thread_pool.start(task)
+
+    def _achieved_verification_ready(self, payload):
+        system = payload.get("system") or {}
+        frequencies = system.get("frequency_hz") or []
+        self.verify_chart.set_series([
+            {
+                "label": "Predicted", "frequency_hz": frequencies,
+                "db": system.get("predicted_db") or [], "color": "#2878b5",
+            },
+            {
+                "label": "Achieved", "frequency_hz": frequencies,
+                "db": system.get("achieved_db") or [], "color": "#16805d",
+            },
+        ])
+        verdict = str(payload.get("verdict", "")).replace("_", " ").title()
+        self.verify_status.setText(
+            f"{verdict}. System difference {float(system.get('difference_rms_db', 0.0)):.2f} dB RMS; "
+            f"vocal region {float(system.get('vocal_difference_rms_db', 0.0)):.2f} dB RMS."
+        )
+        rows = [
+            f"{role}: {float(item.get('difference_rms_db', 0.0)):.2f} dB RMS"
+            for role, item in (payload.get("drivers") or {}).items()
+        ]
+        rows.append(f"Saved: {payload.get('file', '')}")
+        self.verify_details.setPlainText("\n".join(rows))
+
+    def _achieved_verification_failed(self, error: str):
+        self.verify_status.setText(f"Verification failed: {error}")
+
+    def _achieved_verification_finished(self):
+        self.verify_button.setEnabled(True)
+        self._hide_busy()
+        self.verify_task = None
 
     def _build_about_tab(self):
         page = QWidget()
@@ -2238,6 +2360,7 @@ class OptimizerWindow(QMainWindow):
         self.tabs.setTabToolTip(self.TAB_RESULTS, "Review and export completed candidates.")
         self.summary_path = summary_path
         self.summary = load_summary(summary_path)
+        self.verify_run_edit.setText(str(summary_path.parent))
         rows = candidate_files(self.summary, summary_path)
         self.result_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
