@@ -101,7 +101,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.5.0` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.5.1` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
@@ -141,6 +141,9 @@ record.
   under the current objective and write guardrails.
 - Live Run progress shows recent best-objective checkpoints and whether search is
   still improving, stalled, or waiting after its deterministic pass.
+- The Run page is vertically scrollable and preserves every control's size hint at
+  150-200 percent Windows scaling. Run settings, optional outputs, and monitoring
+  are separated into labelled sections instead of being compressed together.
 
 ## Objective And Guardrails
 
@@ -246,7 +249,7 @@ record.
 
 ## Verified State
 
-- Ninety-six regression tests pass, including objective/target-shape invariants,
+- Ninety-seven regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.

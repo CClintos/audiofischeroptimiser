@@ -11,6 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication
+
 from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
@@ -29,10 +33,28 @@ from scripts.make_measurement_manifest import build_manifest
 
 
 class GuiJobTests(unittest.TestCase):
+    def test_run_tab_uses_scrollable_high_dpi_safe_layout(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = OptimizerWindow()
+        window.resize(920, 650)
+        window.tabs.setTabEnabled(window.TAB_RUN, True)
+        window.tabs.setCurrentIndex(window.TAB_RUN)
+        window.show()
+        app.processEvents()
+        try:
+            self.assertGreater(window.run_scroll.verticalScrollBar().maximum(), 0)
+            self.assertGreaterEqual(
+                window.workflow_value.height(),
+                window.workflow_value.minimumHeight(),
+            )
+            self.assertGreaterEqual(window.run_log.height(), window.run_log.minimumHeight())
+        finally:
+            window.close()
+
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.5.0")
+        self.assertEqual(__version__, "0.5.1")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(

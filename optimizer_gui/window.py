@@ -20,7 +20,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QScrollArea, QSlider, QSpinBox, QStyle, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QToolButton, QToolTip, QVBoxLayout, QWidget,
@@ -476,6 +476,7 @@ class OptimizerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("AudioFischer Optimizer")
         title.setObjectName("title")
+        title.setMinimumHeight(38)
         subtitle = QLabel("Local AFPX tuning, measurement validation and candidate export")
         subtitle.setObjectName("subtitle")
         title_box.addWidget(title)
@@ -833,11 +834,39 @@ class OptimizerWindow(QMainWindow):
 
     def _build_run_tab(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 20, 18, 18)
-        layout.setSpacing(14)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.run_scroll = QScrollArea()
+        self.run_scroll.setWidgetResizable(True)
+        self.run_scroll.setFrameShape(QFrame.NoFrame)
+        self.run_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.run_scroll.setObjectName("runScroll")
+
+        self.run_content = QWidget()
+        self.run_content.setObjectName("runContent")
+        layout = QVBoxLayout(self.run_content)
+        layout.setContentsMargins(22, 20, 22, 22)
+        layout.setSpacing(12)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+
+        setup_title = QLabel("Optimizer run settings")
+        setup_title.setObjectName("sectionTitle")
+        layout.addWidget(setup_title)
+        setup_help = QLabel(
+            "Choose the search time and resource limits. CPU controls how many workers "
+            "run; the RAM setting is a safety stop, not a memory-use target."
+        )
+        setup_help.setObjectName("chartNote")
+        setup_help.setWordWrap(True)
+        layout.addWidget(setup_help)
 
         grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        grid.setColumnMinimumWidth(0, 165)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnMinimumWidth(2, 210)
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("Quick check - 2 minutes", 120)
         self.preset_combo.addItem("Normal - 20 minutes", 1200)
@@ -886,7 +915,9 @@ class OptimizerWindow(QMainWindow):
         ram_box.addWidget(self.ram_label)
 
         self.workflow_value = QLabel("PEQ / RTA - Beam search + guided continuation")
-        self.workflow_value.setObjectName("metricValue")
+        self.workflow_value.setObjectName("workflowSummary")
+        self.workflow_value.setWordWrap(True)
+        self.workflow_value.setMinimumHeight(54)
 
         grid.addWidget(QLabel("Run length"), 0, 0)
         grid.addWidget(self.preset_combo, 0, 1)
@@ -901,7 +932,19 @@ class OptimizerWindow(QMainWindow):
         grid.addWidget(self.workflow_value, 3, 1, 1, 2)
         layout.addLayout(grid)
 
-        option_line = QHBoxLayout()
+        options_title = QLabel("Optional run outputs")
+        options_title.setObjectName("sectionTitle")
+        layout.addWidget(options_title)
+        options_help = QLabel(
+            "These do not change the main optimization method. Enable only the extra "
+            "files or recommendation you want."
+        )
+        options_help.setObjectName("chartNote")
+        options_help.setWordWrap(True)
+        layout.addWidget(options_help)
+
+        option_line = QVBoxLayout()
+        option_line.setSpacing(10)
         self.voicing_check = QCheckBox("Create voicing audition files")
         self.sub_blend_check = QCheckBox("Report sub level recommendation")
         self.voicing_check.setToolTip(
@@ -927,8 +970,7 @@ class OptimizerWindow(QMainWindow):
         voicing_help.setObjectName("metricName")
         voicing_help.setWordWrap(True)
         voicing_box.addWidget(voicing_help)
-        option_line.addLayout(voicing_box, 1)
-        option_line.addSpacing(16)
+        option_line.addLayout(voicing_box)
         sub_box = QVBoxLayout()
         sub_head = QHBoxLayout()
         sub_head.addWidget(self.sub_blend_check)
@@ -941,8 +983,7 @@ class OptimizerWindow(QMainWindow):
         sub_help.setObjectName("metricName")
         sub_help.setWordWrap(True)
         sub_box.addWidget(sub_help)
-        option_line.addLayout(sub_box, 1)
-        option_line.addStretch()
+        option_line.addLayout(sub_box)
         layout.addLayout(option_line)
 
         self.phase_warning = QLabel("PEQ stage uses Beam and cannot write phase changes. Phase stage preserves PEQ and writes only changes that pass the evidence gates. The baseline is never overwritten.")
@@ -955,6 +996,10 @@ class OptimizerWindow(QMainWindow):
         self.memory_guard_warning.setWordWrap(True)
         self.memory_guard_warning.hide()
         layout.addWidget(self.memory_guard_warning)
+
+        progress_title = QLabel("Start and monitor the run")
+        progress_title.setObjectName("sectionTitle")
+        layout.addWidget(progress_title)
 
         action_line = QHBoxLayout()
         self.start_button = QPushButton("Start Optimizer")
@@ -993,18 +1038,20 @@ class OptimizerWindow(QMainWindow):
         self.trial_value = QLabel("0")
         self.best_value = QLabel("-")
         self.memory_value = QLabel("-")
-        for col, (label, widget) in enumerate((
+        for index, (label, widget) in enumerate((
             ("Elapsed", self.elapsed_value), ("Workers", self.worker_value),
             ("Candidates checked", self.trial_value), ("Best objective", self.best_value),
             ("Optimizer memory", self.memory_value),
         )):
+            row, col = divmod(index, 3)
             cell = QVBoxLayout()
             name = QLabel(label)
             name.setObjectName("metricName")
             widget.setObjectName("metricValue")
             cell.addWidget(name)
             cell.addWidget(widget)
-            status_grid.addLayout(cell, 0, col)
+            status_grid.addLayout(cell, row, col)
+            status_grid.setColumnStretch(col, 1)
         layout.addLayout(status_grid)
         self.convergence_label = QLabel(
             "Convergence: waiting for the first worker checkpoint."
@@ -1022,6 +1069,7 @@ class OptimizerWindow(QMainWindow):
         self.convergence_table.verticalHeader().setVisible(False)
         self.convergence_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.convergence_table.setSelectionMode(QTableWidget.NoSelection)
+        self.convergence_table.setMinimumHeight(112)
         self.convergence_table.setMaximumHeight(145)
         self.convergence_table.setToolTip(
             "Recent objective improvements from the live worker checkpoints."
@@ -1030,8 +1078,12 @@ class OptimizerWindow(QMainWindow):
 
         self.run_log = QTextEdit()
         self.run_log.setReadOnly(True)
+        self.run_log.setMinimumHeight(150)
         self.run_log.setPlaceholderText("Run status appears here. Full worker logs remain in the run folder.")
-        layout.addWidget(self.run_log, 1)
+        layout.addWidget(self.run_log)
+
+        self.run_scroll.setWidget(self.run_content)
+        outer.addWidget(self.run_scroll)
         return page
 
     def _build_results_tab(self):
@@ -1360,10 +1412,12 @@ class OptimizerWindow(QMainWindow):
             QLabel#metricValue { color: #15191d; font-size: 18px; font-weight: 650; }
             QLabel#sectionTitle { font-size: 18px; font-weight: 650; }
             QLabel#workflowTitle { font-size: 15px; font-weight: 650; color: #202327; margin-top: 8px; }
+            QLabel#workflowSummary { font-size: 15px; font-weight: 650; color: #202327; }
             QLabel#chart { background: white; border: 1px solid #d8dde1; color: #68717a; padding: 4px; }
             QLabel#chartNote { color: #68717a; font-size: 11px; }
+            QScrollArea#runScroll, QWidget#runContent { background: white; }
             QTabWidget::pane { border: 1px solid #d9dde1; background: white; }
-            QTabBar::tab { background: #e9ecef; border: 1px solid #d9dde1; padding: 9px 18px; }
+            QTabBar::tab { background: #e9ecef; border: 1px solid #d9dde1; padding: 9px 14px; }
             QTabBar::tab:selected { background: white; border-bottom-color: white; font-weight: 650; }
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget {
                 background: white; border: 1px solid #cbd1d6; border-radius: 3px; padding: 6px;
