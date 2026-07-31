@@ -14,6 +14,7 @@ param(
     [string]$PhaseWrites = "auto",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [string]$RepeatabilityFolder = "",
     [string]$RoleMap = "",
     [ValidateSet("off", "recommend")]
     [string]$SubBlend = "off",
@@ -82,6 +83,7 @@ $launch = @{
 }
 if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
+if ($RepeatabilityFolder) { $launch.RepeatabilityFolder = $RepeatabilityFolder }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
 Set-RunPhase "searching"
 & (Join-Path $here "run_guided_stream_workers.ps1") @launch
@@ -121,6 +123,7 @@ if ($HeadroomDb -ge 0) { $mergeArgs += @("--headroom-db", "$HeadroomDb") }
 if (Test-Path -LiteralPath $phaseCache) { $mergeArgs += @("--phase-cache", $phaseCache) }
 if ($ImpulseRoot) { $mergeArgs += @("--impulse-root", $ImpulseRoot) }
 if ($LevelCalibration) { $mergeArgs += @("--level-calibration", $LevelCalibration) }
+if ($RepeatabilityFolder) { $mergeArgs += @("--repeatability-folder", $RepeatabilityFolder) }
 $mergeOutput = & $python @mergeArgs 2>&1
 if ($LASTEXITCODE -ne 0) { throw ($mergeOutput -join [Environment]::NewLine) }
 
@@ -137,6 +140,7 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
         "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))
     )
     if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
+    if ($RepeatabilityFolder) { $verifyArgs += @("--repeatability-folder", $RepeatabilityFolder) }
     if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
     $null = & $python @verifyArgs
     if ($LASTEXITCODE -ne 0) { throw "Candidate verification failed: $($candidate.Name)" }

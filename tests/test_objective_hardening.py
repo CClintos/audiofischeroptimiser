@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -386,6 +387,59 @@ class MaskIntegrityTests(unittest.TestCase):
         )
         reasons = {reason for item in errors for reason in item["reasons"]}
         self.assertIn("below_measurement_noise_floor", reasons)
+
+    def test_repeatability_folder_builds_and_installs_empirical_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = root / "primary"
+            repeat = root / "repeat"
+            primary.mkdir()
+            repeat.mkdir()
+            freqs = np.geomspace(200.0, 6000.0, 384)
+            roles = ("FL Low", "FR Low", "FL High", "FR High")
+            primary_files = {}
+            repeat_files = {}
+            for index, role in enumerate(roles):
+                filename = role.replace(" ", "_") + ".txt"
+                first = 60.0 + 0.2 * index + np.zeros_like(freqs)
+                noise = 0.35 * np.sin(np.log(freqs) * (4.0 + index))
+                first_path = primary / filename
+                repeat_path = repeat / filename
+                first_path.write_text(
+                    "\n".join(f"{f:.8f} {value:.8f}" for f, value in zip(freqs, first)),
+                    encoding="utf-8",
+                )
+                repeat_path.write_text(
+                    "\n".join(
+                        f"{f:.8f} {value:.8f}"
+                        for f, value in zip(freqs, first + 1.0 + noise)
+                    ),
+                    encoding="utf-8",
+                )
+                primary_files[role] = first_path
+                repeat_files[role] = repeat_path
+            (repeat / "known_eq_delta.json").write_text(
+                json.dumps({role: 1.0 for role in roles}), encoding="utf-8"
+            )
+            with patch.multiple(
+                optimizer,
+                MEASUREMENT_FILES=primary_files,
+                OPTIONAL_PAIR_ROLES=set(),
+            ), patch.object(optimizer, "resolve_measurement_files", return_value=repeat_files):
+                model = optimizer.empirical_repeatability_model(repeat)
+            canonical_tunefit.configure_measurement_noise_model(model)
+            try:
+                self.assertEqual(model["id"], "empirical_same_day_repeatability_v1")
+                self.assertEqual(model["known_eq_delta_status"], "subtracted")
+                self.assertEqual(set(model["roles_used"]), set(roles))
+                self.assertTrue(model["branches"]["low"])
+                self.assertTrue(model["branches"]["high"])
+                self.assertGreater(
+                    float(canonical_tunefit.measurement_noise_floor_db([1128.0], "low")[0]),
+                    0.05,
+                )
+            finally:
+                canonical_tunefit.configure_measurement_noise_model(None)
 
 
 class ComplexPredictionGateTests(unittest.TestCase):

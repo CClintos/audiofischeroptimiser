@@ -23,6 +23,7 @@ param(
     [string]$DataRoot = "",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [string]$RepeatabilityFolder = "",
     [string]$RoleMap = "",
     [string]$Baseline = "",
     [string]$Target = "",
@@ -54,6 +55,7 @@ $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPa
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
+$repeatabilityFolderPath = if ($RepeatabilityFolder -ne "") { (Resolve-Path -LiteralPath $RepeatabilityFolder).Path } else { "" }
 $roleMapPath = if ($RoleMap -ne "") { (Resolve-Path -LiteralPath $RoleMap).Path } else { "" }
 $phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
 $stopFilePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "stop_requested"
@@ -140,6 +142,9 @@ for ($i = 1; $i -le $Workers; $i++) {
     }
     if ($levelCalibrationPath -ne "") {
         $args += @("--level-calibration", $levelCalibrationPath)
+    }
+    if ($repeatabilityFolderPath -ne "") {
+        $args += @("--repeatability-folder", $repeatabilityFolderPath)
     }
 
     $argLine = Join-Args $args

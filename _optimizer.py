@@ -69,6 +69,7 @@ from _tunefit import (
     band_limited_delay_from_phase,
     cascade_db,
     cascade_complex,
+    configure_measurement_noise_model,
     erb_smooth,
     erb_hz,
     excess_gd_mask,
@@ -669,6 +670,116 @@ def load_measurements(level_calibration: Dict[str, float] | None = None) -> Tupl
         }
         SYNTHETIC_PAIR_ROLES.add(together)
     return base_f, traces, rich
+
+
+def _known_eq_delta_curve(payload: Dict[str, object], role: str,
+                          freqs: np.ndarray) -> np.ndarray:
+    value = payload.get(role, payload.get("default", 0.0))
+    if isinstance(value, (int, float)):
+        return np.full_like(freqs, float(value))
+    if isinstance(value, dict):
+        points = value.get("points", [])
+    else:
+        points = value if isinstance(value, list) else []
+    usable = [
+        (float(item[0]), float(item[1]))
+        for item in points
+        if isinstance(item, (list, tuple)) and len(item) >= 2
+    ]
+    if not usable:
+        return np.zeros_like(freqs)
+    usable.sort()
+    return np.interp(
+        np.log10(freqs),
+        np.log10(np.asarray([item[0] for item in usable])),
+        np.asarray([item[1] for item in usable]),
+    )
+
+
+def empirical_repeatability_model(repeatability_folder: Path,
+                                  level_calibration: Dict[str, float] | None = None) -> Dict[str, object]:
+    """Derive a per-branch noise floor from a second same-day session."""
+    repeatability_folder = Path(repeatability_folder).resolve()
+    repeat_files = resolve_measurement_files(repeatability_folder)
+    delta_path = repeatability_folder / "known_eq_delta.json"
+    known_delta = (
+        json.loads(delta_path.read_text(encoding="utf-8-sig"))
+        if delta_path.is_file() else {}
+    )
+    calibration = level_calibration or {}
+    samples = {"low": {}, "high": {}}
+    roles_used = []
+    points_by_branch = {
+        "low": [400.0, 500.0, 700.0, 1000.0, 1400.0, 2200.0, 5000.0],
+        "high": [1800.0, 3000.0, 6000.0, 10000.0, 16000.0],
+    }
+    for role, primary_path in MEASUREMENT_FILES.items():
+        repeat_path = repeat_files.get(role)
+        if role in OPTIONAL_PAIR_ROLES or role in {"System Sum", "Sub"}:
+            continue
+        if not primary_path.is_file() or repeat_path is None or not repeat_path.is_file():
+            continue
+        first = load_rew_export(primary_path)
+        second = load_rew_export(repeat_path)
+        freqs = optimization_frequency_grid(first["freq"])
+        first_db = np.interp(np.log10(freqs), np.log10(first["freq"]), first["spl"])
+        second_db = np.interp(np.log10(freqs), np.log10(second["freq"]), second["spl"])
+        residual = second_db - first_db - _known_eq_delta_curve(known_delta, role, freqs)
+        anchor = (freqs >= 300.0) & (freqs <= 3000.0)
+        residual -= float(np.median(residual[anchor])) if np.any(anchor) else float(np.median(residual))
+        branch = "high" if role.endswith("High") else "low"
+        for point in points_by_branch[branch]:
+            selected = np.abs(np.log2(freqs / point)) <= 1 / 12
+            if not np.any(selected):
+                continue
+            local = residual[selected]
+            median = float(np.median(local))
+            robust_sigma = 1.4826 * float(np.median(np.abs(local - median))) / math.sqrt(2.0)
+            rms_sigma = float(np.sqrt(np.mean(local ** 2))) / math.sqrt(2.0)
+            floor = max(0.05, robust_sigma, 0.5 * rms_sigma)
+            samples[branch].setdefault(point, []).append(floor)
+        roles_used.append(role)
+    if not roles_used:
+        raise ValueError(
+            f"No matching solo-driver measurements found in repeatability folder: {repeatability_folder}"
+        )
+    branches = {
+        branch: [
+            {
+                "frequency_hz": point,
+                "floor_db": round(float(np.median(values)), 4),
+            }
+            for point, values in sorted(points.items())
+            if values
+        ]
+        for branch, points in samples.items()
+    }
+    return {
+        "id": "empirical_same_day_repeatability_v1",
+        "source_folder": str(repeatability_folder),
+        "required_multiplier": MEASUREMENT_NOISE_MULTIPLIER,
+        "known_eq_delta_file": str(delta_path) if delta_path.is_file() else None,
+        "known_eq_delta_status": (
+            "subtracted" if delta_path.is_file()
+            else "not supplied; only broadband session-level offset was removed"
+        ),
+        "roles_used": sorted(roles_used),
+        "branches": branches,
+        "note": (
+            "Per-session floor estimated from the residual between same-day exports "
+            "after known EQ and broadband level deltas; candidate threshold is 2.5x."
+        ),
+    }
+
+
+def configure_repeatability_floor(repeatability_folder: Path | None,
+                                  level_calibration: Dict[str, float] | None = None) -> Dict[str, object]:
+    model = (
+        empirical_repeatability_model(repeatability_folder, level_calibration)
+        if repeatability_folder else None
+    )
+    configure_measurement_noise_model(model)
+    return measurement_noise_model()
 
 
 def _read_pcm_wav(path: Path) -> ImpulseTrace:
@@ -3021,6 +3132,8 @@ def main() -> None:
                         help="Shared fingerprinted crossover diagnostic cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON object mapping measurement role/file names to dB offsets for mixed-level sessions.")
+    parser.add_argument("--repeatability-folder", type=Path, default=None,
+                        help="Second same-day measurement session used to derive the per-role noise floor.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--sub-blend", choices=("off", "recommend"), default="off")
@@ -3033,6 +3146,9 @@ def main() -> None:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     args.measurement_session, level_calibration = prepare_measurement_session(
         args.baseline, args.target, args.level_calibration
+    )
+    args.measurement_noise_guard = configure_repeatability_floor(
+        args.repeatability_folder, level_calibration
     )
     sync_external_objective(args.baseline, args.target, level_calibration)
 

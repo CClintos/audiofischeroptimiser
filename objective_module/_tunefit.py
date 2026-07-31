@@ -131,6 +131,7 @@ def audibility_weight(freqs):
 # claim that every microphone/session has the same noise floor.
 MEASUREMENT_NOISE_MODEL_ID = "user_supplied_mmm_repeatability_v1"
 MEASUREMENT_NOISE_MULTIPLIER = 2.5
+_MEASUREMENT_NOISE_OVERRIDE = None
 MASK_DETECTED = "DETECTED"
 MASK_CLEAR = "CLEAR"
 MASK_UNKNOWN = "UNKNOWN"
@@ -272,6 +273,14 @@ def measurement_noise_floor_db(freqs, branch="low"):
     in frequency and clamps outside the calibration points.
     """
     f = np.maximum(np.asarray(freqs, dtype=float), 1.0)
+    if _MEASUREMENT_NOISE_OVERRIDE:
+        branches = dict(_MEASUREMENT_NOISE_OVERRIDE.get("branches", {}))
+        key = "high" if str(branch).lower() in {"high", "tweeter", "tweeters"} else "low"
+        points = list(branches.get(key, []))
+        if points:
+            xp = np.asarray([float(item["frequency_hz"]) for item in points])
+            yp = np.asarray([float(item["floor_db"]) for item in points])
+            return np.interp(np.log10(f), np.log10(xp), yp)
     if str(branch).lower() in {"high", "tweeter", "tweeters"}:
         xp = np.array([1800.0, 3000.0, 6000.0, 10000.0, 16000.0])
         yp = np.array([0.23, 0.27, 0.34, 0.41, 0.46])
@@ -364,6 +373,8 @@ def signed_offset_evidence(freqs, difference_db, center_hz, branch="low",
 
 def measurement_noise_model():
     """Serializable description included in optimizer and PDF reports."""
+    if _MEASUREMENT_NOISE_OVERRIDE:
+        return dict(_MEASUREMENT_NOISE_OVERRIDE)
     return {
         "id": MEASUREMENT_NOISE_MODEL_ID,
         "required_multiplier": MEASUREMENT_NOISE_MULTIPLIER,
@@ -378,6 +389,12 @@ def measurement_noise_model():
             "the local same-rig MMM floor."
         ),
     }
+
+
+def configure_measurement_noise_model(model=None):
+    """Install or clear a run-local empirical repeatability model."""
+    global _MEASUREMENT_NOISE_OVERRIDE
+    _MEASUREMENT_NOISE_OVERRIDE = None if model is None else dict(model)
 
 def audibility_score(freqs, dev_db, band=(60.0, 16000.0), mask=None, conf=None):
     """One number for 'how audibly wrong is this curve' (lower = better).

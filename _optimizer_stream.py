@@ -1143,6 +1143,8 @@ def main():
                         help="Shared fingerprinted crossover diagnostic cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
+    parser.add_argument("--repeatability-folder", type=Path, default=None,
+                        help="Second same-day session used to derive the measurement floor.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
@@ -1158,6 +1160,9 @@ def main():
 
     args.measurement_session, level_calibration = opt.prepare_measurement_session(
         args.baseline, args.target, args.level_calibration
+    )
+    args.measurement_noise_guard = opt.configure_repeatability_floor(
+        args.repeatability_folder, level_calibration
     )
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     configure_profile(args.profile)

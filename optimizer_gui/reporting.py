@@ -619,6 +619,17 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
             f"Tweeter {item.get('range_hz', '')} Hz",
             f"{item.get('floor_db', '-')} dB floor",
         ))
+    for branch, points in (noise_guard.get("branches") or {}).items():
+        for item in points:
+            noise_rows.append((
+                f"{str(branch).title()} {float(item.get('frequency_hz', 0.0)):.0f} Hz",
+                f"{float(item.get('floor_db', 0.0)):.2f} dB empirical floor",
+            ))
+    if noise_guard.get("known_eq_delta_status"):
+        noise_rows.append((
+            "Known EQ delta",
+            str(noise_guard.get("known_eq_delta_status")),
+        ))
     noise_rows.append((
         "Filter threshold",
         f"{noise_guard.get('required_multiplier', 2.5)}x the local floor",

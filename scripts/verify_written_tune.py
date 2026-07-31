@@ -217,7 +217,8 @@ def measurement_guardrail_errors(freqs, traces, target, added_by_channel, groups
 
 
 def _measurement_lint(data_root: Path, baseline: Path, target_path: Path,
-                      role_map: Path | None, old_xml: str, new_xml: str) -> list[dict[str, object]]:
+                      role_map: Path | None, repeatability_folder: Path | None,
+                      old_xml: str, new_xml: str) -> list[dict[str, object]]:
     os.environ["AFPX_DATA_ROOT"] = str(data_root)
     os.environ["AFPX_BASELINE"] = str(baseline)
     os.environ["AFPX_TARGET"] = str(target_path)
@@ -225,6 +226,7 @@ def _measurement_lint(data_root: Path, baseline: Path, target_path: Path,
         os.environ["AFPX_ROLE_MAP"] = str(role_map)
     import _optimizer as optimizer
 
+    optimizer.configure_repeatability_floor(repeatability_folder)
     freqs, traces, _ = optimizer.load_measurements()
     raw_target = optimizer.load_target(target_path, freqs)
     target = raw_target + optimizer.target_anchor_offset(freqs, traces["System Sum"], raw_target)
@@ -242,7 +244,8 @@ def _measurement_lint(data_root: Path, baseline: Path, target_path: Path,
 def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
            allow_polarity: bool = False, allow_output_trim: bool = False,
            data_root: Path | None = None, target: Path | None = None,
-           role_map: Path | None = None) -> dict[str, object]:
+           role_map: Path | None = None,
+           repeatability_folder: Path | None = None) -> dict[str, object]:
     old_xml = decode_afpx(baseline)
     new_xml = decode_afpx(candidate)
     old_all = filter_keys(old_xml)
@@ -286,7 +289,9 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
     if data_root is not None and target is not None:
         measurement_lint = _measurement_lint(
             data_root.resolve(), baseline, target.resolve(),
-            role_map.resolve() if role_map else None, old_xml, new_xml,
+            role_map.resolve() if role_map else None,
+            repeatability_folder.resolve() if repeatability_folder else None,
+            old_xml, new_xml,
         )
     if delay_changed and not allow_delay:
         errors.append("delay_changed")
@@ -344,13 +349,14 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--target", type=Path)
     parser.add_argument("--role-map", type=Path)
+    parser.add_argument("--repeatability-folder", type=Path)
     parser.add_argument("--out", type=Path, default=Path("latest_verify_written_tune.json"))
     args = parser.parse_args()
 
     payload = verify(
         args.baseline.resolve(), args.candidate.resolve(), args.allow_delay,
         args.allow_apf, args.allow_polarity, args.allow_output_trim,
-        args.data_root, args.target, args.role_map,
+        args.data_root, args.target, args.role_map, args.repeatability_folder,
     )
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(payload, indent=2))

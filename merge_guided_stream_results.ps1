@@ -4,6 +4,7 @@ param(
     [string]$DataRoot = "",
     [string]$ImpulseRoot = "",
     [string]$LevelCalibration = "",
+    [string]$RepeatabilityFolder = "",
     [string]$Baseline = "",
     [string]$Target = "",
     [double]$ValidationThreshold = 2.5,
@@ -39,6 +40,7 @@ $baselinePath = if ($Baseline -ne "") { $Baseline } else { Join-Path $dataRootPa
 $targetPath = if ($Target -ne "") { $Target } else { Join-Path $here "ResoNix Target Curve 2026.txt" }
 $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $ImpulseRoot).Path } else { "" }
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
+$repeatabilityFolderPath = if ($RepeatabilityFolder -ne "") { (Resolve-Path -LiteralPath $RepeatabilityFolder).Path } else { "" }
 $phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
 if (-not (Test-Path -LiteralPath $baselinePath)) {
     throw "Baseline AFPX not found: $baselinePath"
@@ -61,6 +63,7 @@ if ($Target -ne "") { $args += @("--target", $targetPath) }
 if ($GateMs -gt 0) { $args += @("--gate-ms", "$GateMs") }
 if ($impulseRootPath -ne "") { $args += @("--impulse-root", $impulseRootPath) }
 if ($levelCalibrationPath -ne "") { $args += @("--level-calibration", $levelCalibrationPath) }
+if ($repeatabilityFolderPath -ne "") { $args += @("--repeatability-folder", $repeatabilityFolderPath) }
 $args += @("--sample-rate", "$SampleRate")
 $args += @("--phase-writes", "$PhaseWrites")
 if (Test-Path -LiteralPath $phaseCachePath) { $args += @("--phase-cache", $phaseCachePath) }
