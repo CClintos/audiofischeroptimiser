@@ -75,9 +75,12 @@ The Results screen gives you a practical comparison with your current tune:
 - a plain-language summary of what improved, warnings, and what to check in the
   car
 - `SQ_Tuning_Report.pdf` and `assistant_summary.json` saved with the run files
+- a Verify workflow that compares the predicted result with fresh measurements
+  after you load a candidate
 
 You can export any candidate to another folder without replacing an existing
-export by accident.
+export by accident. You can also record which candidate you loaded, what you
+heard, and whether the post-load measurement confirmed the prediction.
 
 ## What the app will and will not change
 
@@ -188,6 +191,12 @@ midbass, and 0.23-0.46 dB through the tweeter range. The required deviation is
 the tuning report so a user can judge the assumption rather than trusting a
 hidden constant.
 
+If you have a second same-day measurement session, the command-line runner can
+use `--repeatability-folder` to calculate per-driver, frequency-dependent floors
+from your own measurements. An optional `known_eq_delta.json` removes a known EQ
+difference between the sessions before the floor is calculated. The empirical
+values are saved in the run summary and report.
+
 When a proposed correction falls near a crossover, the search compares the
 same region on the upper driver pair, the lower driver pair, and both together.
 The full system score decides which scope earns the filter; it does not
@@ -219,12 +228,33 @@ with available impulse evidence.
 If those gates do not pass, phase controls stay untouched. The app can still
 complete a PEQ run; it simply does not make a phase claim it cannot support.
 
-### 5. Keep the baseline and verify the output
+### 6. Direct search effort toward supported improvements
+
+Before the timed search begins, the app builds a problem census. It ranks
+measured regions by error, audibility, driver authority, and whether the
+evidence says they are fixable. The report lists both the strongest supported
+opportunities and the regions deliberately skipped, including the reason.
+
+Search capacity is then allocated according to recoverable error instead of
+giving every driver group the same candidate budget. Peak spacing becomes finer
+where an issue is strong and well above the noise floor, which keeps nearby real
+features such as the measured 2.67 kHz peak available without filling the pool
+with measurement noise. The Run screen shows recent objective improvements and
+whether the search is still improving or has stalled.
+
+### 7. Keep the baseline and verify the output
 
 Your original tune is always retained as a candidate. If a generated option is
 not meaningfully better than the baseline, the results say so rather than
 forcing a change. Every written AFPX candidate is decoded and checked against
 the baseline to confirm that only the permitted fields changed.
+
+After loading a candidate, use the Verify tab with fresh REW exports. It overlays
+the response the model predicted with the response actually achieved for System
+Sum and available drivers, reports their difference, and saves the verification
+beside the run. A listening-decision entry can link the candidate, your notes,
+and that measured result. Existing run folders can also be replayed under newer
+app versions to show which old proposals now fail current guardrails and why.
 
 This produces a constrained shortlist to test in the car, not an automatic
 promise that a graph will sound better everywhere. Load a candidate, listen,

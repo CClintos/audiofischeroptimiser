@@ -101,7 +101,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.4.5` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.5.0` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
@@ -121,6 +121,26 @@ record.
   phase run is a short one-worker baseline diagnostic, not a timed PEQ search.
 - Packaged builds contain a windowed GUI plus a console worker companion so
   PowerShell can wait for the bundled runtime without displaying a GUI console.
+- Pair/null evidence is tri-state. Missing measured Together traces are UNKNOWN,
+  never silently CLEAR, and suppress one-sided corrections in the affected band.
+- Modal-null detection uses spatial movement when position measurements exist and
+  a conservative low-confidence LF heuristic for single-position sessions.
+- Proposal suppression and independent write lint enforce alternating-comb,
+  summed-hole, imaging-authority, and local measurement-floor guardrails.
+- Repeatability folders can compute empirical per-role noise floors after an
+  optional known EQ delta is removed; the assumed floors are persisted and reported.
+- Crossover overlap candidates compete at upper-driver-only, lower-driver-only,
+  and whole-front scope. The beam search retains fine resolution around strong,
+  well-supported nearby peaks.
+- Preflight and reports include a problem census, suppression ledger, adaptive
+  search budget, deterministic-to-guided transition, and stall verdict.
+- The Verify tab compares predicted and post-load achieved System/driver responses
+  and persists the result beside the run.
+- Run seeds are persisted and repeatable. Results can record a listening-decision
+  ledger, and `scripts/replay_optimizer_run.py` re-scores historical candidates
+  under the current objective and write guardrails.
+- Live Run progress shows recent best-objective checkpoints and whether search is
+  still improving, stalled, or waiting after its deterministic pass.
 
 ## Objective And Guardrails
 
@@ -226,7 +246,7 @@ record.
 
 ## Verified State
 
-- Eighty-one regression tests pass, including objective/target-shape invariants,
+- Ninety-six regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.
@@ -258,6 +278,14 @@ record.
   candidates, emitted `assistant_summary.json`, and passed family verification.
 - A phase-only smoke produced one candidate with one gated delay action; external
   verification reported zero added/removed PEQ filters and no crossover changes.
+- Replaying `Optimizer_Run_20260731_001507` rejected both retained audited
+  candidates; replaying `Optimizer_Run_20260731_012229` rejected all 20 sampled
+  candidates. In both runs the 270 Hz, 1128 Hz, and all-front 2.6 kHz proposals
+  were rejected while the fine 2.67 kHz search opportunity remained present.
+- Only the imaging-frequency weighting task moved the golden fixture. Its objective
+  changed from `5.749806309836579` to `5.768727916218496`; the audible trade-off is
+  deliberately less score reward for low-frequency L/R matching where localisation
+  is weak, preserving tonal accuracy instead.
 - Historical test results are not assumptions about future measurements.
 
 ## Deliberate Non-Changes
