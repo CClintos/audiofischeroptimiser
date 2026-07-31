@@ -204,6 +204,7 @@ def find_guided_candidates(freqs, traces, target, profile: str):
     raw_system_dev = traces["System Sum"] - target
     system_dev = opt.erb_smooth(freqs, raw_system_dev)
     global LAST_PROPOSAL_AUDIT
+    suppressions = []
     masks, pair_states = interference_masks(freqs, traces)
     audible = opt.audibility_weight(freqs)
     vocal = np.ones_like(freqs)
@@ -264,6 +265,13 @@ def find_guided_candidates(freqs, traces, target, profile: str):
             floor = float(opt.measurement_noise_floor_db([center], noise_branch)[0])
             required = float(opt.MEASUREMENT_NOISE_MULTIPLIER * floor)
             if abs(target_deviation) < required:
+                suppressions.append({
+                    "group": group,
+                    "frequency_hz": center,
+                    "reason": "below_measurement_noise_floor",
+                    "deviation_db": target_deviation,
+                    "required_deviation_db": required,
+                })
                 continue
             if cfg.get("pair") and cfg.get("side") and candidate["G"] < 0.0:
                 pair = opt.PAIR_DEFS[cfg["pair"]]
@@ -284,9 +292,22 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                 if (
                     not evidence["eligible"]
                     or imaging_weight < 0.5
-                    or absolute_system_deviation < 0.0
+                    or absolute_system_deviation < -0.5
                     or not hot_side_matches
                 ):
+                    reason = (
+                        evidence["reason"] if not evidence["eligible"]
+                        else "imaging_frequency_outside_authority" if imaging_weight < 0.5
+                        else "summed_response_already_below_target"
+                        if absolute_system_deviation < -0.5
+                        else "cut_not_on_systematically_hotter_side"
+                    )
+                    suppressions.append({
+                        "group": group,
+                        "frequency_hz": center,
+                        "reason": reason,
+                        "system_deviation_db": absolute_system_deviation,
+                    })
                     continue
             candidate.update({
                 "target_deviation_db": target_deviation,
@@ -299,6 +320,12 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         if cfg.get("pair") and cfg.get("side"):
             pair = opt.PAIR_DEFS[cfg["pair"]]
             if pair_states[cfg["pair"]]["state"] == opt.MASK_UNKNOWN:
+                suppressions.append({
+                    "group": group,
+                    "frequency_hz": None,
+                    "band_hz": list(pair["branch_band"]),
+                    "reason": "interference_evidence_unknown",
+                })
                 pools[group] = candidates
                 continue
             diff = opt.erb_smooth(freqs, traces[pair["left"]] - traces[pair["right"]])
@@ -322,8 +349,20 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                     np.log10(candidate["F"]), np.log10(freqs), system_dev
                 ))
                 if not evidence["eligible"]:
+                    suppressions.append({
+                        "group": group,
+                        "frequency_hz": float(candidate["F"]),
+                        "reason": evidence["reason"],
+                        "lr_sign_changes": int(evidence["sign_changes"]),
+                    })
                     continue
-                if candidate["G"] < 0.0 and system_at_center < 0.0:
+                if candidate["G"] < 0.0 and system_at_center < -0.5:
+                    suppressions.append({
+                        "group": group,
+                        "frequency_hz": float(candidate["F"]),
+                        "reason": "summed_response_already_below_target",
+                        "system_deviation_db": system_at_center,
+                    })
                     continue
                 candidate.update({
                     "lr_offset_db": float(evidence["offset_db"]),
@@ -404,6 +443,7 @@ def find_guided_candidates(freqs, traces, target, profile: str):
         "blocking_pairs": [
             name for name, item in pair_states.items() if item["state"] == opt.MASK_UNKNOWN
         ],
+        "suppressions": suppressions,
     }
     return pools
 

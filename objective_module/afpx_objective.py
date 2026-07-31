@@ -907,10 +907,10 @@ def _guardrail_score(band_sets, predicted=None):
                 wasted += 0.18 * (-6.0 - share) * (0.5 + abs(g) / 4.0)
     asym = _asymmetry_penalty(band_sets, total_db)
     parsimony = W['added_band'] * n_added
-    total = (
-        shape + unsupported + wasted + boost_q + asym + parsimony
-        + balance_guard + measurement_guard
-    )
+    # Evidence admissibility is enforced before search and independently at
+    # write verification.  Keep the counts for diagnosis, but do not create a
+    # second hard objective inside the authoritative scalar.
+    total = shape + unsupported + wasted + boost_q + asym + parsimony
     return {
         'guardrail_penalty': float(total),
         'shape_penalty': float(shape),
@@ -919,8 +919,8 @@ def _guardrail_score(band_sets, predicted=None):
         'asymmetric_eq_penalty': float(asym),
         'high_q_boost_penalty': float(boost_q),
         'added_band_penalty': float(parsimony),
-        'balance_guardrail_penalty': float(balance_guard),
-        'measurement_noise_guardrail_penalty': float(measurement_guard),
+        'balance_guardrail_penalty': 0.0,
+        'measurement_noise_guardrail_penalty': 0.0,
         'balance_guardrail_violation_count': int(balance_violations),
         'alternating_lr_comb_violation_count': int(alternating_violations),
         'summed_hole_violation_count': int(sum_hole_violations),

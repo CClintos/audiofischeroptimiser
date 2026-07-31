@@ -13,6 +13,7 @@ import _optimizer_stream as optimizer_stream
 from objective_module import _tunefit as canonical_tunefit
 from objective_module import afpx_objective as objective
 from objective_module.session import ScorerSession
+from scripts.verify_written_tune import measurement_guardrail_errors
 
 
 class StrictMeasurementTests(unittest.TestCase):
@@ -232,6 +233,159 @@ class MaskIntegrityTests(unittest.TestCase):
         self.assertEqual(stable["state"], canonical_tunefit.MASK_CLEAR)
         self.assertEqual(single["state"], canonical_tunefit.MASK_DETECTED)
         self.assertEqual(single["confidence"], "low")
+
+    def _balance_pools(self, freqs: np.ndarray, difference: np.ndarray,
+                       system_deviation: float = 1.0) -> dict[str, list[dict[str, object]]]:
+        target = np.full_like(freqs, 60.0)
+        left = target + difference / 2.0
+        right = target - difference / 2.0
+        together = optimizer.power_sum_db([left, right])
+        traces = {
+            "FL Low": left,
+            "FR Low": right,
+            "Mid Bass Together": together,
+            "System Sum": target + system_deviation,
+            "Sub": np.full_like(freqs, -100.0),
+        }
+        groups = {
+            side: {
+                "channels": (index,),
+                "branch": "low",
+                "trace": role,
+                "pair": "low",
+                "side": side_name,
+                "range": (500.0, 2000.0),
+                "q_range": (0.5, 6.0),
+                "gain_range": (-6.0, 3.0),
+                "max_bands": 2,
+            }
+            for side, index, role, side_name in (
+                ("fl_low", 0, "FL Low", "left"),
+                ("fr_low", 1, "FR Low", "right"),
+            )
+        }
+        pairs = {
+            "low": {
+                "left": "FL Low",
+                "right": "FR Low",
+                "together": "Mid Bass Together",
+                "branch_band": (500.0, 2200.0),
+                "balance_band": (500.0, 2000.0),
+            }
+        }
+        with patch.multiple(
+            optimizer,
+            GROUPS=groups,
+            PAIR_DEFS=pairs,
+            SYNTHETIC_PAIR_ROLES=set(),
+        ):
+            return optimizer_stream.find_guided_candidates(freqs, traces, target, "safe")
+
+    def test_alternating_audit_imbalance_produces_no_balance_candidate(self) -> None:
+        audit_f = np.array([700.0, 800.0, 900.0, 1100.0, 1128.0, 1200.0, 1400.0])
+        audit_d = np.array([-1.4, -1.3, 2.7, 2.9, 3.6, 2.9, -2.3])
+        freqs = np.geomspace(500.0, 2200.0, 768)
+        difference = np.interp(np.log10(freqs), np.log10(audit_f), audit_d)
+        pools = self._balance_pools(freqs, difference)
+        in_audit_band = [
+            item for items in pools.values() for item in items
+            if item["source"] == "balance" and 700.0 <= item["F"] <= 1400.0
+        ]
+        self.assertEqual(in_audit_band, [])
+        self.assertTrue(any(
+            item["reason"] == "alternating_lr_comb"
+            for item in optimizer_stream.LAST_PROPOSAL_AUDIT["suppressions"]
+        ))
+
+    def test_broad_two_db_offset_still_produces_balance_candidate(self) -> None:
+        freqs = np.geomspace(500.0, 2200.0, 768)
+        pools = self._balance_pools(freqs, np.full_like(freqs, 2.0))
+        self.assertTrue(any(
+            item["source"] == "balance"
+            for items in pools.values() for item in items
+        ))
+
+    def test_balance_cut_cannot_deepen_summed_hole(self) -> None:
+        freqs = np.geomspace(500.0, 2200.0, 768)
+        pools = self._balance_pools(freqs, np.full_like(freqs, 3.0), -2.2)
+        self.assertFalse(any(
+            item["source"] == "balance" and item["G"] < 0.0
+            for items in pools.values() for item in items
+        ))
+        self.assertTrue(any(
+            item["reason"] == "summed_response_already_below_target"
+            for item in optimizer_stream.LAST_PROPOSAL_AUDIT["suppressions"]
+        ))
+
+    def test_write_lint_rejects_one_sided_cut_into_summed_hole(self) -> None:
+        freqs = np.geomspace(100.0, 3000.0, 768)
+        target = np.full_like(freqs, 60.0)
+        traces = {
+            "FL Low": target + 1.5,
+            "FR Low": target - 1.5,
+            "Mid Bass Together": target,
+            "System Sum": target - 2.2,
+        }
+        groups = {
+            "fl_low": {
+                "channels": (0,), "branch": "low", "pair": "low", "side": "left",
+            },
+            "fr_low": {
+                "channels": (1,), "branch": "low", "pair": "low", "side": "right",
+            },
+        }
+        pairs = {
+            "low": {
+                "left": "FL Low", "right": "FR Low",
+                "together": "Mid Bass Together", "branch_band": (80.0, 2600.0),
+            }
+        }
+        errors = measurement_guardrail_errors(
+            freqs,
+            traces,
+            target,
+            {0: [{"F": "270", "Q": "2", "G": "-3"}], 1: []},
+            groups,
+            pairs,
+            set(),
+        )
+        reasons = {reason for item in errors for reason in item["reasons"]}
+        self.assertIn("summed_response_already_below_target", reasons)
+
+    def test_write_lint_rejects_sub_floor_filter(self) -> None:
+        freqs = np.geomspace(500.0, 2200.0, 768)
+        target = np.full_like(freqs, 60.0)
+        traces = {
+            "FL Low": target + 0.35,
+            "FR Low": target - 0.35,
+            "Mid Bass Together": target,
+            "System Sum": target + 0.7,
+        }
+        groups = {
+            "fl_low": {
+                "channels": (0,), "branch": "low", "pair": "low", "side": "left",
+            },
+            "fr_low": {
+                "channels": (1,), "branch": "low", "pair": "low", "side": "right",
+            },
+        }
+        pairs = {
+            "low": {
+                "left": "FL Low", "right": "FR Low",
+                "together": "Mid Bass Together", "branch_band": (500.0, 2200.0),
+            }
+        }
+        errors = measurement_guardrail_errors(
+            freqs,
+            traces,
+            target,
+            {0: [{"F": "1128", "Q": "2", "G": "-0.75"}], 1: []},
+            groups,
+            pairs,
+            set(),
+        )
+        reasons = {reason for item in errors for reason in item["reasons"]}
+        self.assertIn("below_measurement_noise_floor", reasons)
 
 
 class ComplexPredictionGateTests(unittest.TestCase):

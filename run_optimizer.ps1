@@ -132,8 +132,11 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
     $verifyArgs = @(
         "scripts\verify_written_tune.py", $baselinePath, $candidate.FullName,
         "--allow-output-trim",
+        "--data-root", $data,
+        "--target", $targetPath,
         "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))
     )
+    if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
     if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
     $null = & $python @verifyArgs
     if ($LASTEXITCODE -ne 0) { throw "Candidate verification failed: $($candidate.Name)" }

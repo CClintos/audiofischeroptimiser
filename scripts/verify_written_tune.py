@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import struct
 import zlib
 from pathlib import Path
+
+import numpy as np
 
 
 def decode_afpx(path: Path) -> str:
@@ -86,6 +89,16 @@ def filter_keys(xml: str, types: set[str] | None = None) -> list[tuple[tuple[str
     return keys
 
 
+def channel_filter_keys(xml: str, types: set[str] | None = None) -> list[list[tuple[tuple[str, str | None], ...]]]:
+    rows = []
+    for block in re.findall(r"<OC\b.*?</OC>", xml, re.S):
+        rows.append([
+            filter_key(tag) for tag in active_filters(block)
+            if types is None or attrs(tag).get("T") in types
+        ])
+    return rows
+
+
 def multiset_delta(old_items: list[object], new_items: list[object]) -> tuple[list[object], list[object]]:
     old_counts: dict[object, int] = {}
     new_counts: dict[object, int] = {}
@@ -102,8 +115,134 @@ def multiset_delta(old_items: list[object], new_items: list[object]) -> tuple[li
     return added, removed
 
 
+def _added_peq_by_channel(old_xml: str, new_xml: str) -> dict[int, list[dict[str, str | None]]]:
+    old_channels = channel_filter_keys(old_xml, {"17"})
+    new_channels = channel_filter_keys(new_xml, {"17"})
+    result = {}
+    for index in range(max(len(old_channels), len(new_channels))):
+        old = old_channels[index] if index < len(old_channels) else []
+        new = new_channels[index] if index < len(new_channels) else []
+        added, _ = multiset_delta(old, new)
+        result[index] = [dict(item) for item in added]
+    return result
+
+
+def measurement_guardrail_errors(freqs, traces, target, added_by_channel, groups,
+                                 pair_defs, synthetic_pairs) -> list[dict[str, object]]:
+    import _tunefit as tunefit
+
+    log_f = np.log10(freqs)
+    system_dev = tunefit.erb_smooth(freqs, traces["System Sum"] - target)
+    errors = []
+    side_groups = [
+        (name, cfg) for name, cfg in groups.items()
+        if cfg.get("pair") and cfg.get("side") and len(cfg.get("channels", ())) == 1
+    ]
+    for group_name, cfg in side_groups:
+        channel = int(cfg["channels"][0])
+        pair = pair_defs[cfg["pair"]]
+        peer_group = next(
+            (peer for peer, peer_cfg in side_groups
+             if peer_cfg.get("pair") == cfg.get("pair")
+             and peer_cfg.get("side") != cfg.get("side")),
+            None,
+        )
+        peer_channel = int(groups[peer_group]["channels"][0]) if peer_group else -1
+        peer_keys = {
+            (round(float(item.get("F") or 0.0), 1),
+             round(float(item.get("Q") or 0.0), 2),
+             round(float(item.get("G") or 0.0), 2))
+            for item in added_by_channel.get(peer_channel, [])
+        }
+        evidence_state = tunefit.interference_mask_evidence(
+            freqs,
+            traces[pair["left"]],
+            traces[pair["right"]],
+            traces.get(pair["together"]),
+            synthetic=pair["together"] in synthetic_pairs,
+            band=pair["branch_band"],
+        )["state"]
+        diff = tunefit.erb_smooth(freqs, traces[pair["left"]] - traces[pair["right"]])
+        for item in added_by_channel.get(channel, []):
+            center = float(item.get("F") or 0.0)
+            gain = float(item.get("G") or 0.0)
+            key = (
+                round(center, 1),
+                round(float(item.get("Q") or 0.0), 2),
+                round(gain, 2),
+            )
+            if gain >= 0.0 or key in peer_keys:
+                continue
+            reasons = []
+            if evidence_state == tunefit.MASK_UNKNOWN:
+                reasons.append("interference_evidence_unknown")
+            evidence = tunefit.signed_offset_evidence(
+                freqs, diff, center, cfg.get("branch", "low")
+            )
+            if not evidence["eligible"]:
+                reasons.append(str(evidence["reason"]))
+            deviation = float(np.interp(np.log10(center), log_f, system_dev))
+            if deviation < -0.5:
+                reasons.append("summed_response_already_below_target")
+            if float(tunefit.imaging_balance_weight([center])[0]) < 0.5:
+                reasons.append("imaging_frequency_outside_authority")
+            if reasons:
+                errors.append({
+                    "group": group_name,
+                    "channel": channel,
+                    "frequency_hz": center,
+                    "gain_db": gain,
+                    "system_deviation_db": deviation,
+                    "reasons": list(dict.fromkeys(reasons)),
+                })
+    for channel, items in added_by_channel.items():
+        role = next((
+            str(cfg.get("branch", "low")) for cfg in groups.values()
+            if channel in cfg.get("channels", ()) and len(cfg.get("channels", ())) == 1
+        ), "low")
+        for item in items:
+            center = float(item.get("F") or 0.0)
+            floor = float(tunefit.measurement_noise_floor_db([center], role)[0])
+            required = tunefit.MEASUREMENT_NOISE_MULTIPLIER * floor
+            deviation = abs(float(np.interp(np.log10(center), log_f, traces["System Sum"] - target)))
+            if deviation < required:
+                errors.append({
+                    "channel": channel,
+                    "frequency_hz": center,
+                    "reasons": ["below_measurement_noise_floor"],
+                    "deviation_db": deviation,
+                    "required_deviation_db": required,
+                })
+    return errors
+
+
+def _measurement_lint(data_root: Path, baseline: Path, target_path: Path,
+                      role_map: Path | None, old_xml: str, new_xml: str) -> list[dict[str, object]]:
+    os.environ["AFPX_DATA_ROOT"] = str(data_root)
+    os.environ["AFPX_BASELINE"] = str(baseline)
+    os.environ["AFPX_TARGET"] = str(target_path)
+    if role_map:
+        os.environ["AFPX_ROLE_MAP"] = str(role_map)
+    import _optimizer as optimizer
+
+    freqs, traces, _ = optimizer.load_measurements()
+    raw_target = optimizer.load_target(target_path, freqs)
+    target = raw_target + optimizer.target_anchor_offset(freqs, traces["System Sum"], raw_target)
+    return measurement_guardrail_errors(
+        freqs,
+        traces,
+        target,
+        _added_peq_by_channel(old_xml, new_xml),
+        optimizer.GROUPS,
+        optimizer.PAIR_DEFS,
+        optimizer.SYNTHETIC_PAIR_ROLES,
+    )
+
+
 def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
-           allow_polarity: bool = False, allow_output_trim: bool = False) -> dict[str, object]:
+           allow_polarity: bool = False, allow_output_trim: bool = False,
+           data_root: Path | None = None, target: Path | None = None,
+           role_map: Path | None = None) -> dict[str, object]:
     old_xml = decode_afpx(baseline)
     new_xml = decode_afpx(candidate)
     old_all = filter_keys(old_xml)
@@ -143,6 +282,12 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         if dict(item).get("T") not in ({"17", "19", "20"} if allow_apf else {"17"})
     ]
     errors = []
+    measurement_lint = []
+    if data_root is not None and target is not None:
+        measurement_lint = _measurement_lint(
+            data_root.resolve(), baseline, target.resolve(),
+            role_map.resolve() if role_map else None, old_xml, new_xml,
+        )
     if delay_changed and not allow_delay:
         errors.append("delay_changed")
     if polarity_changed and not allow_polarity:
@@ -161,6 +306,8 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         errors.append("existing_filter_removed_or_changed")
     if forbidden_added:
         errors.append("forbidden_filter_type_added")
+    if measurement_lint:
+        errors.append("measurement_guardrail_failed")
 
     return {
         "baseline": str(baseline),
@@ -182,6 +329,7 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         "removed_filter_count": len(removed),
         "removed_nonfree_filter_count": len(removed_nonfree),
         "unknown_field_changes": forbidden_added,
+        "measurement_guardrail_errors": measurement_lint,
     }
 
 
@@ -193,12 +341,16 @@ def main() -> None:
     parser.add_argument("--allow-apf", action="store_true")
     parser.add_argument("--allow-polarity", action="store_true")
     parser.add_argument("--allow-output-trim", action="store_true")
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--target", type=Path)
+    parser.add_argument("--role-map", type=Path)
     parser.add_argument("--out", type=Path, default=Path("latest_verify_written_tune.json"))
     args = parser.parse_args()
 
     payload = verify(
         args.baseline.resolve(), args.candidate.resolve(), args.allow_delay,
         args.allow_apf, args.allow_polarity, args.allow_output_trim,
+        args.data_root, args.target, args.role_map,
     )
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(payload, indent=2))
