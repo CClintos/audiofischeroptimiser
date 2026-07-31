@@ -101,6 +101,21 @@ class BalanceGuardrailTests(unittest.TestCase):
             lo, hi = groups[name]["range"]
             self.assertLessEqual(lo, 2650.0)
             self.assertGreaterEqual(hi, 2650.0)
+        self.assertGreaterEqual(groups["low_sym"]["range"][1], 2600.0)
+        three_way = optimizer.groups_for_layout("3way")
+        self.assertGreaterEqual(three_way["mid_sym"]["range"][1], 2600.0)
+
+    def test_tweeter_crossover_scope_maps_only_to_tweeter_outputs(self) -> None:
+        band = (2650.0, 2.0, -1.5)
+        with patch.multiple(
+            optimizer,
+            GROUPS=optimizer.groups_for_layout("2way"),
+            AFPX_OBJECTIVE=None,
+        ), patch.object(optimizer, "baseline_band_sets", return_value=[[] for _ in range(8)]):
+            band_sets = optimizer.groups_to_band_sets({"high_crossover_sym": [band]})
+        self.assertEqual(band_sets[0], [band])
+        self.assertEqual(band_sets[1], [band])
+        self.assertTrue(all(not bands for bands in band_sets[2:]))
 
     def test_symmetric_tweeter_cut_near_crossover_is_not_balance_blocked(self) -> None:
         freqs = np.geomspace(200.0, 16000.0, 512)

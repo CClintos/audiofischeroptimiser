@@ -392,7 +392,7 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
             "low_sym": {
                 "channels": (2, 3),
                 "branch": "low",
-                "range": (70.0, 1800.0) if explore else (80.0, 1600.0),
+                "range": (70.0, 2600.0) if explore else (80.0, 2600.0),
                 "q_range": q_sym,
                 "gain_range": gain_sym,
                 "max_bands": max_sym,
