@@ -76,12 +76,15 @@ from _tunefit import (
     headroom_report,
     imaging_balance_weight,
     interference_audit,
+    interference_mask_evidence,
     LOGSTEP,
+    MASK_UNKNOWN,
     measurement_noise_model,
     measurement_noise_floor_db,
     MEASUREMENT_NOISE_MULTIPLIER,
     phase_linearity_residual,
     peaking_db,
+    modal_null_evidence,
     signed_offset_evidence,
     ms_to_samples,
     optimize_allpass,
@@ -233,6 +236,7 @@ OPTIONAL_PAIR_ROLES = optional_pair_roles(
     "front_3way_plus_sub" if FRONT_LAYOUT == "3way" else "front_2way_plus_sub"
 )
 SYNTHETIC_PAIR_ROLES: set[str] = set()
+LAST_MASK_AUDIT: Dict[str, object] = {}
 
 
 def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str, object]]:
@@ -507,6 +511,11 @@ def measurement_session_audit(manifest: Dict[str, object], calibration: Dict[str
         warnings.append("phase_writes_disabled_timing_reference_missing")
     if manifest.get("optional_missing_roles"):
         warnings.append("phase_writes_disabled_pair_measurements_missing")
+        warnings.append(
+            "interference_evidence_unknown:" + ",".join(
+                sorted(str(role) for role in manifest.get("optional_missing_roles", []))
+            )
+        )
     return {
         "tonal_valid": bool(tonal_valid),
         "phase_valid": phase_valid,
@@ -1063,18 +1072,48 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
     return pred
 
 
-def null_masks(freqs: np.ndarray, traces: TraceMap) -> Dict[str, np.ndarray]:
+def null_masks(freqs: np.ndarray, traces: TraceMap,
+               position_traces: Dict[str, np.ndarray] | None = None) -> Dict[str, np.ndarray]:
+    global LAST_MASK_AUDIT
     masks = {name: np.zeros_like(freqs, dtype=bool) for name in PAIR_DEFS}
+    pair_states = {}
     for name, pair in PAIR_DEFS.items():
-        try:
-            masks[name] = interference_audit(
-                freqs, traces[pair["left"]], traces[pair["right"]], traces[pair["together"]]
-            )[3]
-        except Exception:
-            pass
-    masks["system"] = np.zeros_like(freqs, dtype=bool)
+        evidence = interference_mask_evidence(
+            freqs,
+            traces[pair["left"]],
+            traces[pair["right"]],
+            traces.get(pair["together"]),
+            synthetic=pair["together"] in SYNTHETIC_PAIR_ROLES,
+            band=pair["branch_band"],
+        )
+        masks[name] = evidence["mask"]
+        pair_states[name] = {
+            "state": evidence["state"],
+            "reason": evidence["reason"],
+            "together": pair["together"],
+            "band_hz": list(pair["branch_band"]),
+        }
+    modal = modal_null_evidence(
+        freqs,
+        traces["System Sum"],
+        position_db=position_traces,
+        band=(max(20.0, float(freqs[0])), 250.0),
+    )
+    masks["modal"] = modal["mask"]
+    masks["system"] = modal["mask"].copy()
     for name in PAIR_DEFS:
         masks["system"] |= masks[name]
+    LAST_MASK_AUDIT = {
+        "pairs": pair_states,
+        "modal": {
+            "state": modal["state"],
+            "confidence": modal["confidence"],
+            "regions": modal["regions"],
+        },
+        "blocking_pairs": [
+            name for name, item in pair_states.items() if item["state"] == MASK_UNKNOWN
+        ],
+    }
     return masks
 
 

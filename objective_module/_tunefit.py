@@ -14,6 +14,7 @@
 #    -> correctable. Sharp dips with wild excess-GD swings are non-minimum-phase
 #    -> EQ cannot fix them. excess_gd_mask() computes that classifier from a
 #    single-position export WITH PHASE (REW text export, 3 columns).
+import math
 import os
 
 import numpy as np
@@ -130,6 +131,136 @@ def audibility_weight(freqs):
 # claim that every microphone/session has the same noise floor.
 MEASUREMENT_NOISE_MODEL_ID = "user_supplied_mmm_repeatability_v1"
 MEASUREMENT_NOISE_MULTIPLIER = 2.5
+MASK_DETECTED = "DETECTED"
+MASK_CLEAR = "CLEAR"
+MASK_UNKNOWN = "UNKNOWN"
+
+
+def interference_mask_evidence(freqs, left_db, right_db, together_db=None,
+                               *, synthetic=False, band=None):
+    """Return a tri-state destructive-summation audit.
+
+    A synthesized power sum contains no independent summation evidence, so it
+    is UNKNOWN by definition.  Invalid measured data is also UNKNOWN and the
+    exception is retained in ``reason`` instead of being silently converted to
+    a clear mask.
+    """
+    f = np.asarray(freqs, dtype=float)
+    empty = np.zeros_like(f, dtype=bool)
+    if synthetic or together_db is None:
+        return {
+            "state": MASK_UNKNOWN,
+            "mask": empty,
+            "reason": "measured_together_trace_missing",
+        }
+    try:
+        together = np.asarray(together_db, dtype=float)
+        _, _, _, flagged = interference_audit(
+            f, np.asarray(left_db, dtype=float), np.asarray(right_db, dtype=float), together
+        )
+        if band is not None:
+            lo, hi = map(float, band)
+            in_band = (f >= lo) & (f <= hi)
+            if np.any(in_band):
+                alive = together > (np.nanmax(together[in_band]) - 20.0)
+                flagged = flagged & in_band & alive
+            else:
+                flagged = empty
+        return {
+            "state": MASK_DETECTED if np.any(flagged) else MASK_CLEAR,
+            "mask": np.asarray(flagged, dtype=bool),
+            "reason": "destructive_summation_detected" if np.any(flagged) else "measured_pair_clear",
+        }
+    except (TypeError, ValueError, FloatingPointError, IndexError) as exc:
+        return {
+            "state": MASK_UNKNOWN,
+            "mask": empty,
+            "reason": f"interference_audit_failed:{type(exc).__name__}:{exc}",
+        }
+
+
+def _fractional_octave_mean(freqs, values, width_oct):
+    f = np.asarray(freqs, dtype=float)
+    y = np.asarray(values, dtype=float)
+    out = np.empty_like(y)
+    half = float(width_oct) / 2.0
+    for index, center in enumerate(f):
+        selected = np.abs(np.log2(np.maximum(f, 1e-9) / center)) <= half
+        out[index] = np.nanmean(y[selected]) if np.any(selected) else y[index]
+    return out
+
+
+def modal_null_evidence(freqs, center_db, position_db=None, band=(20.0, 250.0)):
+    """Classify spatially unstable or very narrow/deep LF nulls.
+
+    With multiple positions a centre dip is masked only when its local minimum
+    moves by more than 1/8 octave.  With one position, the fallback masks dips
+    deeper than 8 dB relative to a 1/3-octave local mean and narrower than
+    roughly 1/6 octave; those classifications are explicitly low confidence.
+    """
+    f = np.asarray(freqs, dtype=float)
+    center = np.asarray(center_db, dtype=float)
+    selected = (f >= float(band[0])) & (f <= float(band[1])) & np.isfinite(center)
+    mask = np.zeros_like(f, dtype=bool)
+    if np.count_nonzero(selected) < 5:
+        return {"state": MASK_CLEAR, "mask": mask, "confidence": "low", "regions": []}
+
+    broad = _fractional_octave_mean(f, center, 1 / 3)
+    residual = center - broad
+    minima = [
+        index for index in range(1, len(f) - 1)
+        if selected[index] and residual[index] <= -4.0
+        and residual[index] <= residual[index - 1] and residual[index] <= residual[index + 1]
+    ]
+    positions = [np.asarray(values, dtype=float) for values in (position_db or {}).values()]
+    regions = []
+    for index in minima:
+        center_f = float(f[index])
+        half_oct = 1 / 12
+        local = selected & (np.abs(np.log2(f / center_f)) <= 1 / 3)
+        shifted = []
+        for values in positions:
+            pos_broad = _fractional_octave_mean(f, values, 1 / 3)
+            pos_residual = values - pos_broad
+            candidates = np.flatnonzero(local & np.isfinite(pos_residual))
+            if candidates.size:
+                shifted.append(float(f[candidates[np.argmin(pos_residual[candidates])]]))
+        if positions:
+            centres = [center_f, *shifted]
+            span_oct = math.log2(max(centres) / min(centres)) if len(centres) > 1 else 0.0
+            is_modal = len(shifted) == len(positions) and span_oct > 1 / 8
+            confidence = "high"
+        else:
+            distance = np.abs(np.log2(f / center_f))
+            shoulders = selected & (distance >= 1 / 12) & (distance <= 1 / 4)
+            local_baseline = float(np.nanmedian(center[shoulders])) if np.any(shoulders) else broad[index]
+            local_depth = float(center[index] - local_baseline)
+            deep = local_depth <= -8.0
+            dip = center <= local_baseline + local_depth / 2.0
+            around = np.flatnonzero(dip & selected & (distance <= 1 / 3))
+            contiguous = around
+            width_oct = (
+                math.log2(f[contiguous[-1]] / f[contiguous[0]])
+                if contiguous.size > 1 else 0.0
+            )
+            is_modal = deep and width_oct <= 1 / 6
+            span_oct = width_oct
+            confidence = "low"
+        if is_modal:
+            region = selected & (np.abs(np.log2(f / center_f)) <= half_oct)
+            mask |= region
+            regions.append({
+                "center_hz": center_f,
+                "depth_db": float(residual[index]),
+                "movement_or_width_oct": float(span_oct),
+                "confidence": confidence,
+            })
+    return {
+        "state": MASK_DETECTED if np.any(mask) else MASK_CLEAR,
+        "mask": mask,
+        "confidence": "high" if positions else "low",
+        "regions": regions,
+    }
 
 
 def measurement_noise_floor_db(freqs, branch="low"):

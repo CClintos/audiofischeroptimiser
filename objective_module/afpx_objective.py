@@ -54,9 +54,11 @@ from _tunefit import (
     erb_hz,
     erb_smooth,
     imaging_balance_weight,
-    interference_audit,
+    interference_mask_evidence,
+    MASK_UNKNOWN,
     MEASUREMENT_NOISE_MULTIPLIER,
     measurement_noise_floor_db,
+    modal_null_evidence,
     peaking_db,
     signed_offset_evidence,
 )
@@ -362,6 +364,7 @@ _COMPLEX_MODELS = {}
 _POSITION_COMPLEX_MODELS = {}
 _PREDICTION_AUDIT = {}
 _SYNTHETIC_PAIRS = set()
+_MASK_AUDIT = {}
 
 
 def _attrs(t):
@@ -566,7 +569,7 @@ def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
     global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
     global _BASE_OUTPUT_DB, _TRACE_META, _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT
-    global _SYNTHETIC_PAIRS
+    global _SYNTHETIC_PAIRS, _MASK_AUDIT
     if _F is not None:
         return
     raw = {}
@@ -617,21 +620,6 @@ def _init():
     band = (F >= ANCHOR_BAND[0]) & (F <= ANCHOR_BAND[1])
     _TGT = tgt + float(np.median(_T['System Sum'][band] - tgt[band]))
     # null mask: destructive-interference bins in either front pair (from MEASURED
-    # data -- a property of acoustic summation, ~stable under EQ). Filling these
-    # earns no reward; boosting into them is penalized. Restrict each pair to its
-    # own passband AND to bins where the pair is actually playing (within 20 dB of
-    # its in-band max) -- otherwise the audit flags rolled-off noise-floor regions
-    # outside the passband and masks most of the axis.
-    def _pair_null(a_key, b_key, tog_key, lo, hi):
-        _, _, _, flagged = interference_audit(F, _T[a_key], _T[b_key], _T[tog_key])
-        band = (F >= lo) & (F <= hi)
-        tog = _T[tog_key]
-        alive = tog > (np.max(tog[band]) - 20.0)  # pair is meaningfully present
-        return flagged & band & alive
-    _NULL_MASK = np.zeros_like(F, dtype=bool)
-    for _name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
-        if together not in _SYNTHETIC_PAIRS:
-            _NULL_MASK |= _pair_null(left, right, together, band_range[0], band_range[1])
     with open(BASELINE_AFPX, 'rb') as handle:
         baseline_xml = zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace')
     _V5 = _peqset(baseline_xml)
@@ -655,6 +643,42 @@ def _init():
         measured = np.interp(np.log10(_F), np.log10(pf), ps)
         target = tgt + float(np.median(measured[band] - tgt[band]))
         _POSITION_TRACES[position] = {'system': measured, 'target': target, 'file': str(path)}
+    _NULL_MASK = np.zeros_like(F, dtype=bool)
+    pair_audit = {}
+    for name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
+        evidence = interference_mask_evidence(
+            F,
+            _T[left],
+            _T[right],
+            _T.get(together),
+            synthetic=together in _SYNTHETIC_PAIRS,
+            band=band_range,
+        )
+        _NULL_MASK |= evidence['mask']
+        pair_audit[name] = {
+            'state': evidence['state'],
+            'reason': evidence['reason'],
+            'together': together,
+            'band_hz': list(band_range),
+        }
+    modal = modal_null_evidence(
+        F,
+        _T['System Sum'],
+        {name: data['system'] for name, data in _POSITION_TRACES.items()},
+        band=(max(20.0, float(F[0])), 250.0),
+    )
+    _NULL_MASK |= modal['mask']
+    _MASK_AUDIT = {
+        'pairs': pair_audit,
+        'modal': {
+            'state': modal['state'],
+            'confidence': modal['confidence'],
+            'regions': modal['regions'],
+        },
+        'blocking_pairs': [
+            name for name, item in pair_audit.items() if item['state'] == MASK_UNKNOWN
+        ],
+    }
     keep = (_F >= INBAND[0]) & (_F <= INBAND[1]) & ~_NULL_MASK
     _POSITION_BASELINE = {
         name: tonal_components(_F, _smooth(data['system'] - data['target']), keep)['tonal_masked']
@@ -1269,13 +1293,14 @@ def objective(band_sets, output_trim_override=None):
         diff = _smooth(pr[left] - pr[right])
         balances[name] = balance_components(_F, diff, balance_band)
 
-    # headroom: worst front-channel cascade peak, + boost landing in null bins
+    # Headroom plus any newly-added correction landing in a masked null.
     head_peak = 0.0
     null_boost = 0.0
     for i in range(len(CH_KEYS)):
         b = _casc(band_sets[i]) + float(trim_plan.get(i, 0.0))
         head_peak = max(head_peak, float(np.max(b)))
-        null_boost += float(np.sum(np.maximum(b[_NULL_MASK], 0.0))) / max(np.sum(_NULL_MASK), 1)
+        delta = _delta_channel(i, band_sets)
+        null_boost += float(np.sum(np.abs(delta[_NULL_MASK]))) / max(np.sum(_NULL_MASK), 1)
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
     guard = _guardrail_score(band_sets, pr)
@@ -1356,6 +1381,7 @@ def cache_stats():
         'complex_pairs': sorted(_COMPLEX_MODELS.get('pairs', {})),
         'complex_system': _model_compatible(_COMPLEX_MODELS.get('system')),
         'complex_positions': sorted(_POSITION_COMPLEX_MODELS),
+        'mask_audit': dict(_MASK_AUDIT),
     }
 
 

@@ -16,6 +16,12 @@ WARNING_TEXT: dict[str, dict[str, str]] = {
         "meaning": "PEQ will use the individual drivers and measured System Sum, but it cannot verify how the missing left-and-right pair sums acoustically.",
         "remedy": "You may continue with PEQ. Export the Together traces from REW later to restore pair-null and summation validation.",
     },
+    "interference_evidence_unknown": {
+        "severity": "error",
+        "title": "One-sided balance correction is blocked",
+        "meaning": "A measured Together trace is missing, so the app cannot distinguish a real broad side-to-side offset from destructive pair summation in that driver band.",
+        "remedy": "The tonal optimizer can continue, but it will suppress one-sided balance filters for the affected pair. Capture the missing Together trace to restore that option.",
+    },
     "baseline_missing": {
         "severity": "error",
         "title": "Baseline tune is missing",

@@ -9,6 +9,7 @@ import numpy as np
 
 import _tunefit as public_tunefit
 import _optimizer as optimizer
+import _optimizer_stream as optimizer_stream
 from objective_module import _tunefit as canonical_tunefit
 from objective_module import afpx_objective as objective
 from objective_module.session import ScorerSession
@@ -137,6 +138,85 @@ class BalanceGuardrailTests(unittest.TestCase):
         self.assertEqual(guard["balance_guardrail_violation_count"], 0)
         self.assertEqual(guard["filter_noise_floor_violation_count"], 0)
         self.assertEqual(guard["balance_guardrail_penalty"], 0.0)
+
+
+class MaskIntegrityTests(unittest.TestCase):
+    def test_synthetic_pair_is_unknown_and_blocks_one_sided_pool(self) -> None:
+        freqs = np.geomspace(100.0, 4000.0, 512)
+        target = np.full_like(freqs, 60.0)
+        left = target + 3.0
+        right = target
+        together = 10.0 * np.log10(10.0 ** (left / 10.0) + 10.0 ** (right / 10.0))
+        traces = {
+            "FL Low": left,
+            "FR Low": right,
+            "Mid Bass Together": together,
+            "System Sum": target + 2.0,
+            "Sub": np.full_like(freqs, -100.0),
+        }
+        groups = {
+            "fl_low": {
+                "channels": (0,),
+                "branch": "low",
+                "trace": "FL Low",
+                "pair": "low",
+                "side": "left",
+                "range": (200.0, 2000.0),
+                "q_range": (0.5, 6.0),
+                "gain_range": (-6.0, 3.0),
+                "max_bands": 2,
+            }
+        }
+        pairs = {
+            "low": {
+                "left": "FL Low",
+                "right": "FR Low",
+                "together": "Mid Bass Together",
+                "branch_band": (100.0, 2600.0),
+                "balance_band": (200.0, 2000.0),
+            }
+        }
+        with patch.multiple(
+            optimizer,
+            GROUPS=groups,
+            PAIR_DEFS=pairs,
+            SYNTHETIC_PAIR_ROLES={"Mid Bass Together"},
+        ):
+            masks, states = optimizer_stream.interference_masks(freqs, traces)
+            pools = optimizer_stream.find_guided_candidates(freqs, traces, target, "safe")
+        self.assertEqual(states["low"]["state"], canonical_tunefit.MASK_UNKNOWN)
+        self.assertFalse(np.any(masks["fl_low"]))
+        self.assertFalse(any(item["source"] == "balance" for item in pools["fl_low"]))
+
+    def test_measured_destructive_pair_is_detected(self) -> None:
+        freqs = np.geomspace(300.0, 3000.0, 512)
+        left = np.full_like(freqs, 60.0)
+        right = np.full_like(freqs, 60.0)
+        together = 10.0 * np.log10(10.0 ** 6 + 10.0 ** 6) * np.ones_like(freqs)
+        together -= 8.0 * np.exp(-0.5 * (np.log2(freqs / 1128.0) / 0.05) ** 2)
+        evidence = canonical_tunefit.interference_mask_evidence(
+            freqs, left, right, together, band=(700.0, 1600.0)
+        )
+        self.assertEqual(evidence["state"], canonical_tunefit.MASK_DETECTED)
+        self.assertTrue(np.any(evidence["mask"]))
+
+    def test_spatially_shifting_lf_dip_is_modal_but_stable_dip_is_not(self) -> None:
+        freqs = np.geomspace(20.0, 250.0, 1024)
+
+        def dip(center: float) -> np.ndarray:
+            return -12.0 * np.exp(-0.5 * (np.log2(freqs / center) / 0.045) ** 2)
+
+        moving = canonical_tunefit.modal_null_evidence(
+            freqs, dip(52.0), {"left": dip(59.0), "right": dip(45.0)}
+        )
+        stable = canonical_tunefit.modal_null_evidence(
+            freqs, dip(52.0), {"left": dip(52.5), "right": dip(51.5)}
+        )
+        single = canonical_tunefit.modal_null_evidence(freqs, dip(52.0))
+        self.assertEqual(moving["state"], canonical_tunefit.MASK_DETECTED)
+        self.assertEqual(stable["state"], canonical_tunefit.MASK_CLEAR)
+        self.assertEqual(single["state"], canonical_tunefit.MASK_DETECTED)
+        self.assertEqual(single["confidence"], "low")
 
 
 class ComplexPredictionGateTests(unittest.TestCase):

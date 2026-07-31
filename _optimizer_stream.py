@@ -36,6 +36,7 @@ except ImportError:  # Keep random/guided modes usable if the optional backend i
 
 
 GroupBands = Dict[str, List[Tuple[float, float, float]]]
+LAST_PROPOSAL_AUDIT: Dict[str, object] = {}
 
 
 def configure_profile(profile: str) -> None:
@@ -109,13 +110,22 @@ def branch_contribution(freqs, traces, group: str) -> np.ndarray:
 def interference_masks(freqs, traces):
     masks = {group: np.zeros_like(freqs, dtype=bool) for group in opt.GROUPS}
     pair_masks = {name: np.zeros_like(freqs, dtype=bool) for name in opt.PAIR_DEFS}
+    pair_states = {}
     for name, pair in opt.PAIR_DEFS.items():
-        try:
-            pair_masks[name] |= opt.interference_audit(
-                freqs, traces[pair["left"]], traces[pair["right"]], traces[pair["together"]]
-            )[3]
-        except Exception:
-            pass
+        evidence = opt.interference_mask_evidence(
+            freqs,
+            traces[pair["left"]],
+            traces[pair["right"]],
+            traces.get(pair["together"]),
+            synthetic=pair["together"] in opt.SYNTHETIC_PAIR_ROLES,
+            band=pair["branch_band"],
+        )
+        pair_masks[name] = evidence["mask"]
+        pair_states[name] = {
+            "state": evidence["state"],
+            "reason": evidence["reason"],
+            "band_hz": list(pair["branch_band"]),
+        }
     for group, cfg in opt.GROUPS.items():
         branch = cfg.get("branch")
         if cfg.get("system_transfer"):
@@ -123,7 +133,7 @@ def interference_masks(freqs, traces):
                 masks[group] |= pair_mask
         elif branch in pair_masks:
             masks[group] |= pair_masks[branch]
-    return masks
+    return masks, pair_states
 
 
 def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, source, profile):
@@ -193,7 +203,8 @@ def find_guided_candidates(freqs, traces, target, profile: str):
     """
     raw_system_dev = traces["System Sum"] - target
     system_dev = opt.erb_smooth(freqs, raw_system_dev)
-    masks = interference_masks(freqs, traces)
+    global LAST_PROPOSAL_AUDIT
+    masks, pair_states = interference_masks(freqs, traces)
     audible = opt.audibility_weight(freqs)
     vocal = np.ones_like(freqs)
     vocal[(freqs >= 200.0) & (freqs <= 6000.0)] = 1.8
@@ -287,6 +298,9 @@ def find_guided_candidates(freqs, traces, target, profile: str):
 
         if cfg.get("pair") and cfg.get("side"):
             pair = opt.PAIR_DEFS[cfg["pair"]]
+            if pair_states[cfg["pair"]]["state"] == opt.MASK_UNKNOWN:
+                pools[group] = candidates
+                continue
             diff = opt.erb_smooth(freqs, traces[pair["left"]] - traces[pair["right"]])
             if cfg["side"] == "left":
                 bal_gain = -0.85 * diff
@@ -385,6 +399,12 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                 "required_deviation_db": float(opt.MEASUREMENT_NOISE_MULTIPLIER * floor),
             })
             pools[group].sort(key=lambda item: -item["strength"])
+    LAST_PROPOSAL_AUDIT = {
+        "mask_evidence": pair_states,
+        "blocking_pairs": [
+            name for name, item in pair_states.items() if item["state"] == opt.MASK_UNKNOWN
+        ],
+    }
     return pools
 
 
