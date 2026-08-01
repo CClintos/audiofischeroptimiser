@@ -125,6 +125,16 @@ These left-and-right pair traces let the app test acoustic summation and detect
 destructive interaction at crossover regions. They are optional for a
 magnitude-only PEQ run, but required evidence for phase-related writes.
 
+### Optional: nearfield captures for null confirmation
+
+- `Front L Nearfield.txt` or `Front Left Nearfield.txt`
+- `Front R Nearfield.txt` or `Front Right Nearfield.txt`
+
+A close-mic capture right at each front driver, with negligible room path. If
+both are supplied, they let the app confirm whether a dip seen at the seat is
+a room/summation artefact rather than a real driver problem - see
+[how nulls are treated](#4-treat-nulls-and-missing-evidence-honestly) below.
+
 REW exports can contain frequency/SPL only, or include phase, coherence, and
 position columns. For phase work, keep the microphone fixed and use the same
 acoustic timing reference for the complete session.
@@ -165,6 +175,15 @@ Each candidate is judged on the following evidence together:
 | Optional seat measurements | When centre, left-ear, or right-ear system sums are supplied, the candidate must hold up across them instead of chasing one microphone position. |
 | Headroom and filter cost | Penalises excessive combined boost, unnecessary output gain, too many filters, high-Q corrections, deep cuts, and filters outside a driver's useful range. |
 
+Headroom accounting covers every output including the subwoofer, and any
+active shelf filter already in your tune, not just the PEQ bands a candidate
+proposes - a boost that would look safe by PEQ alone but actually pushes a
+channel toward clipping once its existing shelf or subwoofer trim is counted
+is rejected outright. Before a candidate is written, any proposed filter that
+would not measurably change that channel's response on its own, or a pair of
+filters that mostly cancel each other out, is dropped rather than left in
+place using a slot for nothing.
+
 The result is not simply the candidate with the most filters or the flattest
 single trace. The search favours the smallest correction that makes a meaningful
 improvement across the evidence available.
@@ -197,6 +216,16 @@ from your own measurements. An optional `known_eq_delta.json` removes a known EQ
 difference between the sessions before the floor is calculated. The empirical
 values are saved in the run summary and report.
 
+If you have more than one full measurement session for the same tune, the
+command-line runner can also accept them with `--persistence-sessions`. A
+correction is only proposed if its sign and size hold up across every supplied
+session, not just the one used for scoring - this catches a deviation that
+looked real in a single moving-mic pass but was actually run-to-run capture
+noise. Each qualifying candidate in the report shows how many sessions
+supported it, and sessions are compared by shape rather than absolute level,
+so a louder or quieter capture on a different day does not throw off the
+comparison.
+
 When a proposed correction falls near a crossover, the search compares the
 same region on the upper driver pair, the lower driver pair, and both together.
 The full system score decides which scope earns the filter; it does not
@@ -207,6 +236,13 @@ automatically copy a tweeter correction onto the midbass or midrange.
 If the measurements show a destructive acoustic cancellation, that region is
 masked from the tonal reward and positive EQ there is penalised. The app does
 not call a deep null a "peak to fix" and boost into it.
+
+When close-mic nearfield captures are available for the front drivers, a dip
+that looks deep at the seat but is nearly gone right at the driver is
+confirmed as a room or summation artefact rather than a driver problem, and
+boosting into it - even with a broad filter whose edge only reaches into the
+dip rather than sitting on top of it - is blocked outright rather than merely
+discouraged.
 
 When individual drivers and System Sum are present but a `Together` trace is
 missing, PEQ can still use the measured solo drivers plus system response.
