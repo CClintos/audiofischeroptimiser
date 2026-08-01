@@ -279,6 +279,75 @@ def add_bands(oc, bands, protected_boost=False):
     return oc
 
 
+_SLOT_MATCH_TOL_F = 0.06
+_SLOT_MATCH_TOL_Q = 0.006
+_SLOT_MATCH_TOL_G = 0.006
+
+
+def _find_active_slot(oc, old_band):
+    """Locate the one active (T="17") <Fil> tag matching old_band's current
+    F/Q/G, the same discipline edit_tweeter() above already used by hand:
+    fail loudly rather than guess if the source slot is missing or
+    duplicated."""
+    old_f, old_q, old_g = (float(v) for v in old_band)
+    matches = [
+        tag for tag in re.findall(r'<Fil\b[^>]*/?>', oc)
+        if at(tag, 'T') == '17'
+        and abs(float(at(tag, 'F')) - old_f) < _SLOT_MATCH_TOL_F
+        and abs(float(at(tag, 'Q')) - old_q) < _SLOT_MATCH_TOL_Q
+        and abs(float(at(tag, 'G')) - old_g) < _SLOT_MATCH_TOL_G
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            'expected exactly one active PEQ at F=%.2f Q=%.3f G=%.3f to edit/remove, found %d'
+            % (old_f, old_q, old_g, len(matches))
+        )
+    return matches[0]
+
+
+def edit_band(oc, old_band, new_band, protected_boost=False):
+    """Rewrite an existing active PEQ slot's F/Q/G in place. T, dF, FN and I
+    are untouched - only the values change, matching the verified
+    edit_tweeter() pattern above, generalised to any band."""
+    new_f, new_q, new_g = new_band
+    validate_peq_band(new_f, new_q, new_g, protected_boost=protected_boost)
+    old_tag = _find_active_slot(oc, old_band)
+    new_tag = set_attr(old_tag, 'Q', new_q)
+    new_tag = set_attr(new_tag, 'F', '%.2f' % float(new_f))
+    new_tag = set_attr(new_tag, 'G', new_g)
+    return oc.replace(old_tag, new_tag, 1)
+
+
+def remove_band(oc, old_band):
+    """Free an existing active PEQ slot: T back to "1", G to 0. dF/FN/I are
+    left exactly as PC-Tool would leave a slot that was never used, per
+    afpx_format.md's "keep dF, give a unique FN" writing convention - only T
+    and G actually change here since FN/dF already belong to this slot."""
+    old_tag = _find_active_slot(oc, old_band)
+    new_tag = set_attr(old_tag, 'T', '1')
+    new_tag = set_attr(new_tag, 'G', '0')
+    return oc.replace(old_tag, new_tag, 1)
+
+
+def apply_band_actions(oc, actions, protected_boost=False):
+    """Apply one channel's resolved (append/edit/remove) action log - see
+    _optimizer.py's _resolve_group_bands(), the single source of truth both
+    scoring and writing build on - to its raw <OC> XML block."""
+    appends = []
+    for kind, old, new in actions:
+        if kind == "append":
+            appends.append(new)
+        elif kind == "edit":
+            oc = edit_band(oc, old, new, protected_boost=protected_boost)
+        elif kind == "remove":
+            oc = remove_band(oc, old)
+        else:
+            raise ValueError("unknown band action: %r" % (kind,))
+    if appends:
+        oc = add_bands(oc, appends, protected_boost=protected_boost)
+    return oc
+
+
 def main():
     xml = decode_afpx(SRC)
     ocs = list(re.finditer(r'<OC\b.*?</OC>', xml, re.S))

@@ -264,6 +264,94 @@ def modal_null_evidence(freqs, center_db, position_db=None, band=(20.0, 250.0)):
     }
 
 
+NEARFIELD_DEPTH_RATIO_THRESHOLD = 0.5
+
+
+def nearfield_null_evidence(freqs, at_seat_db, nearfield_db, null_mask, band=None):
+    """Confirm already-flagged nulls with a close-mic nearfield trace.
+
+    A dip that is deep at the listening seat but much shallower right at the
+    driver (negligible room path) is a room-summation/reflection artifact,
+    not something wrong with the driver - EQ cannot fix it and boosting into
+    it wastes filter budget and headroom for no audible gain. Depth is
+    measured relative to each trace's own 1/3-octave local baseline, so an
+    absolute level offset between the loud close-mic capture and the quieter
+    at-seat one never affects the comparison.
+
+    Only bins already in ``null_mask`` are considered (this narrows, it does
+    not widen, what counts as a null). A run is CONFIRMED not-EQ-able when
+    the nearfield depth is under half the at-seat depth at that run's
+    deepest bin. Confirmed runs also report a ``guard_mask`` spanning out to
+    each side's -3dB-down point (relative to the at-seat local baseline) so
+    a positive-gain candidate whose skirt reaches into that span - even
+    without its centre landing on the exact null bin - can be rejected too.
+    """
+    f = np.asarray(freqs, dtype=float)
+    at_seat = np.asarray(at_seat_db, dtype=float)
+    nearfield = np.asarray(nearfield_db, dtype=float)
+    mask = np.asarray(null_mask, dtype=bool)
+    confirmed = np.zeros_like(mask)
+    guard = np.zeros_like(mask)
+    regions = []
+    if band is not None:
+        lo, hi = map(float, band)
+        in_band = (f >= lo) & (f <= hi)
+    else:
+        in_band = np.ones_like(f, dtype=bool)
+    candidate = mask & in_band & np.isfinite(nearfield) & np.isfinite(at_seat)
+    if not np.any(candidate):
+        return {
+            "state": MASK_CLEAR,
+            "confirmed_mask": confirmed,
+            "guard_mask": guard,
+            "regions": regions,
+        }
+    at_seat_broad = _fractional_octave_mean(f, at_seat, 1 / 3)
+    nearfield_broad = _fractional_octave_mean(f, nearfield, 1 / 3)
+    at_seat_residual = at_seat - at_seat_broad
+    nearfield_residual = nearfield - nearfield_broad
+    indices = np.flatnonzero(candidate)
+    runs = []
+    start = prev = indices[0]
+    for idx in indices[1:]:
+        if idx != prev + 1:
+            runs.append((start, prev))
+            start = idx
+        prev = idx
+    runs.append((start, prev))
+    for lo_i, hi_i in runs:
+        span = slice(lo_i, hi_i + 1)
+        center_index = lo_i + int(np.argmin(at_seat_residual[span]))
+        at_seat_depth = float(-at_seat_residual[center_index])
+        nearfield_depth = float(-nearfield_residual[center_index])
+        if at_seat_depth <= 0.0:
+            continue
+        ratio = nearfield_depth / at_seat_depth
+        if ratio >= NEARFIELD_DEPTH_RATIO_THRESHOLD:
+            continue
+        confirmed[span] = True
+        left = center_index
+        while left > 0 and at_seat_residual[left - 1] <= -3.0:
+            left -= 1
+        right = center_index
+        while right < len(f) - 1 and at_seat_residual[right + 1] <= -3.0:
+            right += 1
+        guard[left:right + 1] = True
+        regions.append({
+            "center_hz": float(f[center_index]),
+            "at_seat_depth_db": round(at_seat_depth, 2),
+            "nearfield_depth_db": round(nearfield_depth, 2),
+            "depth_ratio": round(ratio, 3),
+            "guard_band_hz": [float(f[left]), float(f[right])],
+        })
+    return {
+        "state": MASK_DETECTED if np.any(confirmed) else MASK_CLEAR,
+        "confirmed_mask": confirmed,
+        "guard_mask": guard,
+        "regions": regions,
+    }
+
+
 def measurement_noise_floor_db(freqs, branch="low"):
     """Return the assumed one-sigma-ish local repeatability floor in dB.
 
@@ -367,6 +455,53 @@ def signed_offset_evidence(freqs, difference_db, center_hz, branch="low",
         "dominant_sign_fraction": dominant_fraction,
         "offset_db": offset,
         "noise_floor_db": floor,
+        "required_deviation_db": required,
+    }
+
+
+def cross_session_persistence(deviation_db_by_session, noise_floor_db,
+                              multiplier=MEASUREMENT_NOISE_MULTIPLIER):
+    """DEFECT 6: classify a deviation as a real, repeatable target error or
+    single-MMM-session noise, by voting across every supplied session's own
+    measurement at the same frequency.
+
+    A single MMM session cannot tell a genuine deviation from run-to-run
+    capture noise apart. ``deviation_db_by_session`` is one signed dB value
+    per session that actually had coverage at this frequency - a sparse
+    session missing the relevant trace contributes nothing and is simply
+    left out of the vote, it never counts as disagreement. Eligible only
+    when every included session agrees in sign AND every one individually
+    clears ``multiplier`` times the local measurement floor - the weakest
+    session sets the bar, not the average, so one marginal session can't be
+    outvoted by two strong ones.
+    """
+    values = np.asarray(
+        [float(v) for v in deviation_db_by_session if v is not None and np.isfinite(v)],
+        dtype=float,
+    )
+    required = float(multiplier) * float(noise_floor_db)
+    if values.size < 2:
+        return {
+            "eligible": False,
+            "reason": "insufficient_session_coverage",
+            "session_count": int(values.size),
+            "min_magnitude_db": float(np.min(np.abs(values))) if values.size else 0.0,
+            "required_deviation_db": required,
+        }
+    signs = np.sign(values)
+    unanimous = bool(np.all(signs == signs[0])) and signs[0] != 0.0
+    min_magnitude = float(np.min(np.abs(values)))
+    if not unanimous:
+        reason = "sign_disagreement_across_sessions"
+    elif min_magnitude < required:
+        reason = "below_measurement_noise_threshold"
+    else:
+        reason = "persistent_across_sessions"
+    return {
+        "eligible": reason == "persistent_across_sessions",
+        "reason": reason,
+        "session_count": int(values.size),
+        "min_magnitude_db": min_magnitude,
         "required_deviation_db": required,
     }
 

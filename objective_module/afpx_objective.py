@@ -59,6 +59,7 @@ from _tunefit import (
     MEASUREMENT_NOISE_MULTIPLIER,
     measurement_noise_floor_db,
     modal_null_evidence,
+    nearfield_null_evidence,
     peaking_db,
     signed_offset_evidence,
 )
@@ -116,6 +117,12 @@ TARGET = Path(os.environ.get('AFPX_TARGET', str(DATA_ROOT / 'ResoNix Target Curv
 BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'baseline.afpx')))
 LEVEL_CALIBRATION = {}
 ANCHOR_BAND = (300.0, 3000.0)
+# Close-mic front-stage captures, driver-only with negligible room path.
+# Optional: when both sides are present they let an already-flagged null be
+# confirmed (or left unconfirmed) against how it looks right at the driver,
+# not only at the seat. See DEFECT 4a in CHANGELOG.md.
+NEARFIELD_L_NAMES = ('Front L Nearfield', 'Front Left Nearfield')
+NEARFIELD_R_NAMES = ('Front R Nearfield', 'Front Right Nearfield')
 
 # ---- objective weights (tunable; defaults encode the reviewed priorities) --
 W = {
@@ -136,7 +143,10 @@ W = {
 }
 BALANCE_RMS_SHARE = 0.65
 BALANCE_ABS_SHARE = 0.35
-SOFT_CAP_DB = 3.0        # cascade boost above this starts costing
+SOFT_CAP_DB = 3.0        # cascade boost above this starts costing (soft, tiebreaker only)
+HEADROOM_REQUIRED_MARGIN_DB = 1.5  # hard floor: dB below 0 dBFS a channel's real peak must clear
+HEADROOM_VIOLATION_PENALTY = 1000.0  # same scale as the other hard guardrails below
+NEARFIELD_SKIRT_PENALTY = 1000.0  # positive gain whose -3dB skirt overlaps a confirmed null
 VOCAL_BAND = (200.0, 6000.0)
 VOCAL_WEIGHT = 1.8
 COMPLEX_VALIDATION_RMS_DB = 2.5
@@ -365,6 +375,7 @@ _POSITION_COMPLEX_MODELS = {}
 _PREDICTION_AUDIT = {}
 _SYNTHETIC_PAIRS = set()
 _MASK_AUDIT = {}
+_NEARFIELD_GUARD_MASK = None
 
 
 def _attrs(t):
@@ -569,7 +580,7 @@ def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
     global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
     global _BASE_OUTPUT_DB, _TRACE_META, _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT
-    global _SYNTHETIC_PAIRS, _MASK_AUDIT
+    global _SYNTHETIC_PAIRS, _MASK_AUDIT, _NEARFIELD_GUARD_MASK
     if _F is not None:
         return
     raw = {}
@@ -668,6 +679,34 @@ def _init():
         band=(max(20.0, float(F[0])), 250.0),
     )
     _NULL_MASK |= modal['mask']
+
+    # DEFECT 4a: confirm already-flagged nulls with close-mic nearfield
+    # captures, when both sides were measured. Optional - graceful no-op
+    # when the files aren't present, same as the position traces above.
+    nl_path = _resolve_txt(NEARFIELD_L_NAMES, 'FL Nearfield', required=False)
+    nr_path = _resolve_txt(NEARFIELD_R_NAMES, 'FR Nearfield', required=False)
+    if nl_path is not None and nr_path is not None:
+        nl_trace = _load_txt_rich(nl_path)
+        nr_trace = _load_txt_rich(nr_path)
+        nl_spl = np.interp(log_f, np.log10(nl_trace['freq']), nl_trace['spl'])
+        nr_spl = np.interp(log_f, np.log10(nr_trace['freq']), nr_trace['spl'])
+        a = 10.0 ** (nl_spl / 10.0)
+        b = 10.0 ** (nr_spl / 10.0)
+        nearfield_sum = 10.0 * np.log10(np.maximum(a + b, 1e-30))
+        nearfield = nearfield_null_evidence(
+            F, _T['System Sum'], nearfield_sum, _NULL_MASK, band=INBAND,
+        )
+        _NULL_MASK |= nearfield['confirmed_mask']
+        _NEARFIELD_GUARD_MASK = nearfield['guard_mask']
+        nearfield_audit = {
+            'state': nearfield['state'],
+            'regions': nearfield['regions'],
+            'files': [str(nl_path), str(nr_path)],
+        }
+    else:
+        _NEARFIELD_GUARD_MASK = np.zeros_like(F, dtype=bool)
+        nearfield_audit = {'state': 'unavailable', 'reason': 'nearfield_captures_missing'}
+
     _MASK_AUDIT = {
         'pairs': pair_audit,
         'modal': {
@@ -675,6 +714,7 @@ def _init():
             'confidence': modal['confidence'],
             'regions': modal['regions'],
         },
+        'nearfield': nearfield_audit,
         'blocking_pairs': [
             name for name, item in pair_audit.items() if item['state'] == MASK_UNKNOWN
         ],
@@ -1281,6 +1321,18 @@ def objective(band_sets, output_trim_override=None):
     inb = (_F >= INBAND[0]) & (_F <= INBAND[1])
     keep = inb & ~_NULL_MASK  # nulls MASKED OUT of tonal error + worst-case
 
+    # Plain (unweighted) target-relative RMS reported both ways so a masked
+    # win can never hide an unmasked loss behind one number - a candidate can
+    # improve the null-excluded score while its filter skirts spill enough
+    # unrequested boost outside the mask to worsen the null-included one.
+    system_error = pr['System Sum'] - _TGT
+    target_rms_null_excluded_db = (
+        float(np.sqrt(np.mean(system_error[keep] ** 2))) if np.any(keep) else 0.0
+    )
+    target_rms_null_included_db = (
+        float(np.sqrt(np.mean(system_error[inb] ** 2))) if np.any(inb) else 0.0
+    )
+
     tonal_parts = _spatial_components(pr, band_sets, keep, trim_plan)
     tonal = tonal_parts['spatial_tonal_db']
     peak = tonal_parts['spatial_peak_db']
@@ -1294,21 +1346,89 @@ def objective(band_sets, output_trim_override=None):
         balances[name] = balance_components(_F, diff, balance_band)
 
     # Headroom plus any newly-added correction landing in a masked null.
+    #
+    # head_peak/SOFT_CAP_DB below is a SOFT tiebreaker only - it must never be
+    # the only thing standing between a candidate and a real clipping risk.
+    # headroom_margin_db is the hard feasibility gate: real per-channel peak
+    # output (cascade + existing baseline trim + any protective trim), signed
+    # so positive = dB of headroom remaining below 0 dBFS, negative = already
+    # over. A channel is only flagged when the CANDIDATE ITSELF raises that
+    # channel's real peak above the baseline tune's own peak (never for a
+    # pre-existing tight baseline the candidate leaves untouched or improves -
+    # a no-op/baseline-preserving candidate must always stay selectable), and
+    # even then only when the resulting margin is below
+    # HEADROOM_REQUIRED_MARGIN_DB, or the baseline channel was already
+    # clip-risky (any further increase there is disallowed regardless of the
+    # 1.5 dB number). Flagged candidates are rejected via the same
+    # huge-penalty guardrail convention as the other hard rules below - never
+    # a tradeable cost. (bug: a run once paid +1.598 on the old SOFT term to
+    # buy a 0.026/7.5 objective "win" on a channel already clip-risky - see
+    # CHANGELOG.md.)
     head_peak = 0.0
     null_boost = 0.0
+    headroom_violations = 0
+    headroom_margin_db = {}
     for i in range(len(CH_KEYS)):
-        b = _casc(band_sets[i]) + float(trim_plan.get(i, 0.0))
+        trim_i = float(trim_plan.get(i, 0.0))
+        candidate_cascade = _casc(band_sets[i])
+        b = candidate_cascade + trim_i
         head_peak = max(head_peak, float(np.max(b)))
+        baseline_peak_db = float(np.max(_BASE_CASCADES[i])) + float(_BASE_OUTPUT_DB[i])
+        candidate_peak_db = float(np.max(candidate_cascade)) + float(_BASE_OUTPUT_DB[i]) + trim_i
+        margin_db = -candidate_peak_db
+        headroom_margin_db[CH_KEYS[i]] = round(margin_db, 3)
+        baseline_clip_risk = baseline_peak_db > 0.0
+        candidate_makes_it_worse = candidate_peak_db > baseline_peak_db + 1e-9
+        channel_unsafe = candidate_makes_it_worse and (
+            margin_db < HEADROOM_REQUIRED_MARGIN_DB or baseline_clip_risk
+        )
+        if channel_unsafe:
+            headroom_violations += 1
         delta = _delta_channel(i, band_sets)
         null_boost += float(np.sum(np.abs(delta[_NULL_MASK]))) / max(np.sum(_NULL_MASK), 1)
+    headroom_guardrail_penalty = HEADROOM_VIOLATION_PENALTY * headroom_violations
+
+    # DEFECT 4a: a positive-gain band is rejected outright - not merely
+    # discouraged via null_boost above - when its own -3dB-down skirt still
+    # reaches into a null the nearfield captures confirmed is a room/summation
+    # artifact (see nearfield_null_evidence in _tunefit.py). Only newly added
+    # or edited bands are checked; an untouched baseline band already in that
+    # spot is left alone. Same huge-penalty guardrail convention as headroom.
+    nearfield_skirt_violations = 0
+    if _NEARFIELD_GUARD_MASK is not None and np.any(_NEARFIELD_GUARD_MASK):
+        for i, bands in _added_bands_by_channel(band_sets).items():
+            for f, q, g in bands:
+                if g <= 0.0:
+                    continue
+                skirt = peaking_db(_F, f, q, g) >= (g - 3.0)
+                if np.any(skirt & _NEARFIELD_GUARD_MASK):
+                    nearfield_skirt_violations += 1
+    nearfield_skirt_penalty = NEARFIELD_SKIRT_PENALTY * nearfield_skirt_violations
 
     n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
     guard = _guardrail_score(band_sets, pr)
 
+    # spatial_worst_db only carries independent evidence when there is more
+    # than one measured position: at 1 position it is a max-abs-deviation
+    # statistic of the SAME trace the tonal term already scores, so applying
+    # W['worst'] there double-counts one improvement as two score components.
+    # (bug: a candidate with a 0.026/7.5 objective "win" that was entirely
+    # this duplicate shipped as a false 0.4% improvement - see CHANGELOG.md.)
+    position_count = tonal_parts['spatial_position_count']
+    worst_weight = W['worst'] if position_count >= 2 else 0.0
+
     comp = {
         **tonal_parts,
         'worst_masked': worst,
+        'active_weights': {**W, 'worst': worst_weight},
+        'target_rms_null_excluded_db': target_rms_null_excluded_db,
+        'target_rms_null_included_db': target_rms_null_included_db,
         'headroom_peak': head_peak,
+        'headroom_margin_db': headroom_margin_db,
+        'headroom_violation_count': headroom_violations,
+        'headroom_guardrail_penalty': float(headroom_guardrail_penalty),
+        'nearfield_skirt_violation_count': nearfield_skirt_violations,
+        'nearfield_skirt_guardrail_penalty': float(nearfield_skirt_penalty),
         'null_boost_avg': null_boost,
         'n_front_bands': n_bands,
         'protective_output_trim_db': max(0.0, -min(trim_plan.values())) if trim_plan else 0.0,
@@ -1346,13 +1466,15 @@ def objective(band_sets, output_trim_override=None):
               + W['peak'] * peak
               + W['narrow_peak'] * narrow_peak
               + balance_term
-              + W['worst'] * worst
+              + worst_weight * worst
               + W['headroom'] * max(0.0, head_peak - SOFT_CAP_DB)
               + W['output_gain'] * comp['output_level_gain_db']
               + W['null_boost'] * null_boost
               + W['parsimony'] * n_bands
               + W['spatial_fragility'] * tonal_parts['spatial_fragility_penalty']
-              + guard['guardrail_penalty'])
+              + guard['guardrail_penalty']
+              + headroom_guardrail_penalty
+              + nearfield_skirt_penalty)
     comp.update(guard)
     comp['balance_penalty_db'] = float(
         np.sqrt(np.mean([_balance_mismatch(item) ** 2 for item in balances.values()]))

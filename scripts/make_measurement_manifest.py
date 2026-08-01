@@ -17,6 +17,11 @@ LOW_PAIR = ("Mid Bass Together.txt", "Both Midbass.txt", "Both Midbasses.txt", "
 SUB = ("Sub.txt", "SUB.txt", "Subwoofer.txt")
 SYSTEM = ("System Sum.txt", "SYSTEM SUM.txt")
 HIGH_PAIR = ("Tweeters Together.txt", "Both Tweeters.txt")
+# Close-mic captures, driver-only with negligible room path length. Optional:
+# when present, they let a cancellation be classified against how it looks
+# right at the driver, not only at the seat - see DEFECT 4a in CHANGELOG.md.
+NEARFIELD_L = ("Front L Nearfield.txt", "Front Left Nearfield.txt")
+NEARFIELD_R = ("Front R Nearfield.txt", "Front Right Nearfield.txt")
 POSITION_PREFIXES = {
     "left": ("Left Ear ", "Left "),
     "right": ("Right Ear ", "Right "),
@@ -25,6 +30,7 @@ ALL_MEASUREMENT_ROLES = (
     "System Sum", "Sub", "FL High", "FR High", "Tweeters Together",
     "FL Mid", "FR Mid", "Mids Together",
     "FL Low", "FR Low", "Mid Bass Together",
+    "FL Nearfield", "FR Nearfield",
 )
 
 
@@ -139,6 +145,8 @@ def measurement_spec(layout: str) -> dict[str, tuple[str, ...]]:
         "FL High": HIGH_L,
         "FR High": HIGH_R,
         "Tweeters Together": HIGH_PAIR,
+        "FL Nearfield": NEARFIELD_L,
+        "FR Nearfield": NEARFIELD_R,
     }
     if layout == "front_3way_plus_sub":
         spec.update({
@@ -159,7 +167,7 @@ def measurement_spec(layout: str) -> dict[str, tuple[str, ...]]:
 
 
 def optional_pair_roles(layout: str) -> set[str]:
-    roles = {"Tweeters Together", "Mid Bass Together"}
+    roles = {"Tweeters Together", "Mid Bass Together", "FL Nearfield", "FR Nearfield"}
     if layout == "front_3way_plus_sub":
         roles.add("Mids Together")
     return roles

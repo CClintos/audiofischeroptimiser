@@ -129,6 +129,8 @@ def _component_table(baseline: dict[str, Any], best: dict[str, Any]) -> str:
         ("protective_output_trim_db", "Protective front output trim"),
         ("spatial_worst_db", "Worst-position error"),
         ("guardrail_penalty", "Guardrail penalty"),
+        ("target_rms_null_excluded_db", "Target RMS, nulls excluded (decision metric)"),
+        ("target_rms_null_included_db", "Target RMS, nulls included"),
     )
     rows = []
     for key, label in labels:
@@ -563,6 +565,7 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     positions = ["centre", *[str(item) for item in sessions.get("spatial_positions") or []]]
     validation = (summary.get("gates") or {}).get("pair_validation") or []
     noise_guard = (summary.get("gates") or {}).get("measurement_noise_guard") or {}
+    active_weights = summary.get("active_weights") or {}
     search_audit = summary.get("search") or {}
     warnings = _warning_items(summary, mode)
     filters = _best_filters(summary, summary_path.parent / "optimizer_report.md")
@@ -582,6 +585,12 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         ("Output candidate", candidate),
         ("Target", target),
         ("Measurements", f"{len(positions)} position(s): {', '.join(positions)}"),
+        (
+            "Worst-position weight",
+            f"{active_weights.get('worst', 0.0):.2f} (active - {len(positions)} positions)"
+            if active_weights.get("worst") else
+            f"0.00 (single position - would double-count the tonal term, see CHANGELOG.md)",
+        ),
         ("Candidates retained", str(summary.get("candidate_count", 0))),
         ("Baseline objective", _fmt(baseline.get("objective"), 4)),
         ("Best objective", _fmt(best.get("objective"), 4)),

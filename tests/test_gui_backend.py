@@ -286,13 +286,13 @@ class GuiJobTests(unittest.TestCase):
         self.assertEqual(manifest["measurements_missing"], [])
         self.assertEqual(
             set(manifest["optional_missing_roles"]),
-            {"Tweeters Together", "Mid Bass Together"},
+            {"Tweeters Together", "Mid Bass Together", "FL Nearfield", "FR Nearfield"},
         )
         self.assertFalse(manifest["pair_measurements_complete"])
         self.assertIn("optional_pair_measurements_missing:", " ".join(manifest["warnings"]))
         optional_rows = [row for row in checklist["rows"] if not row["required"]]
         self.assertEqual({row["role"] for row in optional_rows}, {
-            "Tweeters Together", "Mid Bass Together",
+            "Tweeters Together", "Mid Bass Together", "FL Nearfield", "FR Nearfield",
         })
 
     def test_independent_objective_consumes_role_map(self) -> None:

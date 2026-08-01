@@ -136,13 +136,26 @@ def interference_masks(freqs, traces):
     return masks, pair_states
 
 
-def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, source, profile):
+def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, source, profile,
+                     forced_targets=None):
+    """forced_targets: optional {grid_index: (existing_F, existing_Q, existing_G)}
+    - existing baseline bands on this group's own channels whose own
+    frequency is always evaluated as a candidate edit/removal target, not
+    only organically-detected local maxima of `strength`. Without this, the
+    search could only ever append a new band into a free slot; it could
+    never modify or retire one of its own earlier picks (DEFECT 1 - see
+    CHANGELOG.md). A forced target that clears the same bars as any other
+    candidate becomes a normal proposal; groups_to_band_sets()/
+    _resolve_group_bands() then recognise it as an edit purely by frequency
+    proximity to the existing band, and score/write it identically to an
+    appended one."""
     strength = np.asarray(strength, dtype=float).copy()
     desired_gain = np.asarray(desired_gain, dtype=float)
     strength[(freqs < lo) | (freqs > hi)] = 0.0
     strength[~np.isfinite(strength)] = 0.0
     strength[np.abs(desired_gain) < 0.25] = 0.0
     strength = opt.erb_smooth(freqs, strength)
+    forced_targets = forced_targets or {}
 
     thresh = 0.35 if profile == "explore" else 0.60
     idxs = []
@@ -153,11 +166,34 @@ def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, 
             idxs.append(i)
     idxs.sort(key=lambda i: -strength[i])
 
-    chosen = []
-    for i in idxs:
+    def min_sep_for(i):
         strong = strength[i] >= max(2.5, thresh * 4.0)
-        min_sep_oct = 1 / 12 if strong else 1 / 5
-        if all(abs(math.log2(freqs[i] / freqs[j])) >= min_sep_oct for j in chosen):
+        return 1 / 12 if strong else 1 / 5
+
+    chosen = []
+    # An existing band's own frequency is judged by whether it still carries
+    # useful residual signal, not by whether it happens to be THE local
+    # maximum of the residual-error surface - so it is checked against a
+    # real (lower) floor rather than the strict peak-detection loop above.
+    # It is also given first pick of the min-separation slot its region
+    # would occupy: without this, a fresh, purely-organic point a fraction
+    # of an octave away can register marginally higher smoothed strength
+    # purely by chance and win that slot instead, so the search proposes a
+    # redundant new band next to an existing one it could have edited
+    # instead - defeating the point of DEFECT 1's fix (see CHANGELOG.md).
+    forced_floor = max(0.05, thresh * 0.25)
+    forced_order = sorted(
+        (i for i, _t in forced_targets.items() if 0 <= i < len(freqs) and strength[i] >= forced_floor),
+        key=lambda i: -strength[i],
+    )
+    for i in forced_order:
+        if all(abs(math.log2(freqs[i] / freqs[j])) >= min_sep_for(i) for j in chosen):
+            chosen.append(i)
+
+    for i in idxs:
+        if i in chosen:
+            continue
+        if all(abs(math.log2(freqs[i] / freqs[j])) >= min_sep_for(i) for j in chosen):
             chosen.append(i)
         if len(chosen) >= 18:
             break
@@ -176,11 +212,28 @@ def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, 
             width_oct = max(width_oct, 1 / 6)
         q_hint = q_from_oct_width(width_oct, q_range)
         gain_hint = float(np.clip(desired_gain[i], gain_range[0], gain_range[1]))
+        target = forced_targets.get(i)
         band = opt.rounded_band(float(freqs[i]), q_hint, gain_hint)
         if band is None:
+            if target is None:
+                continue
+            # The data-supported setting for this existing band is now
+            # effectively "off" (too small to round to a real filter) -
+            # propose retiring it instead of silently dropping the finding.
+            existing_f, existing_q, _existing_g = target
+            candidates.append({
+                "F": float(existing_f),
+                "Q": float(existing_q),
+                "G": 0.0,
+                "strength": float(strength[i]),
+                "width_oct": float(width_oct),
+                "branch_share": 0.0,
+                "source": source + "_remove",
+                "edit_target": tuple(float(v) for v in target),
+            })
             continue
         rounded_f, rounded_q, rounded_gain = band
-        candidates.append({
+        entry = {
             "F": float(rounded_f),
             "Q": float(rounded_q),
             "G": float(rounded_gain),
@@ -188,11 +241,41 @@ def candidate_peaks(freqs, strength, desired_gain, lo, hi, q_range, gain_range, 
             "width_oct": float(width_oct),
             "branch_share": 0.0,
             "source": source,
-        })
+        }
+        if target is not None:
+            entry["source"] = source + "_edit"
+            entry["edit_target"] = tuple(float(v) for v in target)
+        candidates.append(entry)
     return candidates
 
 
-def find_guided_candidates(freqs, traces, target, profile: str):
+def _group_existing_targets(cfg, freqs):
+    """Existing baseline bands on this group's own channels, each mapped to
+    its nearest frequency-grid index, for candidate_peaks' forced_targets -
+    what lets the search find edit/removal opportunities on bands it (or a
+    previous run) already placed, not only brand-new ones. Bands shared
+    across a symmetric group's channels (e.g. front_voicing writes the same
+    band to every front output) collapse to one target, since they are one
+    logical filter, not several."""
+    try:
+        baseline = opt.baseline_band_sets()
+    except Exception:
+        # Existing-band evidence is an enhancement, not a requirement - fall
+        # back to append-only candidate generation for this pass rather than
+        # failing the whole search over it.
+        return {}
+    log_freqs = np.log10(freqs)
+    targets = {}
+    for channel in cfg["channels"]:
+        if channel >= len(baseline):
+            continue
+        for f, q, g in baseline[channel]:
+            index = int(np.argmin(np.abs(log_freqs - math.log10(float(f)))))
+            targets.setdefault(index, (float(f), float(q), float(g)))
+    return targets
+
+
+def find_guided_candidates(freqs, traces, target, profile: str, persistence_sessions=None):
     """Find data-derived candidate PEQ centers before random search.
 
     Candidate centers come from two math-derived needs:
@@ -201,9 +284,31 @@ def find_guided_candidates(freqs, traces, target, profile: str):
       - L/R solo imbalance for the per-side front groups.
     Destructive-summing zones from the together-vs-solo audit are masked from
     tonal candidate generation so PEQ is not asked to fix phase.
+
+    DEFECT 6: when `persistence_sessions` is supplied (extra REW folders'
+    System Sum traces, from opt.load_persistence_sessions), a tonal
+    candidate's target deviation must hold sign and clear the noise floor in
+    every one of them too, not just this primary session - a single MMM
+    session cannot tell a real deviation from run-to-run capture noise.
+    Deliberately opt-in: with no extra sessions this is a complete no-op, so
+    every existing single-session run behaves exactly as before.
+
+    Each session is re-anchored to `target` with its own broadband median
+    offset before comparison (same convention `target` itself was anchored
+    to this primary session's own level with, in the caller). Two REW
+    sessions captured on different days/mic positions rarely share the same
+    absolute source volume or mic gain; without this, a broadband level
+    difference between sessions could flip a real deviation's sign or hide
+    it below the noise floor for reasons that have nothing to do with
+    whether the *shape* of the deviation actually repeats.
     """
     raw_system_dev = traces["System Sum"] - target
     system_dev = opt.erb_smooth(freqs, raw_system_dev)
+    session_devs = []
+    for session in (persistence_sessions or []):
+        session_system_sum = session["system_sum"]
+        anchor = opt.target_anchor_offset(freqs, session_system_sum, target)
+        session_devs.append(opt.erb_smooth(freqs, session_system_sum - anchor - target))
     global LAST_PROPOSAL_AUDIT
     suppressions = []
     masks, pair_states = interference_masks(freqs, traces)
@@ -249,8 +354,10 @@ def find_guided_candidates(freqs, traces, target, profile: str):
             tonal_source = "tonal"
         tonal_strength[masks.get(group, False)] = 0.0
         tonal_strength[~active_driver] = 0.0
+        existing_targets = _group_existing_targets(cfg, freqs)
         tonal_candidates = candidate_peaks(
-            freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, tonal_source, profile
+            freqs, tonal_strength, tonal_gain, lo, hi, q_range, gain_range, tonal_source, profile,
+            forced_targets=existing_targets,
         )
         guarded_tonal = []
         for candidate in tonal_candidates:
@@ -284,6 +391,24 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                     "required_deviation_db": required,
                 })
                 continue
+            if session_devs:
+                session_values = [
+                    float(np.interp(np.log10(center), np.log10(freqs), dev))
+                    for dev in session_devs
+                ]
+                persistence = opt.cross_session_persistence(
+                    [target_deviation] + session_values, floor,
+                )
+                if not persistence["eligible"]:
+                    suppressions.append({
+                        "group": group,
+                        "frequency_hz": center,
+                        "reason": "cross_session_" + persistence["reason"],
+                        "session_count": persistence["session_count"],
+                        "deviation_db": target_deviation,
+                    })
+                    continue
+                candidate["persistence_session_count"] = persistence["session_count"]
             if cfg.get("pair") and cfg.get("side") and candidate["G"] < 0.0:
                 pair = opt.PAIR_DEFS[cfg["pair"]]
                 diff = opt.erb_smooth(
@@ -460,6 +585,14 @@ def find_guided_candidates(freqs, traces, target, profile: str):
                 "gain_db": float(item["G"]),
                 "source": str(item["source"]),
                 "recoverable_error": float(item["strength"]),
+                # DEFECT 6: how many sessions (this one plus any supplied via
+                # --persistence-sessions) actually back this band, so the
+                # report can name the evidence per band rather than assert
+                # it. Absent when no extra sessions were supplied.
+                **(
+                    {"persistence_session_count": item["persistence_session_count"]}
+                    if "persistence_session_count" in item else {}
+                ),
             }
             for group, items in pools.items() for item in items
         ),
@@ -1208,6 +1341,11 @@ def main():
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--repeatability-folder", type=Path, default=None,
                         help="Second same-day session used to derive the measurement floor.")
+    parser.add_argument("--persistence-sessions", type=Path, nargs="+", default=None,
+                        help="Extra REW session folders (each needs a System Sum export). A tonal "
+                             "candidate is only proposed if its deviation holds sign and clears the "
+                             "noise floor in this primary session AND every one of these. Opt-in: "
+                             "omitted, the search behaves exactly as a single-session run.")
     parser.add_argument("--phase-writes", choices=("auto", "off"), default="auto",
                         help="Use 'off' to report the crossover ladder without writing polarity/delay/APF changes.")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
@@ -1253,7 +1391,12 @@ def main():
         args.proposal = "beam"
         guided_pools = {group: [] for group in opt.GROUPS}
     else:
-        guided_pools = find_guided_candidates(freqs, traces, target, args.profile)
+        persistence_sessions = opt.load_persistence_sessions(
+            args.persistence_sessions or [], freqs,
+        )
+        guided_pools = find_guided_candidates(
+            freqs, traces, target, args.profile, persistence_sessions=persistence_sessions,
+        )
     args.proposal_audit = dict(LAST_PROPOSAL_AUDIT)
     (args.out / "problem_census.json").parent.mkdir(parents=True, exist_ok=True)
     (args.out / "problem_census.json").write_text(

@@ -36,6 +36,28 @@ def unique_best(items, keep):
     return out
 
 
+def census_found_nothing_eligible(proposal_audits: list) -> bool:
+    """DEFECT 4b: the pre-search census ("worth fixing" / "deliberately
+    skipped") was computed and reported but never gated the run's actual
+    output - a candidate could still be selected and written even when the
+    census said nothing was eligible. True here means every worker that
+    reported a census found zero eligible correction centres, and no
+    candidate but the baseline may be selected. See CHANGELOG.md."""
+    if not proposal_audits:
+        return False
+    first_worth_fixing = dict(proposal_audits[0]).get("problem_census", {}).get("worth_fixing", [])
+    return not first_worth_fixing
+
+
+def apply_census_gate(items, gate_active: bool):
+    """When census_found_nothing_eligible() is True, only the "baseline"
+    entry in `items` (always present - see main()) may survive, regardless
+    of what any individual worker's search still explored."""
+    if not gate_active:
+        return items
+    return [item for item in items if item[3] == "baseline"]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge streaming optimizer worker outputs.")
     parser.add_argument("root", type=Path, help="Folder containing worker_* folders.")
@@ -87,6 +109,7 @@ def main():
         for payload in worker_state_payloads if payload.get("proposal_audit")
     ]
     args.proposal_audit = proposal_audits[0] if proposal_audits else {}
+    args.census_found_nothing_eligible = census_found_nothing_eligible(proposal_audits)
     convergence_rows = [
         dict(payload.get("convergence", {}))
         for payload in worker_state_payloads if payload.get("convergence")
@@ -149,6 +172,7 @@ def main():
         baseline_groups,
         "baseline",
     ))
+    items = apply_census_gate(items, args.census_found_nothing_eligible)
 
     rescored_items = []
     phase_peq_rejections = []
@@ -240,6 +264,13 @@ def main():
         sub_blend_recommendation=sub_blend,
         trials=sum(json.loads((w / "stream_state.json").read_text(encoding="utf-8")).get("completed_trials", 0)
                    for w in worker_dirs if (w / "stream_state.json").exists()),
+        # Previously never reached write_report()'s assistant_summary at all
+        # (this Namespace is built fresh and did not carry it forward from
+        # `args`) - the merged report's problem_census was silently always
+        # empty regardless of what workers actually found. Fixed alongside
+        # the DEFECT 4b hard gate above; see CHANGELOG.md.
+        proposal_audit=args.proposal_audit,
+        census_found_nothing_eligible=args.census_found_nothing_eligible,
     )
     opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns,
                      family_rows=family_rows, crossover_rows=crossover_rows, phase_plan=phase_plan)

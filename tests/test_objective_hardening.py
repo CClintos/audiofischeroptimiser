@@ -11,6 +11,7 @@ import numpy as np
 import _tunefit as public_tunefit
 import _optimizer as optimizer
 import _optimizer_stream as optimizer_stream
+from _make_v3 import at as afpx_attr
 from objective_module import _tunefit as canonical_tunefit
 from objective_module import afpx_objective as objective
 from objective_module.session import ScorerSession
@@ -234,6 +235,67 @@ class MaskIntegrityTests(unittest.TestCase):
         self.assertEqual(stable["state"], canonical_tunefit.MASK_CLEAR)
         self.assertEqual(single["state"], canonical_tunefit.MASK_DETECTED)
         self.assertEqual(single["confidence"], "low")
+
+    def test_nearfield_confirms_room_only_null_but_not_driver_null(self) -> None:
+        """DEFECT 4a: a dip that is deep at the seat but nearly gone right at
+        the driver (negligible room path) is a room/summation artifact, not a
+        driver problem - confirm it and hand back a -3dB skirt guard band. A
+        dip that persists close to the driver is left unconfirmed, and bins
+        outside the already-flagged null are never touched either way."""
+        freqs = np.geomspace(20.0, 500.0, 1024)
+
+        def dip(center: float, depth: float) -> np.ndarray:
+            return -depth * np.exp(-0.5 * (np.log2(freqs / center) / 0.03) ** 2)
+
+        at_seat = 70.0 + dip(150.0, 16.0)
+        null_mask = np.abs(np.log2(freqs / 150.0)) <= 1 / 12
+
+        room_only = canonical_tunefit.nearfield_null_evidence(
+            freqs, at_seat, 70.0 + dip(150.0, 1.0), null_mask,
+        )
+        self.assertEqual(room_only["state"], canonical_tunefit.MASK_DETECTED)
+        self.assertTrue(np.any(room_only["confirmed_mask"]))
+        self.assertTrue(np.any(room_only["guard_mask"]))
+        self.assertEqual(len(room_only["regions"]), 1)
+        self.assertLess(room_only["regions"][0]["depth_ratio"], 0.5)
+
+        driver_issue = canonical_tunefit.nearfield_null_evidence(
+            freqs, at_seat, 70.0 + dip(150.0, 14.0), null_mask,
+        )
+        self.assertEqual(driver_issue["state"], canonical_tunefit.MASK_CLEAR)
+        self.assertFalse(np.any(driver_issue["confirmed_mask"]))
+        self.assertFalse(np.any(driver_issue["guard_mask"]))
+
+        far_from_null = np.abs(np.log2(freqs / 400.0)) <= 1 / 12
+        unrelated = canonical_tunefit.nearfield_null_evidence(
+            freqs, at_seat, 70.0 + dip(150.0, 1.0), far_from_null,
+        )
+        self.assertEqual(unrelated["state"], canonical_tunefit.MASK_CLEAR)
+
+    def test_cross_session_persistence_requires_unanimous_sign_and_floor(self) -> None:
+        """DEFECT 6: a single MMM session can't tell a real deviation from
+        run-to-run noise. Eligible only when every supplied session agrees
+        in sign and every one individually clears the noise floor."""
+        agree = canonical_tunefit.cross_session_persistence([2.0, 1.8, 2.3], 0.2)
+        self.assertTrue(agree["eligible"])
+        self.assertEqual(agree["reason"], "persistent_across_sessions")
+        self.assertEqual(agree["session_count"], 3)
+
+        disagree = canonical_tunefit.cross_session_persistence([2.0, -1.8, 2.3], 0.2)
+        self.assertFalse(disagree["eligible"])
+        self.assertEqual(disagree["reason"], "sign_disagreement_across_sessions")
+
+        # One weak session sets the bar, even though the others are strong.
+        weak = canonical_tunefit.cross_session_persistence([2.0, 0.1, 2.3], 0.2)
+        self.assertFalse(weak["eligible"])
+        self.assertEqual(weak["reason"], "below_measurement_noise_threshold")
+
+        # A session missing coverage is excluded, not counted as a value -
+        # only 1 real vote remains, which is not enough on its own.
+        one_only = canonical_tunefit.cross_session_persistence([2.0, None], 0.2)
+        self.assertFalse(one_only["eligible"])
+        self.assertEqual(one_only["reason"], "insufficient_session_coverage")
+        self.assertEqual(one_only["session_count"], 1)
 
     def _balance_pools(self, freqs: np.ndarray, difference: np.ndarray,
                        system_deviation: float = 1.0) -> dict[str, list[dict[str, object]]]:
@@ -565,6 +627,191 @@ class CanonicalDspTests(unittest.TestCase):
         self.assertIs(public_tunefit.allpass_fil_str, canonical_tunefit.allpass_fil_str)
         xml = public_tunefit.allpass_fil_str(174.0, 8.0, FN="20")
         self.assertIn('Q="8.0"', xml)
+
+
+class BandEditAndRemovalTests(unittest.TestCase):
+    """DEFECT 1: the search could previously only append new bands into free
+    slots, never modify or remove one of its own earlier picks - the four
+    genuine fixes available in the audited dataset (recentre a mid filter,
+    deepen a sub cut, adjust a tweeter band, retire a now-unneeded one) were
+    all edits, so all four were structurally unreachable. See CHANGELOG.md."""
+
+    def _group(self):
+        # Use whatever the real GROUPS config resolves to in this environment
+        # (matches existing tests' convention), just need one group mapped to
+        # channel 0 with a Q/gain range wide enough for the test values below.
+        return next(
+            name for name, spec in optimizer.GROUPS.items() if 0 in spec["channels"]
+        )
+
+    def test_resolve_group_bands_appends_edits_and_removes(self) -> None:
+        baseline = [
+            [(1000.0, 1.5, -2.0), (5000.0, 2.0, 1.5)], [], [], [], [], [], [], [],
+        ]
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            group = self._group()
+            # An untouched frequency appends, exactly as before this change.
+            band_sets, actions = optimizer._resolve_group_bands(
+                {group: [(2000.0, 1.0, -3.0)]}
+            )
+            self.assertIn((2000.0, 1.0, -3.0), band_sets[0])
+            self.assertIn((1000.0, 1.5, -2.0), band_sets[0])  # baseline band untouched
+            self.assertEqual(actions[0], [("append", None, (2000.0, 1.0, -3.0))])
+
+            # A proposal close in frequency to an existing band edits it in
+            # place - same channel ends with the SAME NUMBER of bands.
+            band_sets, actions = optimizer._resolve_group_bands(
+                {group: [(1000.0, 1.2, -3.4)]}
+            )
+            self.assertEqual(len(band_sets[0]), 2)
+            self.assertIn((1000.0, 1.2, -3.4), band_sets[0])
+            self.assertNotIn((1000.0, 1.5, -2.0), band_sets[0])
+            self.assertEqual(
+                actions[0], [("edit", (1000.0, 1.5, -2.0), (1000.0, 1.2, -3.4))],
+            )
+
+            # A removal sentinel (gain exactly 0.0) deletes the matched band.
+            band_sets, actions = optimizer._resolve_group_bands(
+                {group: [(5000.0, 2.0, 0.0)]}
+            )
+            self.assertEqual(len(band_sets[0]), 1)
+            self.assertNotIn((5000.0, 2.0, 1.5), band_sets[0])
+            self.assertEqual(
+                actions[0], [("remove", (5000.0, 2.0, 1.5), None)],
+            )
+
+            # A removal with nothing to match is a no-op, not an error.
+            band_sets, actions = optimizer._resolve_group_bands(
+                {group: [(9000.0, 2.0, 0.0)]}
+            )
+            self.assertEqual(len(band_sets[0]), 2)
+            self.assertEqual(actions[0], [])
+
+    def test_close_together_new_bands_in_one_group_never_chain_onto_each_other(
+        self,
+    ) -> None:
+        """Regression: against the real v9 baseline, a single group's guided
+        pool proposed three brand-new bands within EDIT_MATCH_TOLERANCE_OCT
+        of each other (448.0, 451.4, 452.5 Hz - none close to any real
+        baseline band). The second and third were wrongly resolved as
+        "edits" of the first proposal's own in-memory tuple, which has no
+        XML slot yet - write_candidate/apply_band_actions only materializes
+        appends after every edit/remove in the channel has already run, so
+        that edit could never find its target and crashed the whole write.
+        Each must resolve as its own independent append. See CHANGELOG.md."""
+        baseline = [[], [], [], [], [], [], [], []]
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            group = self._group()
+            close_bands = [(448.0, 2.0, 2.0), (451.4, 1.53, 3.0), (452.5, 2.0, 2.5)]
+            band_sets, actions = optimizer._resolve_group_bands({group: close_bands})
+        self.assertEqual(len(band_sets[0]), 3)
+        for band in close_bands:
+            self.assertIn(band, band_sets[0])
+        self.assertEqual(
+            actions[0],
+            [("append", None, band) for band in close_bands],
+        )
+
+    def test_write_candidate_appends_close_together_new_bands_without_crashing(
+        self,
+    ) -> None:
+        """Same regression as above, through the full write path: three free
+        slots must each get one of the three close-together new bands, not
+        an exception from an accidental append->edit chain."""
+        oc = "<OC>" + "".join(
+            f'<Fil T="1" F="{f:.2f}" Q="4.3" G="0" dF="{f:.0f}" FN="{i}"/>'
+            for i, f in enumerate((400.0, 500.0, 600.0, 700.0))
+        ) + "</OC>"
+        base_xml = "<Root>" + "".join(oc if i == 0 else "<OC></OC>" for i in range(8)) + "</Root>"
+        group = "fl_high"  # channels=(0,) only - keeps this test to one channel
+        close_bands = [(448.0, 2.0, 2.0), (451.4, 1.53, 3.0), (452.5, 2.0, 2.5)]
+        with patch.object(
+            optimizer, "baseline_band_sets",
+            return_value=[[], [], [], [], [], [], [], []],
+        ), patch.object(
+            optimizer, "phase_peq_conflicts", return_value=[],
+        ), patch.object(
+            optimizer, "afpx_roundtrip_lint",
+            return_value={"pass": True, "channel_diffs": []},
+        ), patch.object(
+            optimizer, "output_trim_for_groups", return_value={},
+        ), patch.object(
+            optimizer, "apply_phase_writes", side_effect=lambda xml, _plan: xml,
+        ), tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "candidate.afpx"
+            optimizer.write_candidate(base_xml, out_path, {group: close_bands})
+            written = optimizer.decode_afpx(out_path)
+            written_oc = optimizer.re.findall(r"<OC\b.*?</OC>", written, optimizer.re.S)[0]
+            active = [
+                tag for tag in optimizer.re.findall(r'<Fil\b[^>]*/?>', written_oc)
+                if afpx_attr(tag, "T") == "17"
+            ]
+            self.assertEqual(len(active), 3)
+            written_bands = {
+                (float(afpx_attr(tag, "F")), float(afpx_attr(tag, "Q")), float(afpx_attr(tag, "G")))
+                for tag in active
+            }
+            self.assertEqual(written_bands, set(close_bands))
+
+    def test_write_candidate_edits_slot_in_place_not_alongside(self) -> None:
+        oc = (
+            '<OC><Fil T="17" F="1000.00" Q="1.50" G="-2.00" dF="500" FN="5"/>'
+            '<Fil T="1" F="500.00" Q="1.00" G="0" dF="20000" FN="9"/></OC>'
+        )
+        base_xml = "<Root>" + "".join(oc if i == 0 else "<OC></OC>" for i in range(8)) + "</Root>"
+        group = "fl_high"  # channels=(0,) only - keeps this test to one channel
+        with patch.object(
+            optimizer, "baseline_band_sets",
+            return_value=[[(1000.0, 1.5, -2.0)], [], [], [], [], [], [], []],
+        ), patch.object(
+            optimizer, "phase_peq_conflicts", return_value=[],
+        ), patch.object(
+            optimizer, "afpx_roundtrip_lint",
+            return_value={"pass": True, "channel_diffs": []},
+        ), patch.object(
+            optimizer, "output_trim_for_groups", return_value={},
+        ), patch.object(
+            optimizer, "apply_phase_writes", side_effect=lambda xml, _plan: xml,
+        ), tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "candidate.afpx"
+            optimizer.write_candidate(base_xml, out_path, {group: [(1000.0, 1.2, -3.4)]})
+            written = optimizer.decode_afpx(out_path)
+            written_oc = optimizer.re.findall(r"<OC\b.*?</OC>", written, optimizer.re.S)[0]
+            active = [
+                tag for tag in optimizer.re.findall(r'<Fil\b[^>]*/?>', written_oc)
+                if afpx_attr(tag, "T") == "17"
+            ]
+            self.assertEqual(len(active), 1)
+            self.assertEqual(afpx_attr(active[0], "F"), "1000.00")
+            self.assertEqual(afpx_attr(active[0], "G"), "-3.4")
+            self.assertEqual(afpx_attr(active[0], "Q"), "1.2")
+
+    def test_write_candidate_removal_frees_the_slot(self) -> None:
+        oc = '<OC><Fil T="17" F="1000.00" Q="1.50" G="-2.00" dF="500" FN="5"/></OC>'
+        base_xml = "<Root>" + "".join(oc if i == 0 else "<OC></OC>" for i in range(8)) + "</Root>"
+        group = "fl_high"  # channels=(0,) only - keeps this test to one channel
+        with patch.object(
+            optimizer, "baseline_band_sets",
+            return_value=[[(1000.0, 1.5, -2.0)], [], [], [], [], [], [], []],
+        ), patch.object(
+            optimizer, "phase_peq_conflicts", return_value=[],
+        ), patch.object(
+            optimizer, "afpx_roundtrip_lint",
+            return_value={"pass": True, "channel_diffs": []},
+        ), patch.object(
+            optimizer, "output_trim_for_groups", return_value={},
+        ), patch.object(
+            optimizer, "apply_phase_writes", side_effect=lambda xml, _plan: xml,
+        ), tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "candidate.afpx"
+            optimizer.write_candidate(base_xml, out_path, {group: [(1000.0, 1.5, 0.0)]})
+            written = optimizer.decode_afpx(out_path)
+            written_oc = optimizer.re.findall(r"<OC\b.*?</OC>", written, optimizer.re.S)[0]
+            active = [
+                tag for tag in optimizer.re.findall(r'<Fil\b[^>]*/?>', written_oc)
+                if afpx_attr(tag, "T") == "17"
+            ]
+            self.assertEqual(active, [])
 
 
 if __name__ == "__main__":

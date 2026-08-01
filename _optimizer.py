@@ -53,6 +53,7 @@ from scripts.make_measurement_manifest import (
 
 from _make_v3 import (
     add_bands,
+    apply_band_actions,
     apply_output_trim,
     afpx_roundtrip_lint,
     choose_free_slots,
@@ -70,6 +71,7 @@ from _tunefit import (
     cascade_db,
     cascade_complex,
     configure_measurement_noise_model,
+    cross_session_persistence,
     erb_smooth,
     erb_hz,
     excess_gd_mask,
@@ -628,6 +630,35 @@ def load_txt_export(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return trace["freq"], trace["spl"]
 
 
+_PERSISTENCE_SYSTEM_SUM_NAMES = ("System Sum", "SYSTEM SUM")
+
+
+def load_persistence_sessions(session_dirs: Iterable[Path], freqs: np.ndarray) -> List[Dict[str, object]]:
+    """Load each extra session folder's System Sum export for the cross-
+    session persistence gate (DEFECT 6). Deliberately lightweight: unlike the
+    primary session, a persistence session needs no baseline .afpx, target,
+    or full manifest - just the one export every one of the user's sessions
+    had, including a sparse one that otherwise only captured two of eight
+    files. A folder missing System Sum contributes nothing and is skipped,
+    it never blocks the run.
+    """
+    sessions: List[Dict[str, object]] = []
+    for session_dir in session_dirs:
+        session_dir = Path(session_dir)
+        path = None
+        for name in _PERSISTENCE_SYSTEM_SUM_NAMES:
+            candidate = session_dir / (name + ".txt")
+            if candidate.is_file():
+                path = candidate
+                break
+        if path is None:
+            continue
+        trace = load_rew_export(path)
+        spl = np.interp(np.log10(freqs), np.log10(trace["freq"]), trace["spl"])
+        sessions.append({"system_sum": spl, "path": str(path), "folder": str(session_dir)})
+    return sessions
+
+
 def load_measurements(level_calibration: Dict[str, float] | None = None) -> Tuple[np.ndarray, TraceMap, RichTraceMap]:
     global SYNTHETIC_PAIR_ROLES
     level_calibration = level_calibration or {}
@@ -941,17 +972,104 @@ def baseline_band_sets() -> List[List[Band]]:
     return [[] for _ in range(8)]
 
 
-def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
+# How close (in octaves) a proposed band's frequency must land to an existing
+# band in the same channel before it is treated as an EDIT of that band
+# rather than a new appended one. Matches the "same feature" proximity
+# thresholds already used elsewhere in this file (e.g. candidate dedup at
+# 1/16-1/8 octave) rather than inventing a new convention.
+EDIT_MATCH_TOLERANCE_OCT = 1 / 24
+
+# Sentinel: a proposed band with gain exactly 0.0 (never produced by
+# rounded_band(), which rejects |G| < 0.5) means "remove the existing band
+# this matches", not "add a 0 dB filter". A removal with no matching existing
+# band is a no-op (the search may propose one speculatively).
+REMOVE_BAND_GAIN = 0.0
+
+
+def _find_edit_target(
+    existing: List[Band], f: float, eligible: List[bool] | None = None,
+) -> int | None:
+    """Index of the existing band closest in frequency to `f`, if within
+    EDIT_MATCH_TOLERANCE_OCT; else None (this is a genuinely new frequency).
+
+    `eligible[index]`, when given, must be True for that index to be
+    considered - used to exclude same-pass appends that have no XML slot
+    yet (see _resolve_group_bands)."""
+    best_index = None
+    best_dist = EDIT_MATCH_TOLERANCE_OCT
+    for index, (existing_f, _q, _g) in enumerate(existing):
+        if eligible is not None and not eligible[index]:
+            continue
+        dist = abs(math.log2(float(f) / float(existing_f)))
+        if dist <= best_dist:
+            best_dist = dist
+            best_index = index
+    return best_index
+
+
+def _resolve_group_bands(
+    groups: GroupBands,
+) -> Tuple[List[List[Band]], Dict[int, List[Tuple[str, "Band | None", "Band | None"]]]]:
+    """Resolve proposed group bands against the baseline into a final
+    per-channel band list, AND the exact action (append/edit/remove) that
+    produced each change - the single source of truth both scoring
+    (groups_to_band_sets) and AFPX writing (write_candidate) build on, so the
+    written file can never diverge from what was scored.
+
+    A proposed band close in frequency (EDIT_MATCH_TOLERANCE_OCT) to an
+    existing band in that channel edits it in place. A proposed band with
+    gain exactly REMOVE_BAND_GAIN (0.0) removes the existing band it matches.
+    Everything else appends, exactly as before this changed - DEFECT 1 was
+    that only this last case existed: the search could add a new band into a
+    free slot but could never modify or remove one of its own earlier picks,
+    so real fixes that were edits (recentre a mid filter, deepen a sub cut,
+    retire a now-unneeded band) were structurally unreachable. See
+    CHANGELOG.md.
+    """
     band_sets = [list(bands) for bands in baseline_band_sets()]
     while len(band_sets) < 8:
         band_sets.append([])
+    actions: Dict[int, List[Tuple[str, "Band | None", "Band | None"]]] = {
+        i: [] for i in range(len(band_sets))
+    }
+    # Parallel to band_sets[channel]: True while that entry still has a real
+    # AFPX slot behind it (baseline, or already edited from baseline), False
+    # for a same-pass append. write_candidate/apply_band_actions runs every
+    # edit/remove for a channel FIRST and only materializes appends into the
+    # XML afterwards in one batch, so a later proposal in this same
+    # resolution must never be allowed to "edit" an append from an earlier
+    # one - that slot does not exist in the file yet when the edit would run.
+    # (Bug found against the real v9 baseline: three close guided proposals
+    # in one group chained append->edit->edit on top of each other and the
+    # edit failed to find its target. See CHANGELOG.md.)
+    from_baseline = [[True] * len(bands) for bands in band_sets]
     for group, bands in groups.items():
         if not bands:
             continue
         for channel in GROUPS[group]["channels"]:
-            band_sets[channel].extend(bands)
-            band_sets[channel].sort(key=lambda b: b[0])
-    return band_sets
+            for f, q, g in bands:
+                index = _find_edit_target(band_sets[channel], f, from_baseline[channel])
+                if g == REMOVE_BAND_GAIN:
+                    if index is not None:
+                        old = band_sets[channel].pop(index)
+                        from_baseline[channel].pop(index)
+                        actions[channel].append(("remove", old, None))
+                    continue
+                if index is not None:
+                    old = band_sets[channel][index]
+                    band_sets[channel][index] = (f, q, g)
+                    actions[channel].append(("edit", old, (f, q, g)))
+                else:
+                    band_sets[channel].append((f, q, g))
+                    from_baseline[channel].append(False)
+                    actions[channel].append(("append", None, (f, q, g)))
+    for channel_bands in band_sets:
+        channel_bands.sort(key=lambda b: b[0])
+    return band_sets, actions
+
+
+def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
+    return _resolve_group_bands(groups)[0]
 
 
 def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
@@ -2286,14 +2404,23 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
         )
     blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
     new_blocks = list(blocks)
-    for group, bands in groups.items():
-        if not bands:
+    # _resolve_group_bands is the SAME resolution groups_to_band_sets uses for
+    # scoring, so an edit/removal is written exactly as it was scored - never
+    # a silent extra append alongside an untouched original slot.
+    _, actions_by_channel = _resolve_group_bands(groups)
+    protected_channels = {
+        channel
+        for group, bands in groups.items() if bands
+        for channel in GROUPS[group]["channels"]
+        if GROUPS[group].get("system_transfer")
+    }
+    for channel, channel_actions in actions_by_channel.items():
+        if not channel_actions or channel >= len(new_blocks):
             continue
-        for channel in GROUPS[group]["channels"]:
-            new_blocks[channel] = add_bands(
-                new_blocks[channel], bands,
-                protected_boost=bool(GROUPS[group].get("system_transfer")),
-            )
+        new_blocks[channel] = apply_band_actions(
+            new_blocks[channel], channel_actions,
+            protected_boost=channel in protected_channels,
+        )
 
     trim_plan = output_trim_for_groups(groups)
     for channel, trim_db in trim_plan.items():
@@ -2800,6 +2927,9 @@ def write_report(
         "filter_noise_floor_violation_count",
         "spatial_tonal_db", "spatial_peak_db", "spatial_narrow_peak_db", "spatial_worst_db",
         "spatial_fragility_penalty", "spatial_position_count",
+        "target_rms_null_excluded_db", "target_rms_null_included_db",
+        "headroom_violation_count", "headroom_guardrail_penalty",
+        "nearfield_skirt_violation_count", "nearfield_skirt_guardrail_penalty",
         "complex_prediction_active", "complex_pair_count",
         "complex_system_validation_rms_db", "complex_position_count",
     )
@@ -2870,6 +3000,16 @@ def write_report(
             "phase_diagnostic_cache": getattr(args, "phase_diagnostic_cache", {}),
             "measurement_noise_guard": measurement_noise_model(),
         },
+        "active_weights": {
+            key: round(float(value), 4)
+            for key, value in dict(base_components.get("active_weights", {})).items()
+        },
+        "no_change_proposed": bool(getattr(args, "census_found_nothing_eligible", False)),
+        "no_change_reason": (
+            "The pre-search problem census found no eligible correction centres in this "
+            "measurement set; the baseline is the result. (DEFECT 4b hard gate - see CHANGELOG.md.)"
+            if getattr(args, "census_found_nothing_eligible", False) else ""
+        ),
         "baseline": baseline_core,
         "baseline_position_tonal_db": base_components.get("spatial_position_tonal_db", {}),
         "best": None if best_row is None else {

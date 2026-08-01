@@ -175,6 +175,142 @@ class BeamSearchTests(unittest.TestCase):
             ]
             self.assertTrue(cuts, group)
 
+    def test_guided_pool_proposes_editing_an_existing_band_not_only_appending(self) -> None:
+        """DEFECT 1: real fix. With a baseline sub cut already at 33 Hz that
+        is too shallow for the measured deviation there, the pool must offer
+        an edit of THAT band (deepening it), not only free-slot append
+        candidates elsewhere. See CHANGELOG.md."""
+        freqs = np.geomspace(20.0, 16000.0, 1024)
+        inactive = np.full_like(freqs, -100.0)
+        front_pair = optimizer.power_sum_db([inactive, inactive])
+        sub_bump = 8.0 * np.exp(-0.5 * (np.log2(freqs / 33.0) / 0.30) ** 2)
+        sub_flat = np.where(freqs <= 200.0, 60.0, -100.0)
+        sub_measured = np.where(freqs <= 200.0, 60.0 + sub_bump, -100.0)
+        system = optimizer.power_sum_db([front_pair, front_pair, sub_measured])
+        target = optimizer.power_sum_db([front_pair, front_pair, sub_flat])
+        traces = {
+            "FL High": inactive, "FR High": inactive,
+            "FL Low": inactive, "FR Low": inactive,
+            "Tweeters Together": front_pair, "Mid Bass Together": front_pair,
+            "Sub": sub_measured, "System Sum": system,
+        }
+        baseline = [[] for _ in range(8)]
+        baseline[6] = [(33.0, 2.0, -2.0)]
+        baseline[7] = [(33.0, 2.0, -2.0)]
+
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            pools = stream.find_guided_candidates(freqs, traces, target, "safe")
+
+        edits = [
+            candidate for candidate in pools["sub"]
+            if candidate.get("source") == "tonal_edit"
+            and abs(candidate["F"] - 33.0) < 2.0
+        ]
+        self.assertTrue(edits, pools["sub"])
+        self.assertEqual(edits[0]["edit_target"], (33.0, 2.0, -2.0))
+        self.assertLess(edits[0]["G"], -2.0)  # deeper than the existing -2.0 dB cut
+
+    def test_candidate_peaks_proposes_removal_when_existing_band_is_no_longer_justified(
+        self,
+    ) -> None:
+        """DEFECT 1, removal side: when the data-supported setting for an
+        existing band rounds to nothing (too small to be a real filter),
+        candidate_peaks must propose retiring it via the G=0.0 sentinel, not
+        silently drop the finding the way a plain append candidate would be
+        dropped. See CHANGELOG.md."""
+        freqs = np.geomspace(20.0, 200.0, 512)
+        target_index = int(np.argmin(np.abs(np.log10(freqs) - np.log10(33.0))))
+        # A narrow single-bin spike is diluted to near-nothing by ERB
+        # smoothing inside candidate_peaks, so use a bump wide enough to
+        # survive it - this test is about the removal branch, not smoothing.
+        strength = 3.0 * np.exp(-0.5 * (np.log2(freqs / 33.0) / 0.25) ** 2)
+        desired_gain = np.full_like(freqs, -0.3)  # clears the 0.25 dB gate, rounds to <0.5 dB
+
+        candidates = stream.candidate_peaks(
+            freqs, strength, desired_gain, 30.0, 90.0, (0.5, 5.0), (-6.0, 0.0),
+            "tonal", "safe", forced_targets={target_index: (33.0, 2.0, -2.0)},
+        )
+
+        removals = [c for c in candidates if c["source"] == "tonal_remove"]
+        self.assertTrue(removals, candidates)
+        self.assertEqual(removals[0]["F"], 33.0)
+        self.assertEqual(removals[0]["G"], 0.0)
+        self.assertEqual(removals[0]["edit_target"], (33.0, 2.0, -2.0))
+
+    def _sub_bump_scenario(self):
+        freqs = np.geomspace(20.0, 16000.0, 1024)
+        inactive = np.full_like(freqs, -100.0)
+        front_pair = optimizer.power_sum_db([inactive, inactive])
+        sub_bump = 8.0 * np.exp(-0.5 * (np.log2(freqs / 33.0) / 0.30) ** 2)
+        sub_flat = np.where(freqs <= 200.0, 60.0, -100.0)
+        sub_measured = np.where(freqs <= 200.0, 60.0 + sub_bump, -100.0)
+        system = optimizer.power_sum_db([front_pair, front_pair, sub_measured])
+        target = optimizer.power_sum_db([front_pair, front_pair, sub_flat])
+        traces = {
+            "FL High": inactive, "FR High": inactive,
+            "FL Low": inactive, "FR Low": inactive,
+            "Tweeters Together": front_pair, "Mid Bass Together": front_pair,
+            "Sub": sub_measured, "System Sum": system,
+        }
+        return freqs, traces, target, system, sub_bump
+
+    def test_persistence_gate_suppresses_a_deviation_only_the_primary_session_shows(
+        self,
+    ) -> None:
+        """DEFECT 6: a single MMM session can't tell a real deviation from
+        run-to-run capture noise. Extra sessions whose System Sum matches the
+        target (no bump - exactly what noise on the primary session would
+        look like if it weren't real) must suppress the candidate, even
+        though the primary session alone clearly supports it."""
+        freqs, traces, target, system, sub_bump = self._sub_bump_scenario()
+
+        def near_bump(candidates):
+            return any(abs(np.log2(c["F"] / 33.0)) < 1.0 for c in candidates)
+
+        without_sessions = stream.find_guided_candidates(freqs, traces, target, "safe")
+        self.assertTrue(near_bump(without_sessions["sub"]))
+
+        quiet_session = {"system_sum": system - sub_bump}
+        gated = stream.find_guided_candidates(
+            freqs, traces, target, "safe",
+            persistence_sessions=[quiet_session, quiet_session],
+        )
+        self.assertFalse(near_bump(gated["sub"]))
+
+    def test_persistence_gate_allows_a_deviation_confirmed_by_every_session(self) -> None:
+        """DEFECT 6, positive path: when every supplied session's System Sum
+        shows the same bump, the candidate must survive and carry the
+        session count it was confirmed against - the evidence success
+        criterion #15 needs in the final report."""
+        freqs, traces, target, system, _sub_bump = self._sub_bump_scenario()
+        matching_session = {"system_sum": system}
+        gated = stream.find_guided_candidates(
+            freqs, traces, target, "safe",
+            persistence_sessions=[matching_session, matching_session],
+        )
+        matches = [c for c in gated["sub"] if abs(np.log2(c["F"] / 33.0)) < 1.0]
+        self.assertTrue(matches, gated["sub"])
+        self.assertEqual(matches[0]["persistence_session_count"], 3)
+
+    def test_persistence_gate_anchors_each_session_before_comparing(self) -> None:
+        """DEFECT 6 methodology gap found while reviewing the real v9
+        re-run: two REW sessions rarely share the exact same absolute source
+        volume or mic gain. Without per-session level anchoring, a session
+        that is simply captured several dB louder/quieter overall - but
+        otherwise flat, i.e. matches target's SHAPE exactly - would look
+        like it "confirms" a positive deviation at every frequency purely
+        from its own broadband level offset. Anchoring each session to
+        `target` first (same convention `target` itself was anchored to the
+        primary session with) must recognize this session has no real
+        spectral deviation and refuse to let it confirm anything."""
+        freqs, traces, target, system, _sub_bump = self._sub_bump_scenario()
+        flat_but_louder_session = {"system_sum": target + 5.0}
+        gated = stream.find_guided_candidates(
+            freqs, traces, target, "safe",
+            persistence_sessions=[flat_but_louder_session, flat_but_louder_session],
+        )
+        self.assertFalse(any(abs(np.log2(c["F"] / 33.0)) < 1.0 for c in gated["sub"]))
+
     def test_beam_selects_tweeter_only_crossover_scope_when_rms_is_lower(self) -> None:
         band = {
             "F": 2642.7, "Q": 2.0, "G": -1.5, "strength": 2.0,

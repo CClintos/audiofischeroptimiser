@@ -6,10 +6,17 @@ import math
 import os
 import re
 import struct
+import sys
 import zlib
 from pathlib import Path
 
 import numpy as np
+
+# Invoked as `python scripts/verify_written_tune.py`, so sys.path[0] is this
+# file's own "scripts" directory, not the repo root where _optimizer.py
+# lives - without this, the deferred `import _optimizer` below always fails.
+# Same pattern as scripts/prepare_phase_cache.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def decode_afpx(path: Path) -> str:
