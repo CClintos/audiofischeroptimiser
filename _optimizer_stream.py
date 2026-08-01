@@ -445,10 +445,49 @@ def find_guided_candidates(freqs, traces, target, profile: str, persistence_sess
                         "system_deviation_db": absolute_system_deviation,
                     })
                     continue
+            # Repo-review finding: scale the proposed gain by continuous
+            # evidence-based confidence, on top of (never instead of) the
+            # hard/soft gates already checked above. Boosting needs much
+            # stronger evidence than cutting, so it scales with the SQUARE
+            # of boost confidence while a cut only scales with its square
+            # root - a candidate with mediocre evidence keeps most of its
+            # proposed cut but loses most of its proposed boost. A null bin
+            # is already excluded upstream (tonal_strength zeroed there);
+            # this is a further, continuous refinement on what's left, not
+            # a replacement for that hard exclusion.
+            null_at_center = bool(masks.get(group, np.zeros_like(freqs, dtype=bool))[
+                int(np.argmin(np.abs(np.log10(freqs) - np.log10(center))))
+            ])
+            authority_at_center = float(np.interp(np.log10(center), np.log10(freqs), contribution))
+            session_agreement = session_required = None
+            if session_devs:
+                session_agreement = min(abs(target_deviation), *(abs(v) for v in session_values))
+                session_required = required
+            confidence = opt.correction_confidence(
+                [center], null_fraction=1.0 if null_at_center else 0.0,
+                driver_authority=authority_at_center,
+                session_agreement_db=session_agreement, session_required_db=session_required,
+            )
+            conf_boost = float(confidence["boost"][0])
+            conf_cut = float(confidence["cut"][0])
+            scale = conf_boost ** 2 if candidate["G"] > 0.0 else math.sqrt(max(conf_cut, 0.0))
+            scaled_gain = candidate["G"] * scale
+            if abs(scaled_gain) < 0.3:
+                suppressions.append({
+                    "group": group,
+                    "frequency_hz": center,
+                    "reason": "low_correction_confidence",
+                    "confidence_boost": round(conf_boost, 3),
+                    "confidence_cut": round(conf_cut, 3),
+                })
+                continue
+            candidate["G"] = scaled_gain
             candidate.update({
                 "target_deviation_db": target_deviation,
                 "noise_floor_db": floor,
                 "required_deviation_db": required,
+                "confidence_boost": round(conf_boost, 3),
+                "confidence_cut": round(conf_cut, 3),
             })
             guarded_tonal.append(candidate)
         candidates.extend(guarded_tonal)

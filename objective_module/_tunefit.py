@@ -19,7 +19,24 @@ import os
 
 import numpy as np
 
-FS = 96000.0                     # Helix internal rate (verified, P SIX MK2 manual)
+try:
+    # Normal case: loaded as the objective_module package's own submodule
+    # (objective_module._tunefit) - a relative import resolves correctly
+    # with no sys.path changes, so this file is never independently
+    # importable under a second, bare "_tunefit" module identity (that
+    # would silently duplicate every function in this file as a DIFFERENT
+    # object from the one everyone else has - a real bug caught here: an
+    # earlier version used sys.path.insert + a bare import instead, which
+    # is exactly what tripped this).
+    from .device_profile import DEFAULT_DEVICE_PROFILE
+except ImportError:
+    # Standalone self-test (`python _tunefit.py` from inside this
+    # directory) - there's no package context for a relative import, but
+    # Python already put this file's own directory on sys.path[0], so a
+    # bare import finds the sibling file directly.
+    from device_profile import DEFAULT_DEVICE_PROFILE
+
+FS = DEFAULT_DEVICE_PROFILE.sample_rate_hz  # Helix internal rate - see device_profile.py
 LOGSTEP = 2 ** (1 / 96.0)        # REW 96 PPO
 
 # --------------------------------------------------------------------------
@@ -53,11 +70,25 @@ def cascade_db(freqs, bands):
 
 # --------------------------------------------------------------------------
 # 1) MINIMUM-PHASE EXTRACTION + EXCESS GROUP DELAY  (REW doctrine, computable)
-def minphase_from_mag(freqs, mag_db, n_fft=2 ** 16, fs=48000.0):
+def minphase_from_mag(freqs, mag_db, n_fft=2 ** 16, fs=None):
     """Min-phase (radians, on `freqs`) implied by a magnitude curve.
     Real-cepstrum method: resample |H| to a linear grid, fold the cepstrum,
     read back the phase. Standard DSP; assumes the magnitude IS the whole story
-    (that's the definition of minimum phase)."""
+    (that's the definition of minimum phase).
+
+    `fs` only sets this reconstruction's own internal FFT Nyquist bound - it
+    has nothing to do with the target DSP's processing rate (this operates
+    on measured acoustic magnitude data, not the DSP's biquad math). Left
+    unspecified, it is derived from the data itself with headroom above the
+    highest measured frequency, so the reconstruction is always correct for
+    whatever `freqs` actually contains. Previously hardcoded to 48000.0
+    regardless of input: harmless for most car-audio REW exports (max
+    ~20-24 kHz), but that put Nyquist right at the edge of - or below - data
+    that runs close to or past 24 kHz, silently degrading the reconstructed
+    minimum phase, excess group delay, and EQ-ability classification there.
+    See CHANGELOG.md."""
+    if fs is None:
+        fs = 2.2 * float(np.max(freqs))
     lin_f = np.linspace(0, fs / 2, n_fft // 2 + 1)
     lo, hi = freqs.min(), freqs.max()
     lin_db = np.interp(np.clip(lin_f, lo, hi), freqs, mag_db)  # clamp ends flat
@@ -73,16 +104,18 @@ def minphase_from_mag(freqs, mag_db, n_fft=2 ** 16, fs=48000.0):
     mp_phase_lin = np.imag(mp_full[:n_fft // 2 + 1])            # radians (min phase)
     return np.interp(freqs, lin_f, mp_phase_lin)
 
-def excess_gd_mask(freqs, spl_db, phase_deg, flat_ms=1.0, smooth_oct=1 / 6.0):
+def excess_gd_mask(freqs, spl_db, phase_deg, flat_ms=1.0, smooth_oct=1 / 6.0, fs=None):
     """The EQ-ability classifier. Inputs: single-position REW text export WITH
     phase (freq, SPL, phase columns). Returns (excess_gd_ms, eqable_mask).
     REW doctrine: flat excess GD = minimum phase = EQ WORKS THERE; wild excess-GD
     swings (usually at sharp dips) = non-minimum-phase = EQ CANNOT FIX. `flat_ms`
     = how far excess GD may deviate from its local median and still count flat.
     Note: an overall time-of-flight offset only adds a CONSTANT GD slope, which the
-    local-median comparison ignores by construction."""
+    local-median comparison ignores by construction. `fs` is forwarded to
+    minphase_from_mag() - see its docstring; leave unspecified unless a caller
+    has a specific reason to override the data-derived default."""
     ph = np.unwrap(np.deg2rad(phase_deg))
-    mp = minphase_from_mag(freqs, spl_db)
+    mp = minphase_from_mag(freqs, spl_db, fs=fs)
     ex = ph - mp
     w = 2 * np.pi * freqs
     gd = -np.gradient(ex, w) * 1000.0            # excess group delay, ms
@@ -238,8 +271,20 @@ def modal_null_evidence(freqs, center_db, position_db=None, band=(20.0, 250.0)):
             local_depth = float(center[index] - local_baseline)
             deep = local_depth <= -8.0
             dip = center <= local_baseline + local_depth / 2.0
-            around = np.flatnonzero(dip & selected & (distance <= 1 / 3))
-            contiguous = around
+            window = selected & (distance <= 1 / 3)
+            # Connected component containing `index` itself, not every dip
+            # bin within the 1/3-octave window - a bare boolean selection
+            # can silently merge this minimum with a SEPARATE, unrelated
+            # dip island nearby into one inflated width estimate, which can
+            # push a genuinely narrow modal null over the 1/6-octave cutoff
+            # below and misclassify it as too wide to be modal.
+            left = index
+            while left > 0 and dip[left - 1] and window[left - 1]:
+                left -= 1
+            right = index
+            while right < len(f) - 1 and dip[right + 1] and window[right + 1]:
+                right += 1
+            contiguous = np.arange(left, right + 1)
             width_oct = (
                 math.log2(f[contiguous[-1]] / f[contiguous[0]])
                 if contiguous.size > 1 else 0.0
@@ -503,6 +548,98 @@ def cross_session_persistence(deviation_db_by_session, noise_floor_db,
         "session_count": int(values.size),
         "min_magnitude_db": min_magnitude,
         "required_deviation_db": required,
+    }
+
+
+# --------------------------------------------------------------------------
+# Repo-review finding: the objective's null classification, repeatability
+# checks, and driver-authority weighting were all real but separate binary
+# gates - a candidate either cleared every threshold or it didn't, with no
+# continuous notion of "how confident are we." Boosting a dip and cutting a
+# peak are not symmetric risks (a missed cut just leaves a peak in place; an
+# unjustified boost can audibly worsen the exact spot it targeted), so they
+# need separate, asymmetric confidence, not one shared pass/fail. This
+# combines the SAME evidence the discrete gates already use into one
+# continuous [0,1] score per frequency bin - additive to those gates, not a
+# replacement for any of them; every existing hard/soft guardrail keeps
+# running unchanged. See CHANGELOG.md.
+CONFIDENCE_NEUTRAL = 1.0  # missing evidence: doesn't count for OR against
+CONFIDENCE_PHASE_UNKNOWN_PENALTY = 0.15  # phase-classified non-minimum-phase
+
+
+def correction_confidence(freqs, *, null_fraction=None, driver_authority=None,
+                          session_agreement_db=None, session_required_db=None,
+                          eqable_mask=None, spatial_agreement=None):
+    """Continuous per-bin confidence that a proposed correction is real and
+    worth acting on, split into `boost` (asking for more energy) and `cut`
+    (asking for less), each 0..1 on `freqs`.
+
+    This is a PRODUCT of independent-evidence factors, so the correct "we
+    don't have this evidence" default for a missing factor is 1.0 (no
+    effect), not some partial-credit value - only evidence that is
+    ACTUALLY PRESENT and ACTUALLY WEAK should reduce confidence. (An
+    earlier version defaulted every missing factor to 0.5 and multiplied
+    them all together regardless of availability; with three or four
+    factors commonly absent at once - e.g. a single-session MMM run has no
+    position or phase data at all - that compounded into rejecting ~98% of
+    every boost candidate's gain even when the evidence that WAS available
+    was strong. Fixed before it shipped. See CHANGELOG.md.) Every input
+    below is optional; a caller with only some of the evidence (the common
+    case) gets a confidence driven entirely by what it actually has.
+
+    - `null_fraction`: 0..1 (or boolean mask) - how much of this bin is
+      already confirmed cancellation/reflection (e.g. _NULL_MASK, or a
+      nearfield/modal region's confidence). Only affects `boost` - a
+      genuine null is never a real target to fill.
+    - `driver_authority`: 0..1 - how much the candidate's own driver
+      contributes to the system sum here (branch_contribution()); a
+      correction proposed where that driver barely matters is unreliable.
+    - `session_agreement_db` / `session_required_db`: repeatability - the
+      weakest cross-session deviation magnitude vs what's required to clear
+      the noise floor (same ratio cross_session_persistence() computes).
+    - `eqable_mask`: bool array from excess_gd_mask() - minimum-phase
+      regions are trustworthy correction targets, non-minimum-phase ones
+      usually are not (REW doctrine - see excess_gd_mask's docstring).
+    - `spatial_agreement`: 0..1 - sign/centre-frequency agreement across
+      measured positions.
+    """
+    f = np.asarray(freqs, dtype=float)
+    n = len(f)
+
+    def _neutral():
+        return np.full(n, CONFIDENCE_NEUTRAL)
+
+    c_null = (
+        np.zeros(n) if null_fraction is None
+        else np.clip(np.asarray(null_fraction, dtype=float), 0.0, 1.0)
+    )
+    c_authority = (
+        _neutral() if driver_authority is None
+        else np.clip(np.asarray(driver_authority, dtype=float), 0.0, 1.0)
+    )
+    if session_agreement_db is None or session_required_db is None:
+        c_repeat = _neutral()
+    else:
+        required = np.maximum(np.asarray(session_required_db, dtype=float), 1e-9)
+        ratio = np.asarray(session_agreement_db, dtype=float) / required
+        c_repeat = np.clip(ratio / 2.0, 0.0, 1.0)
+    c_phase = (
+        _neutral() if eqable_mask is None
+        else np.where(np.asarray(eqable_mask, dtype=bool), 1.0, CONFIDENCE_PHASE_UNKNOWN_PENALTY)
+    )
+    c_spatial = (
+        _neutral() if spatial_agreement is None
+        else np.clip(np.asarray(spatial_agreement, dtype=float), 0.0, 1.0)
+    )
+    boost = c_spatial * c_repeat * c_phase * c_authority * (1.0 - c_null)
+    cut = c_spatial * c_repeat * c_authority
+    return {
+        "boost": np.clip(boost, 0.0, 1.0),
+        "cut": np.clip(cut, 0.0, 1.0),
+        "components": {
+            "spatial": c_spatial, "repeat": c_repeat, "phase": c_phase,
+            "authority": c_authority, "null": c_null,
+        },
     }
 
 

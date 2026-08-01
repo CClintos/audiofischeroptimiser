@@ -84,7 +84,8 @@ def load_target(freqs, sum_trace):
 
 
 def peqset(path):
-    xml = zlib.decompress(open(path, 'rb').read()[4:]).decode('utf-8', 'replace')
+    # Strict, not 'replace' - see _make_v3.decode_afpx for why.
+    xml = zlib.decompress(open(path, 'rb').read()[4:]).decode('utf-8', 'strict')
     out = []
     for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S)[:8]:
         bands = []

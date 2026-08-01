@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +14,7 @@ import _tunefit as public_tunefit
 import _optimizer as optimizer
 import _optimizer_stream as optimizer_stream
 from _make_v3 import at as afpx_attr
+from _make_v3 import decode_afpx, encode_afpx
 from objective_module import _tunefit as canonical_tunefit
 from objective_module import afpx_objective as objective
 from objective_module.session import ScorerSession
@@ -37,6 +40,61 @@ class StrictMeasurementTests(unittest.TestCase):
             rows = [f"{100 + i} 60" for i in range(16)] + ["400"]
             path.write_text("\n".join(rows), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "frequency and SPL"):
+                objective._load_txt_rich(path)
+
+    def test_detect_delimiter_and_decimal(self) -> None:
+        """Repo-review finding: REW supports comma, tab, space, and
+        semicolon-delimited exports with a selectable decimal convention.
+        Blindly replacing every comma with a space corrupts a European-
+        locale decimal comma (e.g. "3,295898" -> "3 295898", split into two
+        garbage tokens instead of one number)."""
+        detect = objective._detect_delimiter_and_decimal
+        self.assertEqual(detect(["100.5\t60.2", "200.0\t61.0"]), ("\t", False))
+        self.assertEqual(detect(["100,5;60,2", "200,0;61,0"]), (";", True))
+        # A comma followed by 4+ digits is a decimal point, not a field
+        # separator or thousands grouping.
+        self.assertEqual(detect(["3,295898 40,533", "3,319782 40,533"]), (None, True))
+        # A comma between two already-period-decimal numbers is a field
+        # separator (the locale already uses periods for decimals).
+        self.assertEqual(detect(["20.5,70.3", "21.0,70.1"]), (",", False))
+        self.assertEqual(detect(["100.5 60.2", "200.0 61.0"]), (None, False))
+
+    def test_load_txt_rich_handles_comma_decimal_locale(self) -> None:
+        """A European-locale REW export ("3,295898 40,533") must parse as
+        one number per field, not be split into garbage by a naive
+        comma-to-space replacement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "comma_decimal.txt"
+            rows = [f"{100 + i},5 60,0" for i in range(20)]
+            path.write_text("\n".join(rows), encoding="utf-8")
+            trace = objective._load_txt_rich(path)
+            self.assertEqual(len(trace["freq"]), 20)
+            self.assertAlmostEqual(trace["freq"][0], 100.5)
+            self.assertAlmostEqual(trace["spl"][0], 60.0)
+            self.assertTrue(trace["format"]["decimal_is_comma"])
+
+    def test_load_txt_rich_drops_exact_duplicate_frequency_rows(self) -> None:
+        """Repo-review finding: an exact-duplicate frequency row used to
+        fail the generic "not strictly increasing" check with no
+        indication of why. Now resolved explicitly - the first occurrence
+        is kept, later ones dropped, and the count is reported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duplicate.txt"
+            rows = [f"{100 + i} {60 + i}" for i in range(20)]
+            rows.insert(5, rows[5])  # exact duplicate of an existing row
+            path.write_text("\n".join(rows), encoding="utf-8")
+            trace = objective._load_txt_rich(path)
+            self.assertEqual(len(trace["freq"]), 20)
+            self.assertEqual(trace["format"]["duplicate_frequency_rows_dropped"], 1)
+            self.assertTrue(np.all(np.diff(trace["freq"]) > 0.0))
+
+    def test_load_txt_rich_still_rejects_genuinely_out_of_order_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out_of_order.txt"
+            rows = [f"{100 + i} 60" for i in range(16)]
+            rows[8], rows[9] = rows[9], rows[8]  # swap two DIFFERENT frequencies
+            path.write_text("\n".join(rows), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "strictly increasing"):
                 objective._load_txt_rich(path)
 
 
@@ -296,6 +354,35 @@ class MaskIntegrityTests(unittest.TestCase):
         self.assertFalse(one_only["eligible"])
         self.assertEqual(one_only["reason"], "insufficient_session_coverage")
         self.assertEqual(one_only["session_count"], 1)
+
+    def test_modal_width_uses_the_connected_component_not_the_whole_window(self) -> None:
+        """Repo-review finding: the single-position modal-null width
+        previously took every "dip" bin within 1/3 octave of the candidate
+        minimum (`contiguous = around`), not the connected component
+        actually containing that minimum. Two separate narrow notches close
+        together got silently merged into one inflated span, pushing a
+        genuinely narrow (and otherwise-qualifying, >=8dB deep) null over
+        the 1/6-octave modal cutoff and hiding both of them. Verified
+        against the pre-fix code: this exact two-notch signal returned
+        MASK_CLEAR (found nothing) before the fix. See CHANGELOG.md."""
+        freqs = np.geomspace(20.0, 250.0, 2048)
+
+        def notch(center: float, depth: float, sigma_oct: float) -> np.ndarray:
+            return -depth * np.exp(-0.5 * (np.log2(freqs / center) / sigma_oct) ** 2)
+
+        # Two separate, narrow (~0.027 oct true width, well under 1/6),
+        # deep (>=8 dB) notches ~0.25 octave apart with a real gap between
+        # them - each individually qualifies as modal.
+        center = 70.0 + notch(52.0, 15.0, 0.012) + notch(63.0, 12.0, 0.012)
+
+        result = canonical_tunefit.modal_null_evidence(freqs, center, band=(20.0, 250.0))
+        self.assertEqual(result["state"], canonical_tunefit.MASK_DETECTED)
+        centres = sorted(region["center_hz"] for region in result["regions"])
+        self.assertEqual(len(centres), 2)
+        self.assertAlmostEqual(centres[0], 52.0, delta=1.0)
+        self.assertAlmostEqual(centres[1], 63.0, delta=1.0)
+        for region in result["regions"]:
+            self.assertLess(region["movement_or_width_oct"], 1 / 6)
 
     def _balance_pools(self, freqs: np.ndarray, difference: np.ndarray,
                        system_deviation: float = 1.0) -> dict[str, list[dict[str, object]]]:
@@ -627,6 +714,172 @@ class CanonicalDspTests(unittest.TestCase):
         self.assertIs(public_tunefit.allpass_fil_str, canonical_tunefit.allpass_fil_str)
         xml = public_tunefit.allpass_fil_str(174.0, 8.0, FN="20")
         self.assertIn('Q="8.0"', xml)
+
+
+class DeviceProfileTests(unittest.TestCase):
+    """Repo-review finding: the DSP's sample rate and PEQ hardware range
+    were hardcoded literals repeated in _tunefit.py and _make_v3.py, with
+    no single documented source. Consolidated into device_profile.py -
+    these assert the two call sites actually read from it (value-
+    preserving: same numbers as before), not that the numbers changed."""
+
+    def test_tunefit_fs_matches_the_device_profile(self) -> None:
+        from objective_module.device_profile import DEFAULT_DEVICE_PROFILE
+        self.assertEqual(canonical_tunefit.FS, DEFAULT_DEVICE_PROFILE.sample_rate_hz)
+        self.assertEqual(canonical_tunefit.FS, 96000.0)
+
+    def test_validate_peq_band_reads_gain_range_from_the_profile(self) -> None:
+        import _make_v3
+        from objective_module.device_profile import DeviceProfile
+
+        narrower = DeviceProfile(
+            model_id="test_narrow", sample_rate_hz=96000.0,
+            peq_frequency_range_hz=(20.0, 20000.0),
+            peq_gain_range_db=(-6.0, 3.0), peq_q_range=(0.5, 15.0),
+            filter_slots_per_output=30,
+        )
+        _make_v3.validate_peq_band(1000.0, 2.0, 3.0, device=narrower)
+        with self.assertRaises(ValueError):
+            _make_v3.validate_peq_band(1000.0, 2.0, 4.0, device=narrower)
+        # Default profile still accepts what the narrower one just rejected.
+        _make_v3.validate_peq_band(1000.0, 2.0, 4.0)
+
+
+class MinPhaseSampleRateTests(unittest.TestCase):
+    """Repo-review finding: minphase_from_mag() previously hardcoded
+    fs=48000.0 regardless of input. Its own internal FFT grid only spans
+    0..fs/2, so any measured data above 24 kHz was silently discarded
+    before the cepstral reconstruction even ran, then flat-extrapolated
+    back onto the output - degrading the reconstructed minimum phase,
+    excess group delay, and excess_gd_mask()'s EQ-ability classification
+    for anything measured close to or past 24 kHz. Now derived from the
+    data itself (2.2x headroom above the highest measured frequency) so it
+    is always correct for whatever `freqs` actually contains. See
+    CHANGELOG.md."""
+
+    def test_default_fs_covers_data_the_old_hardcoded_48k_default_would_clip(self) -> None:
+        freqs = np.geomspace(200.0, 26000.0, 1024)  # extends past old fs/2=24000
+        mag_db = canonical_tunefit.peaking_db(freqs, 26000.0 * 0.98, 8.0, 12.0)
+
+        auto = canonical_tunefit.minphase_from_mag(freqs, mag_db)
+        old_hardcoded = canonical_tunefit.minphase_from_mag(freqs, mag_db, fs=48000.0)
+
+        # Above the old hardcoded default's own Nyquist (24 kHz), that
+        # reconstruction's internal grid never saw this data at all -
+        # np.interp flat-extrapolates the output beyond lin_f's range, so
+        # every frequency past 24 kHz gets frozen at whatever value sat
+        # right at the boundary. The data-derived default keeps tracking
+        # the real peak (placed at 25480 Hz) instead of flattening it.
+        top = freqs >= 25000.0
+        self.assertTrue(np.any(top))
+        self.assertLess(float(np.ptp(old_hardcoded[top])), 1e-9)
+        self.assertGreater(float(np.ptp(auto[top])), 0.05)
+
+    def test_excess_gd_mask_forwards_fs_and_still_classifies_a_known_peak(self) -> None:
+        freqs = np.geomspace(200.0, 26000.0, 1024)
+        mag_db = canonical_tunefit.peaking_db(freqs, 300.0, 2.0, 6.0)
+        phase_deg = np.rad2deg(canonical_tunefit.minphase_from_mag(freqs, mag_db))
+        gd, eqable = canonical_tunefit.excess_gd_mask(freqs, mag_db, phase_deg, flat_ms=0.2)
+        i_pk = int(np.argmin(np.abs(freqs - 300.0)))
+        self.assertTrue(bool(eqable[i_pk]))
+        self.assertEqual(len(gd), len(freqs))
+
+
+class StrictAfpxDecodeTests(unittest.TestCase):
+    """Repo-review finding: AFPX was decoded with .decode('utf-8', 'replace')
+    at every read AND write-verification site. A malformed/non-UTF-8 byte
+    would silently become U+FFFD, which then re-encodes to DIFFERENT bytes
+    than the original on write - corrupting whatever attribute held it, even
+    outside the one value this tool intends to change. Fixed to strict
+    decode, which fails loudly instead. Verified empirically against 24 real
+    AFPX files spanning several tuning iterations: all decode as clean UTF-8
+    already, so this costs nothing for real files. See CHANGELOG.md."""
+
+    def _write_afpx(self, path: Path, xml_bytes: bytes) -> None:
+        path.write_bytes(struct.pack(">I", len(xml_bytes)) + zlib.compress(xml_bytes, 9))
+
+    def test_malformed_byte_raises_instead_of_silently_replacing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "malformed.afpx"
+            malformed = b'<Root><OC><Fil T="17" F="1000.00" Q="1.0" G="\xff-2.0"/></OC></Root>'
+            self._write_afpx(path, malformed)
+            with self.assertRaises(UnicodeDecodeError):
+                decode_afpx(path)
+
+    def test_real_afpx_round_trips_byte_identical_under_strict_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clean.afpx"
+            clean = "<Root><OC><Fil T=\"17\" F=\"1000.00\" Q=\"1.0\" G=\"-2.0\"/></OC></Root>"
+            self._write_afpx(path, clean.encode("utf-8"))
+            xml = decode_afpx(path)
+            self.assertEqual(xml, clean)
+            out_path = Path(tmp) / "roundtrip.afpx"
+            encode_afpx(xml, out_path)
+            self.assertEqual(decode_afpx(out_path), xml)
+
+
+class CorrectionConfidenceTests(unittest.TestCase):
+    """Repo-review finding: the objective's null classification,
+    repeatability, and driver-authority checks were real but separate
+    binary gates - correction_confidence() combines them into one
+    continuous [0,1] score, asymmetric between boost and cut (boosting
+    needs stronger evidence than cutting - a missed cut just leaves a peak
+    in place, an unjustified boost can audibly worsen the exact spot it
+    targeted). Additive to the existing gates, not a replacement for any of
+    them. See CHANGELOG.md."""
+
+    def test_missing_evidence_does_not_compound_into_near_zero_confidence(self) -> None:
+        """This is a product of independent factors - a caller with NO
+        evidence at all (e.g. no persistence sessions, no position data,
+        no phase data, which is the common single-session case) must get
+        full confidence, not a crushed one from multiplying several
+        default placeholders together. Only evidence that is actually
+        present and actually weak should reduce confidence."""
+        freqs = np.array([100.0, 200.0, 300.0])
+        result = canonical_tunefit.correction_confidence(freqs)
+        np.testing.assert_allclose(result["boost"], 1.0)
+        np.testing.assert_allclose(result["cut"], 1.0)
+
+    def test_full_positive_evidence_reaches_full_confidence(self) -> None:
+        freqs = np.array([100.0, 200.0, 300.0])
+        result = canonical_tunefit.correction_confidence(
+            freqs, null_fraction=0.0, driver_authority=1.0,
+            session_agreement_db=4.0, session_required_db=2.0,
+            eqable_mask=[True, True, True], spatial_agreement=1.0,
+        )
+        np.testing.assert_allclose(result["boost"], 1.0)
+        np.testing.assert_allclose(result["cut"], 1.0)
+
+    def test_confirmed_null_kills_boost_confidence_but_not_cut(self) -> None:
+        """A null is a dip caused by cancellation, never a genuine excess -
+        boosting into one is never justified regardless of how strong
+        everything else looks, but a null classification says nothing
+        about whether cutting a DIFFERENT nearby peak is justified."""
+        freqs = np.array([100.0])
+        result = canonical_tunefit.correction_confidence(
+            freqs, null_fraction=1.0, driver_authority=1.0,
+            session_agreement_db=4.0, session_required_db=2.0,
+            eqable_mask=[True], spatial_agreement=1.0,
+        )
+        np.testing.assert_allclose(result["boost"], 0.0)
+        np.testing.assert_allclose(result["cut"], 1.0)
+
+    def test_non_minimum_phase_region_penalizes_boost_only(self) -> None:
+        freqs = np.array([100.0])
+        result = canonical_tunefit.correction_confidence(
+            freqs, driver_authority=1.0,
+            session_agreement_db=4.0, session_required_db=2.0,
+            eqable_mask=[False], spatial_agreement=1.0,
+        )
+        np.testing.assert_allclose(result["boost"], canonical_tunefit.CONFIDENCE_PHASE_UNKNOWN_PENALTY)
+        np.testing.assert_allclose(result["cut"], 1.0)
+
+    def test_weak_driver_authority_reduces_both(self) -> None:
+        freqs = np.array([100.0])
+        weak = canonical_tunefit.correction_confidence(freqs, driver_authority=0.1)
+        strong = canonical_tunefit.correction_confidence(freqs, driver_authority=1.0)
+        self.assertLess(weak["boost"][0], strong["boost"][0])
+        self.assertLess(weak["cut"][0], strong["cut"][0])
 
 
 class BandEditAndRemovalTests(unittest.TestCase):

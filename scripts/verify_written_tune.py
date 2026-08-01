@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def decode_afpx(path: Path) -> str:
     raw = path.read_bytes()
     declared = struct.unpack(">I", raw[:4])[0]
-    xml = zlib.decompress(raw[4:]).decode("utf-8", "replace")
+    # Strict, not "replace" - see _make_v3.decode_afpx for why.
+    xml = zlib.decompress(raw[4:]).decode("utf-8", "strict")
     if declared != len(xml.encode("utf-8")):
         raise ValueError("Header length mismatch in %s" % path)
     return xml

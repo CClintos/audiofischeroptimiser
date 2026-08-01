@@ -12,6 +12,7 @@ import numpy as np
 import _optimizer as optimizer
 import _optimizer_stream as stream
 import _merge_stream_results as merge_results
+from _make_v3 import at as afpx_attr
 from objective_module import afpx_objective as objective
 from scripts.summarise_optimizer_run import summarise
 
@@ -421,6 +422,7 @@ class ModernGoldenBenchmarkTests(unittest.TestCase):
 
     def _build_synthetic_measurement_root(
         self, root, with_ear_positions=False, baseline_channel_filters=None,
+        baseline_channel_shelves=None, ear_position_shift_db=1.5,
     ):
         freqs = np.geomspace(30.0, 20000.0, 384)
         x = np.log2(freqs / 500.0)
@@ -454,7 +456,9 @@ class ModernGoldenBenchmarkTests(unittest.TestCase):
             )
             (root / filename).write_text("\n".join(rows), encoding="utf-8")
         if with_ear_positions:
-            for prefix, shift in (("Left Ear ", 1.5), ("Right Ear ", -1.5)):
+            for prefix, shift in (
+                ("Left Ear ", ear_position_shift_db), ("Right Ear ", -ear_position_shift_db),
+            ):
                 rows = ["* volume: 0.90", "* sweeps at -12 dBFS", "* reference played from Rear R"]
                 rows.extend(
                     f"{f:.9f} {s + shift:.9f} 0.0 0.99 1"
@@ -468,11 +472,16 @@ class ModernGoldenBenchmarkTests(unittest.TestCase):
         ), encoding="utf-8")
         baseline = root / "baseline.afpx"
         baseline_channel_filters = baseline_channel_filters or {}
+        baseline_channel_shelves = baseline_channel_shelves or {}
         channels_xml = []
         for index in range(8):
             fils = "".join(
                 f'<Fil F="{f}" Q="{q}" G="{g}" T="17"/>'
                 for f, q, g in baseline_channel_filters.get(index, [])
+            )
+            fils += "".join(
+                f'<Fil F="{f}" Q="{q}" G="{g}" T="{"3" if kind == "low" else "4"}"/>'
+                for kind, f, q, g in baseline_channel_shelves.get(index, [])
             )
             channels_xml.append(f"<OC>{fils}</OC>")
         xml = "<Root>" + "".join(channels_xml) + "</Root>"
@@ -506,6 +515,51 @@ class ModernGoldenBenchmarkTests(unittest.TestCase):
                 _V5=None,
             ):
                 return objective.score_bands([[] for _ in range(8)])
+
+    def test_position_anchor_is_bounded_not_fully_independent(self) -> None:
+        """Repo-review finding: a secondary position used to get a fully
+        independent target re-anchor, which can silently hide a genuine
+        broad level difference between positions by always re-centering to
+        its own local median. With the left position shifted a real 4 dB
+        (well past the 1.5 dB nuisance bound), only 1.5 dB of that may be
+        absorbed as plausible mic-placement noise - the remaining ~2.5 dB
+        must stay visible as real deviation, not vanish. See CHANGELOG.md."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(
+                root, with_ear_positions=True, ear_position_shift_db=4.0,
+            )
+            solo_files = {key: (Path(name).stem,) for key, name in filenames.items()}
+            pair_specs = {
+                "low": ("FL Low", "FR Low", "Mid Bass Together", (80.0, 2600.0), (200.0, 2000.0)),
+                "high": ("FL High", "FR High", "Tweeters Together", (2600.0, 16000.0), (2800.0, 16000.0)),
+            }
+            with patch.multiple(
+                objective,
+                REW_DIR=root, TARGET=target, BASELINE_AFPX=baseline, LEVEL_CALIBRATION={},
+                SOLO_FILES=solo_files, PAIR_SPECS=pair_specs,
+                CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+                _F=None, _T={}, _TGT=None, _NULL_MASK=None, _V5=None,
+            ):
+                objective.score_bands([[] for _ in range(8)])
+                audit = objective._MASK_AUDIT["target_anchor"]["positions"]["left"]
+                self.assertTrue(audit["clamped"])
+                self.assertAlmostEqual(
+                    audit["nuisance_offset_db"], objective.POSITION_ANCHOR_NUISANCE_BOUND_DB,
+                    places=3,
+                )
+                global_offset = objective._MASK_AUDIT["target_anchor"]["global_offset_db"]
+                self.assertAlmostEqual(
+                    audit["raw_offset_db"] - global_offset, 4.0, delta=0.3,
+                )
+                # The un-absorbed excess (~2.5 dB) must remain a real,
+                # measurable deviation at this position - not silently
+                # erased the way a fully independent re-anchor would.
+                left_target = objective._POSITION_TRACES["left"]["target"]
+                left_measured = objective._POSITION_TRACES["left"]["system"]
+                band = (objective._F >= 300.0) & (objective._F <= 3000.0)
+                residual = float(np.median(left_measured[band] - left_target[band]))
+                self.assertGreater(abs(residual), 2.0)
 
     def test_worst_position_weight_is_zero_with_one_position(self) -> None:
         """A single-position (centre-only) session must not let
@@ -629,6 +683,225 @@ class ModernGoldenBenchmarkTests(unittest.TestCase):
         self.assertGreaterEqual(
             pushed_too_far["objective"], objective.HEADROOM_VIOLATION_PENALTY,
         )
+
+    def test_sub_channel_is_covered_by_headroom_and_parsimony_guardrails(self) -> None:
+        """Repo-review finding: _added_bands_by_channel(), the headroom loop,
+        and the parsimony band count previously iterated only
+        range(len(CH_KEYS)) - the sub lives at physical channels 6/7, so a
+        filter placed there was scored acoustically but bypassed headroom,
+        null-boost, and filter-count penalties entirely. Verified against the
+        real v9 baseline: a +6 dB/Q6 sub boost that would be hard-rejected on
+        a front channel scored BETTER than doing nothing when placed on the
+        sub instead. A sub-channel filter must now be counted and penalized
+        exactly like an equivalent front-channel one. See CHANGELOG.md."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(
+                root, baseline_channel_filters={6: [(50.0, 1.0, -2.0)]},
+            )
+            solo_files = {key: (Path(name).stem,) for key, name in filenames.items()}
+            pair_specs = {
+                "low": ("FL Low", "FR Low", "Mid Bass Together", (80.0, 2600.0), (200.0, 2000.0)),
+                "high": ("FL High", "FR High", "Tweeters Together", (2600.0, 16000.0), (2800.0, 16000.0)),
+            }
+            with patch.multiple(
+                objective,
+                REW_DIR=root, TARGET=target, BASELINE_AFPX=baseline, LEVEL_CALIBRATION={},
+                SOLO_FILES=solo_files, PAIR_SPECS=pair_specs,
+                CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+                _F=None, _T={}, _TGT=None, _NULL_MASK=None, _V5=None,
+            ):
+                safe_baseline = [[] for _ in range(8)]
+                safe_baseline[6] = [(50.0, 1.0, -2.0)]
+                safe = objective.score_bands(safe_baseline)
+                self.assertEqual(safe["headroom_violation_count"], 0)
+
+                # A candidate that pushes the SUB channel's own peak below
+                # the 1.5 dB margin floor must be hard-rejected, exactly as
+                # the equivalent front-channel case already is above.
+                unsafe_sub = [[] for _ in range(8)]
+                unsafe_sub[6] = [(50.0, 1.0, 2.0)]
+                unsafe = objective.score_bands(unsafe_sub)
+                self.assertGreaterEqual(unsafe["headroom_violation_count"], 1)
+                self.assertGreaterEqual(
+                    unsafe["objective"], objective.HEADROOM_VIOLATION_PENALTY,
+                )
+                self.assertIn("Sub A", unsafe["headroom_margin_db"])
+
+                # Adding a sub-channel filter must also cost parsimony, not
+                # be free just because it isn't on a front channel.
+                extra_sub_band = [[] for _ in range(8)]
+                extra_sub_band[6] = [(50.0, 1.0, -2.0), (90.0, 1.0, -1.0)]
+                with_extra = objective.score_bands(extra_sub_band)
+                self.assertEqual(with_extra["n_front_bands"], safe["n_front_bands"] + 1)
+
+    def test_active_shelf_counts_toward_the_real_headroom_peak(self) -> None:
+        """Repo-review finding: headroom only ever looked at the T=17 PEQ
+        cascade, never a T=3/4 shelf, even though a shelf carries real gain
+        and the search leaves shelves alone (so it's a fixed, invisible
+        addition to the real chain). Built so PEQ-only accounting reports a
+        comfortable ~5 dB margin for a +4 dB/12 kHz PEQ candidate, while the
+        real chain (that PEQ stacked on top of an existing +6 dB/9 kHz
+        high-shelf, on a channel already trimmed to -9.1 dB output) is
+        actually within a fraction of a dB of 0 dBFS. See CHANGELOG.md."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(root)
+            # Overwrite the helper's plain baseline with one that also has a
+            # real output trim and an active high-shelf on channel 0 - the
+            # helper itself has no way to express either.
+            oc0 = '<Vol L="0.35"/><Fil F="9000.00" Q="0.7" G="6.0" T="4"/>'
+            xml = "<Root>" + "".join(
+                f"<OC>{oc0}</OC>" if i == 0 else "<OC></OC>" for i in range(8)
+            ) + "</Root>"
+            baseline.write_bytes(b"AFPX" + zlib.compress(xml.encode("utf-8")))
+            solo_files = {key: (Path(name).stem,) for key, name in filenames.items()}
+            pair_specs = {
+                "low": ("FL Low", "FR Low", "Mid Bass Together", (80.0, 2600.0), (200.0, 2000.0)),
+                "high": ("FL High", "FR High", "Tweeters Together", (2600.0, 16000.0), (2800.0, 16000.0)),
+            }
+            with patch.multiple(
+                objective,
+                REW_DIR=root, TARGET=target, BASELINE_AFPX=baseline, LEVEL_CALIBRATION={},
+                SOLO_FILES=solo_files, PAIR_SPECS=pair_specs,
+                CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+                _F=None, _T={}, _TGT=None, _NULL_MASK=None, _V5=None,
+            ):
+                baseline_score = objective.score_bands([[] for _ in range(8)])
+                # The shelf alone already costs real margin the PEQ cascade
+                # (empty here) could never have reported.
+                self.assertLess(baseline_score["headroom_margin_db"]["FL High"], 4.0)
+                self.assertEqual(baseline_score["headroom_violation_count"], 0)
+
+                candidate = [[] for _ in range(8)]
+                candidate[0] = [(12000.0, 2.0, 4.0)]
+                scored = objective.score_bands(candidate)
+                self.assertLess(scored["headroom_margin_db"]["FL High"], 1.5)
+                self.assertGreaterEqual(scored["headroom_violation_count"], 1)
+                self.assertGreaterEqual(
+                    scored["objective"], objective.HEADROOM_VIOLATION_PENALTY,
+                )
+
+    def _score_context(self, root, target, baseline, filenames):
+        solo_files = {key: (Path(name).stem,) for key, name in filenames.items()}
+        pair_specs = {
+            "low": ("FL Low", "FR Low", "Mid Bass Together", (80.0, 2600.0), (200.0, 2000.0)),
+            "high": ("FL High", "FR High", "Tweeters Together", (2600.0, 16000.0), (2800.0, 16000.0)),
+        }
+        return patch.multiple(
+            objective,
+            REW_DIR=root, TARGET=target, BASELINE_AFPX=baseline, LEVEL_CALIBRATION={},
+            SOLO_FILES=solo_files, PAIR_SPECS=pair_specs,
+            CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+            _F=None, _T={}, _TGT=None, _NULL_MASK=None, _V5=None,
+        )
+
+    def test_negligible_appended_band_is_dropped_meaningful_one_is_kept(self) -> None:
+        """Repo-review finding: post-quantization filter reduction. Only
+        ever considers bands passed in as `removable` (the search's own
+        purely-appended proposals) - a pre-existing/protected band is
+        always kept unconditionally, and an edit or removal is a separate,
+        already-deliberate action this never touches. See CHANGELOG.md."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(root)
+            with self._score_context(root, target, baseline, filenames):
+                objective.score_bands([[] for _ in range(8)])
+                protected = (500.0, 1.0, -2.0)
+                negligible = (15000.0, 0.5, 0.08)  # its own peak is 0.08 dB < tolerance
+                meaningful = (1200.0, 2.0, -3.0)
+                kept, dropped = objective.simplify_removable_bands(
+                    [protected, negligible, meaningful], [negligible, meaningful],
+                )
+                self.assertEqual(dropped, [negligible])
+                self.assertIn(protected, kept)
+                self.assertIn(meaningful, kept)
+                self.assertNotIn(negligible, kept)
+
+    def test_near_cancelling_pair_is_dropped_together(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(root)
+            with self._score_context(root, target, baseline, filenames):
+                objective.score_bands([[] for _ in range(8)])
+                boost = (1000.0, 1.0, 4.0)
+                cut = (1005.0, 1.0, -4.0)
+                kept, dropped = objective.simplify_removable_bands([boost, cut], [boost, cut])
+                self.assertEqual(kept, [])
+                self.assertEqual(set(dropped), {boost, cut})
+
+    def test_protected_bands_are_never_candidates_for_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(root)
+            with self._score_context(root, target, baseline, filenames):
+                objective.score_bands([[] for _ in range(8)])
+                protected_but_tiny = (2000.0, 1.0, 0.01)
+                kept, dropped = objective.simplify_removable_bands([protected_but_tiny], [])
+                self.assertEqual(dropped, [])
+                self.assertEqual(kept, [protected_but_tiny])
+
+    def test_write_candidate_drops_a_negligible_appended_band(self) -> None:
+        """Same regression, through the full write path: a candidate that
+        appends both a meaningful band and a negligible one must be written
+        with only the meaningful one occupying a slot.
+
+        _optimizer.py's own AFPX_OBJECTIVE is a SEPARATE module instance
+        (dynamically loaded via importlib, not the `from objective_module
+        import afpx_objective` this test file uses) - write_candidate calls
+        THAT instance's simplify_removable_bands, so its REW_DIR/etc must be
+        patched too, or it looks for the real default measurement files and
+        the whole simplification step silently no-ops (by design - see the
+        try/except in write_candidate)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, baseline, filenames = self._build_synthetic_measurement_root(root)
+            oc = "<OC>" + "".join(
+                f'<Fil T="1" F="{f:.2f}" Q="4.3" G="0" dF="{f:.0f}" FN="{i}"/>'
+                for i, f in enumerate((500.0, 1200.0, 15000.0))
+            ) + "</OC>"
+            xml = "<Root>" + "".join(oc if i == 0 else "<OC></OC>" for i in range(8)) + "</Root>"
+            solo_files = {key: (Path(name).stem,) for key, name in filenames.items()}
+            pair_specs = {
+                "low": ("FL Low", "FR Low", "Mid Bass Together", (80.0, 2600.0), (200.0, 2000.0)),
+                "high": ("FL High", "FR High", "Tweeters Together", (2600.0, 16000.0), (2800.0, 16000.0)),
+            }
+            with self._score_context(root, target, baseline, filenames), patch.multiple(
+                optimizer.AFPX_OBJECTIVE,
+                REW_DIR=root, TARGET=target, BASELINE_AFPX=baseline, LEVEL_CALIBRATION={},
+                SOLO_FILES=solo_files, PAIR_SPECS=pair_specs,
+                CH_KEYS=["FL High", "FR High", "FL Low", "FR Low"],
+                _F=None, _T={}, _TGT=None, _NULL_MASK=None, _V5=None,
+            ):
+                objective.score_bands([[] for _ in range(8)])  # prime _init() against these files
+                optimizer.AFPX_OBJECTIVE.score_bands([[] for _ in range(8)])  # ... and this SEPARATE instance's
+                group = "fl_high"  # channels=(0,) only
+                with patch.object(
+                    optimizer, "baseline_band_sets",
+                    return_value=[[], [], [], [], [], [], [], []],
+                ), patch.object(
+                    optimizer, "phase_peq_conflicts", return_value=[],
+                ), patch.object(
+                    optimizer, "afpx_roundtrip_lint",
+                    return_value={"pass": True, "channel_diffs": []},
+                ), patch.object(
+                    optimizer, "output_trim_for_groups", return_value={},
+                ), patch.object(
+                    optimizer, "apply_phase_writes", side_effect=lambda xml, _plan: xml,
+                ):
+                    out_path = Path(tmp) / "written_candidate.afpx"
+                    optimizer.write_candidate(
+                        xml, out_path,
+                        {group: [(1200.0, 2.0, -3.0), (15000.0, 0.5, 0.08)]},
+                    )
+                    written = optimizer.decode_afpx(out_path)
+                    written_oc = optimizer.re.findall(r"<OC\b.*?</OC>", written, optimizer.re.S)[0]
+                    active = [
+                        tag for tag in optimizer.re.findall(r'<Fil\b[^>]*/?>', written_oc)
+                        if afpx_attr(tag, "T") == "17"
+                    ]
+                    self.assertEqual(len(active), 1)
+                    self.assertEqual(afpx_attr(active[0], "F"), "1200.00")
 
     def test_nearfield_confirmed_null_forbids_positive_gain_skirt_overlap(self) -> None:
         """DEFECT 4a end-to-end: a narrow, deep System Sum dip with flat

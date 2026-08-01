@@ -11,7 +11,8 @@ from pathlib import Path
 
 def decode_afpx(path: Path) -> str:
     raw = path.read_bytes()
-    return zlib.decompress(raw[4:]).decode("utf-8", "replace")
+    # Strict, not "replace" - see _make_v3.decode_afpx for why.
+    return zlib.decompress(raw[4:]).decode("utf-8", "strict")
 
 
 def attrs(tag: str) -> dict[str, str]:

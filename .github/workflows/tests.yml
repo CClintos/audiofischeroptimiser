@@ -1,0 +1,94 @@
+name: Tests
+
+# Repo-review finding: the only workflow in this repo was the tag-triggered
+# Windows release build (windows-release.yml) - a plain commit or pull
+# request never ran anything. This adds ordinary PR/push CI, separate from
+# that release workflow.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11/3.12 are the review's requested floor; 3.14 matches the
+        # Python version windows-release.yml actually ships with.
+        python-version: ["3.11", "3.12", "3.14"]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Headless Qt on Ubuntu needs a handful of system libraries even for
+      # the offscreen platform plugin - tests/test_gui_backend.py already
+      # sets QT_QPA_PLATFORM=offscreen for exactly this.
+      - name: Install Linux Qt runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libopengl0 libxkbcommon0 libdbus-1-3 libxcb-cursor0
+
+      - name: Install the package with its gui/test extras
+        run: python -m pip install --disable-pip-version-check -e ".[gui,test]"
+
+      - name: Run the regression suite
+        run: python -m unittest discover -s tests -q
+
+      - name: Run _tunefit.py's own self-test
+        run: python objective_module/_tunefit.py
+
+  packaged-wheel-smoke-test:
+    # Validates the pyproject.toml packaging fix (core modules were
+    # previously missing from a normal `pip install` of this project) -
+    # build a real wheel and confirm every packaged module actually imports
+    # from it, not just from the checked-out source tree.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --disable-pip-version-check build
+          python -m build --wheel
+
+      - name: Install the built wheel only (no source tree on the import path)
+        run: |
+          cd /tmp
+          python -m pip install --disable-pip-version-check "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)"
+
+      - name: Import smoke test
+        run: |
+          cd /tmp
+          python -c "
+          import _optimizer
+          import _make_v3
+          import objective_module.afpx_objective
+          import objective_module.device_profile
+          import scripts.verify_written_tune
+          print('all core modules imported from the installed wheel')
+          "

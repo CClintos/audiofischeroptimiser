@@ -19,10 +19,34 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["PySide6>=6.8,<7"]
 build = ["PyInstaller>=6.10,<7"]
-test = []
+# Repo-review finding: this was empty even though tests/ actually imports
+# PySide6 (test_gui_backend.py etc.) - a plain `pip install
+# audiofischeroptimiser[test]` couldn't run the full suite.
+test = ["PySide6>=6.8,<7"]
 
 [tool.setuptools.dynamic]
 version = {attr = "optimizer_gui.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["optimizer_gui*"]
+# Repo-review finding: this only included optimizer_gui*, even though most
+# of the actual optimizer/DSP/objective logic lives in root-level modules
+# and objective_module/ and scripts/ - a normal `pip install` of this
+# project silently produced an incomplete, GUI-only package. objective_module
+# and scripts are now regular packages (see their __init__.py) so find()
+# can discover them; root-level modules are listed explicitly below since
+# find() only discovers packages (directories), not standalone .py files.
+include = ["optimizer_gui*", "objective_module*", "scripts*"]
+
+[tool.setuptools]
+py-modules = [
+  "_benchmark",
+  "_devcalc",
+  "_make_v3",
+  "_merge_stream_results",
+  "_optimizer",
+  "_optimizer_stream",
+  "_tunefit",
+  "afpx",
+  "audiofischer_gui",
+  "pct6",
+]

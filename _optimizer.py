@@ -71,6 +71,7 @@ from _tunefit import (
     cascade_db,
     cascade_complex,
     configure_measurement_noise_model,
+    correction_confidence,
     cross_session_persistence,
     erb_smooth,
     erb_hz,
@@ -2407,7 +2408,34 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
     # _resolve_group_bands is the SAME resolution groups_to_band_sets uses for
     # scoring, so an edit/removal is written exactly as it was scored - never
     # a silent extra append alongside an untouched original slot.
-    _, actions_by_channel = _resolve_group_bands(groups)
+    band_sets, actions_by_channel = _resolve_group_bands(groups)
+    # Repo-review finding: post-quantization filter reduction, applied only
+    # here (write time, a handful of finalists) - never in the hot search
+    # loop above this file's own resolution, which runs for every candidate
+    # the beam search evaluates. Only ever drops a purely-APPENDED band
+    # (never an edit or removal, both already-deliberate actions) whose
+    # removal changes that channel's own cascade by less than
+    # FILTER_SIMPLIFICATION_TOLERANCE_DB everywhere - one fewer filter slot
+    # used for the same audible result.
+    if AFPX_OBJECTIVE is not None and hasattr(AFPX_OBJECTIVE, "simplify_removable_bands"):
+        for channel, channel_actions in actions_by_channel.items():
+            removable = [new for kind, _old, new in channel_actions if kind == "append"]
+            if not removable or channel >= len(band_sets):
+                continue
+            try:
+                _kept, dropped = AFPX_OBJECTIVE.simplify_removable_bands(band_sets[channel], removable)
+            except Exception:
+                # Degrades gracefully to "no simplification" - e.g. a test
+                # or tool scoring synthetic bands with no real measurement
+                # session behind them. Never blocks the write itself.
+                continue
+            if not dropped:
+                continue
+            dropped_set = set(dropped)
+            actions_by_channel[channel] = [
+                action for action in channel_actions
+                if not (action[0] == "append" and action[2] in dropped_set)
+            ]
     protected_channels = {
         channel
         for group, bands in groups.items() if bands

@@ -57,11 +57,14 @@ from _tunefit import (
     interference_mask_evidence,
     MASK_UNKNOWN,
     MEASUREMENT_NOISE_MULTIPLIER,
+    high_shelf_db,
+    low_shelf_db,
     measurement_noise_floor_db,
     modal_null_evidence,
     nearfield_null_evidence,
     peaking_db,
     signed_offset_evidence,
+    target_anchor_offset,
 )
 
 # ---- config ---------------------------------------------------------------
@@ -113,10 +116,41 @@ else:
         'low': ('FL Low', 'FR Low', 'Mid Bass Together', (80.0, 2600.0), (200.0, 2000.0)),
         'high': ('FL High', 'FR High', 'Tweeters Together', (2600.0, 16000.0), (2800.0, 16000.0)),
     }
+# Physical channels covered by cross-cutting safety guardrails (headroom,
+# null-boost exposure, total filter-count parsimony): every front role in
+# CH_KEYS, plus both subwoofer outputs. GROUPS['sub']['channels'] is always
+# (6, 7) in _optimizer.py regardless of front layout, so the same physical
+# indices are used here. Previously these guardrail loops iterated only
+# range(len(CH_KEYS)), so a filter placed on the sub was scored acoustically
+# but bypassed headroom, null-boost, and parsimony penalties entirely - a
+# +6 dB/Q6 sub boost that would be hard-rejected on a front channel scored
+# BETTER than the untouched baseline when placed on the sub instead. See
+# CHANGELOG.md. _guardrail_score's own front-only pair/imaging/measurement-
+# noise checks are deliberately NOT extended here - sub has no L/R pair or
+# calibrated noise floor of its own yet, and folding it into that per-band
+# logic is a separate, larger design task.
+GUARDRAIL_CHANNEL_INDICES = tuple(range(len(CH_KEYS))) + (6, 7)
+
+
+def _channel_label(index):
+    if index < len(CH_KEYS):
+        return CH_KEYS[index]
+    return {6: 'Sub A', 7: 'Sub B'}.get(index, 'Channel %d' % index)
+
+
 TARGET = Path(os.environ.get('AFPX_TARGET', str(DATA_ROOT / 'ResoNix Target Curve 2026.txt')))
 BASELINE_AFPX = Path(os.environ.get('AFPX_BASELINE', str(DATA_ROOT / 'baseline.afpx')))
 LEVEL_CALIBRATION = {}
 ANCHOR_BAND = (300.0, 3000.0)
+# Repo-review finding: a secondary listening position (left/right ear) used
+# to get a fully independent target re-anchor, which can silently hide a
+# real broad level difference between positions by always re-centering to
+# its own local median. Now it gets only a small bounded "nuisance" offset
+# around the ONE global (System Sum) anchor - representing plausible
+# mic-placement variance, not a license to erase a genuine asymmetry. If a
+# position's own raw anchor differs from the global one by more than this,
+# the excess stays visible as real deviation instead of vanishing.
+POSITION_ANCHOR_NUISANCE_BOUND_DB = 1.5
 # Close-mic front-stage captures, driver-only with negligible room path.
 # Optional: when both sides are present they let an already-flagged null be
 # confirmed (or left unconfirmed) against how it looks right at the driver,
@@ -156,37 +190,79 @@ INBAND = (60.0, 16000.0)
 
 
 # ---- load measured data + target (once) -----------------------------------
+def _detect_delimiter_and_decimal(sample_lines):
+    """Repo-review finding: REW supports comma, tab, space, and semicolon-
+    delimited exports with a selectable decimal convention, but this used
+    to blindly `.replace(',', ' ')` on every line - fine for the
+    space-delimited, period-decimal exports this project has actually been
+    tested against, but a European-locale decimal comma (e.g. "3,295898")
+    would silently become "3 295898", split into two garbage tokens
+    instead of one number.
+
+    Inspects a handful of real data lines (comments already stripped) and
+    decides delimiter and decimal convention TOGETHER. Returns
+    (delimiter, decimal_is_comma): delimiter is a literal split() separator,
+    or None for "any whitespace".
+    """
+    for text in sample_lines:
+        if '\t' in text:
+            return '\t', False
+        if ';' in text:
+            return ';', True  # semicolon-delimited REW exports are always comma-decimal
+    for text in sample_lines:
+        if ',' not in text:
+            continue
+        # Whitespace already splits this line into 2+ tokens, so it's
+        # already doing the field-separating job - a comma living INSIDE
+        # one of those tokens is a decimal point (e.g. "100,5 60,0" or
+        # "3,295898 40,533"), not a second, redundant delimiter.
+        if len(text.split()) >= 2:
+            return None, True
+        # No whitespace at all: the comma(s) must be the field separator
+        # (e.g. "20.5,70.3").
+        return ',', False
+    return None, False
+
+
 def _load_txt_rich(path, min_points=16):
     """Load a REW-style trace and fail loudly on missing or truncated inputs."""
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError('Required measurement is missing: %s' % path)
+    with open(path, encoding='utf-8', errors='replace') as handle:
+        raw_lines = handle.readlines()
+    data_preview = [
+        stripped for stripped in (line.strip() for line in raw_lines)
+        if stripped and not stripped.startswith(('*', '#', ';'))
+    ][:20]
+    delimiter, decimal_is_comma = _detect_delimiter_and_decimal(data_preview)
     columns = [[], [], [], [], []]
     numeric_rows = 0
-    with open(path, encoding='utf-8', errors='replace') as handle:
-        for line_number, line in enumerate(handle, 1):
-            text = line.strip()
-            if not text or text.startswith(('*', '#', ';')):
-                continue
-            parts = text.replace(',', ' ').split()
+    for line_number, line in enumerate(raw_lines, 1):
+        text = line.strip()
+        if not text or text.startswith(('*', '#', ';')):
+            continue
+        normalized = text.replace(',', '.') if decimal_is_comma else text
+        parts = normalized.split(delimiter) if delimiter is not None else normalized.split()
+        parts = [p for p in (p.strip() for p in parts) if p]
+        try:
+            values = [float(value) for value in parts[:5]]
+        except (ValueError, TypeError):
+            numeric_start = False
             try:
-                values = [float(value) for value in parts[:5]]
-            except (ValueError, TypeError):
-                numeric_start = False
-                try:
-                    float(parts[0])
-                    numeric_start = True
-                except (ValueError, TypeError, IndexError):
-                    pass
-                if not numeric_start and any(char.isalpha() for char in text):
-                    continue
-                raise ValueError('Malformed numeric row in %s at line %d' % (path, line_number))
-            if len(values) < 2:
-                raise ValueError('Measurement row needs frequency and SPL in %s at line %d'
-                                 % (path, line_number))
-            numeric_rows += 1
-            for index, value in enumerate(values):
-                columns[index].append(value)
+                float(parts[0])
+                numeric_start = True
+            except (ValueError, TypeError, IndexError):
+                pass
+            if not numeric_start and any(char.isalpha() for char in text):
+                continue
+            raise ValueError('Malformed numeric row in %s at line %d' % (path, line_number))
+        if len(values) < 2:
+            raise ValueError('Measurement row needs frequency and SPL in %s at line %d'
+                             % (path, line_number))
+        numeric_rows += 1
+        for index, value in enumerate(values):
+            columns[index].append(value)
     if numeric_rows < int(min_points):
         raise ValueError('Measurement %s is truncated: %d points, need at least %d'
                          % (path, numeric_rows, min_points))
@@ -194,9 +270,29 @@ def _load_txt_rich(path, min_points=16):
     spl = np.asarray(columns[1], dtype=float)
     if np.any(~np.isfinite(freqs)) or np.any(~np.isfinite(spl)):
         raise ValueError('Measurement contains non-finite frequency or SPL values: %s' % path)
-    if np.any(freqs <= 0.0) or np.any(np.diff(freqs) <= 0.0):
-        raise ValueError('Measurement frequencies must be positive and strictly increasing: %s' % path)
-    result = {'freq': freqs, 'spl': spl, 'path': str(path)}
+    if np.any(freqs <= 0.0):
+        raise ValueError('Measurement frequencies must be positive: %s' % path)
+    # Resolve exact-duplicate frequency rows explicitly (keep the first,
+    # drop the rest) rather than letting them fail the ordering check below
+    # with a generic "not strictly increasing" error that doesn't say why.
+    _, first_indices = np.unique(freqs, return_index=True)
+    duplicates_dropped = int(len(freqs) - len(first_indices))
+    if duplicates_dropped:
+        keep = np.sort(first_indices)
+        columns = [[column[i] for i in keep] if column else column for column in columns]
+        freqs = np.asarray(columns[0], dtype=float)
+        spl = np.asarray(columns[1], dtype=float)
+        numeric_rows = len(keep)
+    if np.any(np.diff(freqs) <= 0.0):
+        raise ValueError('Measurement frequencies must be strictly increasing: %s' % path)
+    result = {
+        'freq': freqs, 'spl': spl, 'path': str(path),
+        'format': {
+            'delimiter': delimiter if delimiter is not None else 'whitespace',
+            'decimal_is_comma': decimal_is_comma,
+            'duplicate_frequency_rows_dropped': duplicates_dropped,
+        },
+    }
     if len(columns[2]) == numeric_rows:
         phase = np.asarray(columns[2], dtype=float)
         if np.all(np.isfinite(phase)):
@@ -363,6 +459,7 @@ _NULL_MASK = None
 _V5 = None
 _GRID_TOKEN = None
 _BASE_CASCADES = []
+_BASE_SHELF_DB = []
 _TOTAL_DB = None
 _SMOOTH_T = {}
 _POSITION_TRACES = {}
@@ -389,6 +486,29 @@ def _peqset(xml):
                     for a in (_attrs(t) for t in re.findall(r'<Fil\b[^>]*/>', oc))
                     if a['T'] == '17' and float(a['G']) != 0])
     return out
+
+
+def _shelf_bands(xml):
+    """Active low/high-shelf filters (T=3/T=4 - see afpx_format.md) per
+    channel: (kind, F, Q, G). The search never proposes or edits a shelf -
+    only T=17 PEQ - so this is purely a fixed, baseline-only contribution to
+    the real per-channel gain chain, never a candidate variable."""
+    out = []
+    for oc in re.findall(r'<OC\b.*?</OC>', xml, re.S)[:8]:
+        bands = []
+        for a in (_attrs(t) for t in re.findall(r'<Fil\b[^>]*/>', oc)):
+            if a['T'] not in ('3', '4') or float(a['G']) == 0:
+                continue
+            bands.append(('low' if a['T'] == '3' else 'high', float(a['F']), float(a['Q']), float(a['G'])))
+        out.append(bands)
+    return out
+
+
+def _shelf_chain_db(freqs, bands):
+    total = np.zeros_like(freqs)
+    for kind, f, q, g in bands:
+        total += (low_shelf_db if kind == 'low' else high_shelf_db)(freqs, f, q, g)
+    return total
 
 
 def _output_levels_db(xml):
@@ -578,7 +698,7 @@ def _build_complex_models(position_specs):
 
 def _init():
     global _F, _T, _TGT, _NULL_MASK, _V5, _GRID_TOKEN
-    global _BASE_CASCADES, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
+    global _BASE_CASCADES, _BASE_SHELF_DB, _TOTAL_DB, _SMOOTH_T, _POSITION_TRACES, _POSITION_BASELINE, _SMOOTHER
     global _BASE_OUTPUT_DB, _TRACE_META, _COMPLEX_MODELS, _POSITION_COMPLEX_MODELS, _PREDICTION_AUDIT
     global _SYNTHETIC_PAIRS, _MASK_AUDIT, _NEARFIELD_GUARD_MASK
     if _F is not None:
@@ -629,13 +749,26 @@ def _init():
     tf, ts = target_trace['freq'], target_trace['spl']
     tgt = np.interp(np.log10(F), np.log10(np.array(tf)), np.array(ts))
     band = (F >= ANCHOR_BAND[0]) & (F <= ANCHOR_BAND[1])
-    _TGT = tgt + float(np.median(_T['System Sum'][band] - tgt[band]))
+    # Repo-review finding: this used to be a plain single-band median even
+    # though the confidence-weighted, multi-band-fallback target_anchor_offset()
+    # already existed and wasn't used anywhere. Robust to a thin/noisy
+    # 300-3000 Hz window (falls back to 120-1000 Hz, then 1000-6000 Hz, then
+    # anything finite) rather than silently degrading with fewer valid bins.
+    global_anchor_offset = target_anchor_offset(F, _T['System Sum'], tgt)
+    _TGT = tgt + global_anchor_offset
     # null mask: destructive-interference bins in either front pair (from MEASURED
     with open(BASELINE_AFPX, 'rb') as handle:
-        baseline_xml = zlib.decompress(handle.read()[4:]).decode('utf-8', 'replace')
+        # Strict, not 'replace' - see _make_v3.decode_afpx for why.
+        baseline_xml = zlib.decompress(handle.read()[4:]).decode('utf-8', 'strict')
     _V5 = _peqset(baseline_xml)
     _BASE_OUTPUT_DB = _output_levels_db(baseline_xml)
     _BASE_CASCADES = [_casc_uncached(bands) for bands in _V5]
+    # Full-chain headroom (repo-review finding): the search never touches
+    # shelves (only T=17 PEQ), so this is a fixed, baseline-only addition to
+    # each channel's real gain chain - included at headroom-check time only,
+    # never in _BASE_CASCADES itself (that stays PEQ-only, matching what
+    # _delta_channel and everything else that measures a PEQ CHANGE expects).
+    _BASE_SHELF_DB = [_shelf_chain_db(F, bands) for bands in _shelf_bands(baseline_xml)]
     _TOTAL_DB = _system_branch_total_uncached()
     _SMOOTH_T = {key: _smooth(values) for key, values in _T.items()}
 
@@ -643,6 +776,10 @@ def _init():
     position_specs = {
         'left': ('Left Ear ', 'Left '),
         'right': ('Right Ear ', 'Right '),
+    }
+    target_anchor_audit = {
+        'global_offset_db': round(float(global_anchor_offset), 3),
+        'positions': {},
     }
     for position, prefixes in position_specs.items():
         path = _position_path(prefixes, SOLO_FILES['System Sum'])
@@ -652,8 +789,29 @@ def _init():
         pf = position_trace['freq']
         ps = position_trace['spl'] + _calibration_offset(position + ':System Sum', path)
         measured = np.interp(np.log10(_F), np.log10(pf), ps)
-        target = tgt + float(np.median(measured[band] - tgt[band]))
+        # Repo-review finding: each position previously got a FULLY
+        # INDEPENDENT re-anchor here, which can silently hide a genuine
+        # broad level difference between positions (a real acoustic
+        # asymmetry, not mic-placement noise) by always re-centering to
+        # match its own target-region median. Now: one global anchor
+        # (above) stays fixed for the whole search, and each position gets
+        # only a small BOUNDED nuisance offset around it - representing
+        # plausible mic-placement variance, not a license to erase a real
+        # difference. If the position's own raw anchor would have differed
+        # from the global one by more than the bound, the excess stays
+        # visible as real deviation instead of being absorbed away.
+        position_raw_offset = target_anchor_offset(F, measured, tgt)
+        nuisance = float(np.clip(
+            position_raw_offset - global_anchor_offset,
+            -POSITION_ANCHOR_NUISANCE_BOUND_DB, POSITION_ANCHOR_NUISANCE_BOUND_DB,
+        ))
+        target = tgt + global_anchor_offset + nuisance
         _POSITION_TRACES[position] = {'system': measured, 'target': target, 'file': str(path)}
+        target_anchor_audit['positions'][position] = {
+            'raw_offset_db': round(float(position_raw_offset), 3),
+            'nuisance_offset_db': round(nuisance, 3),
+            'clamped': abs(float(position_raw_offset) - global_anchor_offset) > POSITION_ANCHOR_NUISANCE_BOUND_DB + 1e-9,
+        }
     _NULL_MASK = np.zeros_like(F, dtype=bool)
     pair_audit = {}
     for name, (left, right, together, band_range, _balance) in PAIR_SPECS.items():
@@ -715,6 +873,7 @@ def _init():
             'regions': modal['regions'],
         },
         'nearfield': nearfield_audit,
+        'target_anchor': target_anchor_audit,
         'blocking_pairs': [
             name for name, item in pair_audit.items() if item['state'] == MASK_UNKNOWN
         ],
@@ -752,15 +911,79 @@ def _casc(bands):
     return d
 
 
+# Repo-review finding: post-quantization filter reduction. Deliberately a
+# WRITE-TIME-ONLY refinement on the small number of already-selected
+# finalists, never wired into the hot search-loop resolution
+# (_resolve_group_bands/groups_to_band_sets run for every candidate the
+# beam search evaluates - thousands per run - and this does several extra
+# _casc() calls per channel, which would meaningfully slow the search for
+# no benefit there). It only ever considers bands the search purely
+# APPENDED (never an edited or pre-existing baseline band - editing/
+# removing an existing filter is a deliberate, already-justified action,
+# not redundant filter-count bloat), so it can only ever reduce filter
+# count, never change what an edit or removal already decided.
+FILTER_SIMPLIFICATION_TOLERANCE_DB = 0.1
+
+
+def simplify_removable_bands(channel_bands, removable_bands, tolerance_db=FILTER_SIMPLIFICATION_TOLERANCE_DB):
+    """Drop any of `removable_bands` (a subset of `channel_bands`) whose
+    removal changes that channel's own cascade by less than `tolerance_db`
+    everywhere - it isn't pulling its weight, so it isn't worth the filter
+    slot. Then checks near-cancelling PAIRS among whatever survives alone
+    (each individually meaningful, but redundant together). Returns
+    (kept_bands, dropped_bands); `kept_bands` always contains every band
+    NOT in `removable_bands`, unconditionally."""
+    _init()
+    removable_set = set(removable_bands)
+    protected = [b for b in channel_bands if b not in removable_set]
+    working = list(removable_bands)
+    dropped = []
+    index = 0
+    while index < len(working):
+        trial = working[:index] + working[index + 1:]
+        before = _casc(protected + working)
+        after = _casc(protected + trial)
+        if float(np.max(np.abs(before - after))) < tolerance_db:
+            dropped.append(working[index])
+            working = trial
+        else:
+            index += 1
+    changed = True
+    while changed and len(working) >= 2:
+        changed = False
+        for a in range(len(working)):
+            for b in range(a + 1, len(working)):
+                trial = [x for j, x in enumerate(working) if j not in (a, b)]
+                before = _casc(protected + working)
+                after = _casc(protected + trial)
+                if float(np.max(np.abs(before - after))) < tolerance_db:
+                    dropped.extend([working[a], working[b]])
+                    working = trial
+                    changed = True
+                    break
+            if changed:
+                break
+    return protected + working, dropped
+
+
 def _band_key(band):
     f, q, g = band
     return (round(float(f), 1), round(float(q), 2), round(float(g) * 4.0) / 4.0)
 
 
-def _added_bands_by_channel(band_sets):
-    """Return only filters added on top of the matching baseline tune."""
+def _added_bands_by_channel(band_sets, channels=None):
+    """Return only filters added on top of the matching baseline tune.
+
+    Defaults to front channels only (CH_KEYS), matching every existing
+    caller's front-specific logic (L/R pair symmetry, imaging, per-band
+    measurement-noise justification - none of which have a sub analog
+    defined yet). Pass channels=GUARDRAIL_CHANNEL_INDICES explicitly at a
+    call site that should also see sub-channel additions.
+    """
+    if channels is None:
+        channels = range(len(CH_KEYS))
     added = {}
-    for i, _key in enumerate(CH_KEYS):
+    for i in channels:
         candidate = list(band_sets[i]) if i < len(band_sets) else []
         baseline = list(_V5[i]) if i < len(_V5) else []
         remaining = Counter(_band_key(b) for b in baseline)
@@ -1368,15 +1591,22 @@ def objective(band_sets, output_trim_override=None):
     null_boost = 0.0
     headroom_violations = 0
     headroom_margin_db = {}
-    for i in range(len(CH_KEYS)):
+    for i in GUARDRAIL_CHANNEL_INDICES:
         trim_i = float(trim_plan.get(i, 0.0))
-        candidate_cascade = _casc(band_sets[i])
+        # Full-chain headroom: shelves (T=3/4) carry real gain and are part
+        # of the actual per-channel signal chain, but the search never
+        # touches them - fold their fixed baseline contribution into the
+        # peak everywhere PEQ cascade + output trim used to stand in for
+        # the "whole chain" alone. Repo-review finding: a baseline with an
+        # active shelf could have its true peak silently underestimated.
+        shelf_i = _BASE_SHELF_DB[i] if i < len(_BASE_SHELF_DB) else np.zeros_like(_F)
+        candidate_cascade = _casc(band_sets[i]) + shelf_i
         b = candidate_cascade + trim_i
         head_peak = max(head_peak, float(np.max(b)))
-        baseline_peak_db = float(np.max(_BASE_CASCADES[i])) + float(_BASE_OUTPUT_DB[i])
+        baseline_peak_db = float(np.max(_BASE_CASCADES[i] + shelf_i)) + float(_BASE_OUTPUT_DB[i])
         candidate_peak_db = float(np.max(candidate_cascade)) + float(_BASE_OUTPUT_DB[i]) + trim_i
         margin_db = -candidate_peak_db
-        headroom_margin_db[CH_KEYS[i]] = round(margin_db, 3)
+        headroom_margin_db[_channel_label(i)] = round(margin_db, 3)
         baseline_clip_risk = baseline_peak_db > 0.0
         candidate_makes_it_worse = candidate_peak_db > baseline_peak_db + 1e-9
         channel_unsafe = candidate_makes_it_worse and (
@@ -1396,7 +1626,7 @@ def objective(band_sets, output_trim_override=None):
     # spot is left alone. Same huge-penalty guardrail convention as headroom.
     nearfield_skirt_violations = 0
     if _NEARFIELD_GUARD_MASK is not None and np.any(_NEARFIELD_GUARD_MASK):
-        for i, bands in _added_bands_by_channel(band_sets).items():
+        for i, bands in _added_bands_by_channel(band_sets, channels=GUARDRAIL_CHANNEL_INDICES).items():
             for f, q, g in bands:
                 if g <= 0.0:
                     continue
@@ -1405,7 +1635,11 @@ def objective(band_sets, output_trim_override=None):
                     nearfield_skirt_violations += 1
     nearfield_skirt_penalty = NEARFIELD_SKIRT_PENALTY * nearfield_skirt_violations
 
-    n_bands = sum(len(bs) for bs in band_sets[:len(CH_KEYS)])
+    # Parsimony must count every filter that costs a slot, not just front
+    # ones - a sub-only candidate previously looked "free" here too.
+    n_bands = sum(
+        len(band_sets[i]) for i in GUARDRAIL_CHANNEL_INDICES if i < len(band_sets)
+    )
     guard = _guardrail_score(band_sets, pr)
 
     # spatial_worst_db only carries independent evidence when there is more
@@ -1430,6 +1664,9 @@ def objective(band_sets, output_trim_override=None):
         'nearfield_skirt_violation_count': nearfield_skirt_violations,
         'nearfield_skirt_guardrail_penalty': float(nearfield_skirt_penalty),
         'null_boost_avg': null_boost,
+        # Key name kept for compatibility with existing reporting/CSV
+        # consumers (_optimizer.py's "filter_count"); the VALUE now counts
+        # sub-channel filters too - see GUARDRAIL_CHANNEL_INDICES above.
         'n_front_bands': n_bands,
         'protective_output_trim_db': max(0.0, -min(trim_plan.values())) if trim_plan else 0.0,
         'output_level_gain_db': max(0.0, max(trim_plan.values())) if trim_plan else 0.0,
@@ -1509,7 +1746,8 @@ def cache_stats():
 
 def score_afpx(path):
     _init()
-    xml = zlib.decompress(open(path, 'rb').read()[4:]).decode('utf-8', 'replace')
+    # Strict, not 'replace' - see _make_v3.decode_afpx for why.
+    xml = zlib.decompress(open(path, 'rb').read()[4:]).decode('utf-8', 'strict')
     candidate_levels = _output_levels_db(xml)
     output_delta = {
         index: float(candidate_levels[index] - _BASE_OUTPUT_DB[index])

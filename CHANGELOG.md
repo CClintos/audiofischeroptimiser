@@ -4,6 +4,205 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-01 - Platform fixes from a repo review ("Batch C")
+
+Final tier of the same review - packaging, parsing, and CI, not acoustic
+behaviour. No changes to search/scoring numerics. 139 tests passing (up
+from 135 after Batch B).
+
+- **`DeviceProfile`** (`objective_module/device_profile.py`): consolidates
+  the DSP's sample rate and PEQ hardware range (frequency/Q/gain), which
+  were hardcoded literals repeated in `_tunefit.py` (`FS = 96000.0`) and
+  `_make_v3.py` (`validate_peq_band`'s 20-20000 Hz/0.5-15 Q/-15..+6 dB).
+  Value-preserving - both call sites now read from one documented
+  `HELIX_P_SIX_MK2` profile instead of repeating the numbers, with the
+  model-verification caveat attached directly to it. Deliberately does NOT
+  fold `GROUPS`'s own `gain_range`/`q_range` (`_optimizer.py`) into this -
+  those are conservative ACOUSTIC SEARCH POLICY ("should we"), not a
+  hardware limit ("can the hardware"), and stay separate on purpose. Found
+  and fixed a real bug while wiring this in: an early version added
+  `objective_module/` directly to `sys.path` from inside `_tunefit.py` (and
+  from `_make_v3.py`), which let a bare `import _tunefit` elsewhere resolve
+  straight to `objective_module/_tunefit.py` instead of the root
+  `_tunefit.py` compatibility shim - silently loading the file TWICE under
+  two different module identities, so every DSP function in it existed as
+  two different objects. `CanonicalDspTests` (pre-existing) caught it
+  immediately; fixed with a relative import in the package case and a
+  fully-qualified `objective_module.device_profile` import from
+  `_make_v3.py`, no sys.path changes needed either way.
+- **REW parser hardening** (`_load_txt_rich` in `afpx_objective.py`): used
+  to blindly `.replace(',', ' ')` on every line, which corrupts a European-
+  locale decimal comma (e.g. "3,295898" -> "3 295898", split into two
+  garbage tokens) even though REW itself supports comma/tab/space/
+  semicolon-delimited exports with a selectable decimal convention. New
+  `_detect_delimiter_and_decimal()` inspects a handful of real data lines
+  and decides delimiter and decimal convention TOGETHER: tab or semicolon
+  found first wins outright (semicolon implies comma-decimal); otherwise,
+  if whitespace already splits the line into 2+ tokens, a comma living
+  inside one of them is a decimal point; only when there's no whitespace
+  at all is a comma treated as the field separator. (An initial version
+  used "4+ digits after a comma implies decimal" instead, which misread a
+  perfectly ordinary "100,5 60,0" SPL row as comma-delimited - caught by
+  the tests before it shipped.) Also: exact-duplicate frequency rows are
+  now dropped explicitly (keep the first, report the count in the trace's
+  new `format` dict) instead of failing the generic "not strictly
+  increasing" check with no indication of why; a genuinely out-of-order
+  (non-duplicate) row still fails that check as before. Verified against
+  all 22 real REW export files across all three of the user's sessions -
+  zero behaviour change for real data, this only changes what happens on
+  input that previously would have been silently corrupted or opaquely
+  rejected.
+- **Packaging**: `pyproject.toml`'s `packages.find` only ever included
+  `optimizer_gui*`, even though most of the actual optimizer/DSP logic
+  lives in root-level modules and `objective_module`/`scripts`. A plain
+  `pip install` of this project silently produced a GUI-only, non-
+  functional package. `objective_module/` and `scripts/` gained a minimal
+  `__init__.py` (regular packages now, not implicit namespace packages, so
+  `packages.find` can discover them); root-level modules are listed
+  explicitly under a new `[tool.setuptools] py-modules` (setuptools'
+  package finder only discovers directories, not standalone `.py` files).
+  The empty `test` extra now pins `PySide6` (tests/test_gui_backend.py
+  already imports it). Verified with a real wheel build + install into a
+  clean venv + import from outside the source tree - every core module
+  resolves from the installed package, not a stale source-tree fallback.
+- **PR CI** (`.github/workflows/tests.yml`): the only existing workflow
+  was the tag-triggered Windows release build - a plain commit or pull
+  request never ran anything. New workflow runs the full suite on
+  `pull_request` and push-to-`main`, matrixed across Python 3.11/3.12/3.14
+  (3.14 matching the release build) and Ubuntu/Windows (Ubuntu needs a
+  handful of headless-Qt system libraries; `test_gui_backend.py` already
+  sets `QT_QPA_PLATFORM=offscreen`), plus a separate job that builds a real
+  wheel and smoke-tests importing every core module from the installed
+  package - the same check used to verify the packaging fix above, now
+  running on every PR instead of only when someone remembers to check by
+  hand.
+
+## 2026-08-01 - Audible-quality improvements from a repo review ("Batch B")
+
+Continuation of Batch A below - the same review's higher-effort, more
+architectural recommendations. Optimizer only, no GUI changes. 133 tests
+passing (up from 122 after Batch A).
+
+- **Full-chain headroom now includes shelves.** Headroom only ever looked at
+  the T=17 PEQ cascade; a T=3/4 shelf carries real gain but was invisible to
+  every headroom check. The search never touches shelves (only PEQ), so this
+  is a fixed, baseline-only addition to the real per-channel chain -
+  `_BASE_SHELF_DB` (built once in `_init()` from `low_shelf_db`/
+  `high_shelf_db`, already existing in `_tunefit.py` but unused for this)
+  folded into the headroom peak everywhere PEQ cascade + output trim used to
+  stand in for "the whole chain" alone. Verified with a synthetic baseline
+  (a +6 dB/9 kHz shelf on a channel trimmed to -9.1 dB output): pre-fix, a
+  +4 dB/12 kHz PEQ candidate reported a comfortable 5.1 dB margin; the real
+  combined peak was actually within a fraction of a dB of 0 dBFS. Crossovers
+  (T=9/15/16) and a separate "routing gain" stage were deliberately NOT
+  added - crossovers are pure attenuation (never raise the peak, so omitting
+  them is conservative, not unsafe) and this hardware's AFPX format has no
+  routing/mix stage distinct from per-channel PEQ + output level.
+- **Continuous boost/cut correction confidence.** The objective's null
+  classification, repeatability, and driver-authority checks were real but
+  separate binary gates. `correction_confidence()` (`_tunefit.py`) combines
+  them into one continuous [0,1] score per frequency, split asymmetrically:
+  boosting needs stronger evidence than cutting (a missed cut just leaves a
+  peak in place; an unjustified boost can audibly worsen the exact spot it
+  targeted). Wired into `_optimizer_stream.py`'s candidate generation as a
+  gain-scaling refinement on top of (never instead of) every existing gate:
+  a proposed boost scales by confidence², a cut by confidence's square root,
+  matching the asymmetry. A near-miss on the design: the first version
+  defaulted every missing-evidence factor to 0.5 and multiplied them all
+  together, so a single-session run with no position/phase data (the common
+  case) compounded three or four 0.5s into rejecting ~98% of every boost's
+  gain even with strong evidence on the factors that WERE available. Caught
+  before it shipped and fixed: missing evidence is neutral (1.0, no effect on
+  a product of independent factors), not partial-credit.
+- **Global target anchor + bounded per-position offsets.** A secondary
+  listening position (left/right ear) used to get a FULLY INDEPENDENT target
+  re-anchor, which can silently hide a genuine broad level difference
+  between positions by always re-centering to its own local median. Now: one
+  confidence-weighted, multi-band-fallback global anchor
+  (`target_anchor_offset()` - already existed, was never used) stays fixed
+  for the whole search, and each position gets only a small bounded
+  "nuisance" offset (`POSITION_ANCHOR_NUISANCE_BOUND_DB = 1.5`) around it. A
+  position whose raw independent anchor would have differed by more than
+  that keeps the excess visible as real deviation instead of it vanishing.
+  Offsets are recorded in `_MASK_AUDIT['target_anchor']` for the report.
+- **Post-quantization filter reduction.** After the search picks its
+  finalists, `simplify_removable_bands()` drops any PURELY APPENDED band
+  (never an edit or removal - both already-deliberate actions, never
+  touched) whose removal changes that channel's own cascade by less than
+  0.1 dB everywhere, then checks near-cancelling PAIRS of whatever survives
+  alone. Wired into `write_candidate()` only - deliberately NOT into
+  `_resolve_group_bands`/`groups_to_band_sets`, which run for every
+  candidate the beam search evaluates (thousands per run); this is a
+  refinement on the small number of already-selected finalists, not a
+  search-time cost.
+
+## 2026-08-01 - Correctness fixes from a repo review ("Batch A")
+
+An independent architecture review (static read of `main`, no test run) found
+four correctness issues. All four verified against real code and real v9 data
+before fixing, all four now have dedicated regression tests. Optimizer only.
+
+- **Sub-channel guardrail gap (the highest-priority finding).** Headroom,
+  null-boost exposure, and the parsimony filter count in
+  `objective_module/afpx_objective.py`'s `objective()` all iterated
+  `range(len(CH_KEYS))` - front channels only. The subwoofer lives at
+  physical channels 6/7 (`GROUPS['sub']['channels']` in `_optimizer.py`,
+  always, regardless of front layout), so a filter placed there was scored
+  acoustically but bypassed every safety and parsimony penalty entirely.
+  Verified against the real v9 baseline: a +6 dB/Q6 boost that gets
+  hard-rejected (objective ~2048, guardrail penalty ~41) on a front channel
+  scored *better than doing nothing* (objective 6.2359 vs baseline 6.2370)
+  when placed on the sub instead. Fixed with an explicit
+  `GUARDRAIL_CHANNEL_INDICES` covering CH_KEYS plus channels 6/7, used by
+  the headroom loop, null-boost accumulation, and the parsimony band count.
+  `_added_bands_by_channel()` gained an optional `channels` parameter so the
+  one call site that should see sub additions (the DEFECT-4a nearfield-skirt
+  guardrail) can ask for them, while `_guardrail_score()`'s own front-only
+  L/R-pair/imaging/measurement-noise checks stay front-scoped on purpose -
+  sub has no L/R pair or calibrated noise floor of its own yet; folding it
+  into that per-band logic is a separate, larger design task, not this fix.
+- **48 kHz/96 kHz minimum-phase inconsistency.**
+  `objective_module/_tunefit.py`'s `minphase_from_mag()` hardcoded
+  `fs=48000.0` for its cepstral reconstruction's internal FFT grid
+  (`lin_f = linspace(0, fs/2, ...)`), and `excess_gd_mask()` (the EQ-ability
+  classifier) called it without overriding that. Harmless for most car-audio
+  REW exports (~20-24 kHz max), but any measured content at or above 24 kHz
+  never made it into the reconstruction at all - `np.interp`'s default flat
+  extrapolation just froze the output at whatever value sat right at 24 kHz.
+  Not really a "should be 96 kHz instead" fix (this operates on measured
+  acoustic data, not the DSP's own biquad math, so there's no reason it
+  needs to match the 96 kHz `FS` constant) - now derived from the data
+  itself (2.2x headroom above the highest measured frequency), so it's
+  always correct for whatever `freqs` actually contains. `fs` is still
+  overridable on both functions.
+- **AFPX decoded with `.decode('utf-8', 'replace')`,** including on the
+  write path (`_make_v3.decode_afpx`, used by every `write_candidate` call)
+  and the verification path (`scripts/verify_written_tune.py`). A malformed
+  or non-UTF-8 byte would silently become U+FFFD, which then re-encodes to
+  DIFFERENT bytes than the original on write - corrupting whatever attribute
+  held it, even outside the one value a write actually intends to change.
+  There was already a weak indirect check (compare the AFPX header's
+  declared length against the re-encoded length) but it only printed a
+  warning and continued. Switched every decode site to strict UTF-8 (fails
+  loudly instead). Verified empirically against 24 real AFPX files spanning
+  several tuning iterations (v4 through v9, plus variants) - all decode as
+  clean UTF-8 already, so this costs nothing for real files; it only closes
+  the silent-corruption path for a malformed one. A full byte-preserving
+  rewrite (never decoding to `str` at all) would be safer still but is a
+  much larger change to every regex call site in `_make_v3.py` and
+  `afpx_objective.py` - not done here.
+- **Modal-null width used the whole search window, not the connected
+  component.** In `modal_null_evidence()`'s single-position fallback,
+  `contiguous = around` took every "dip" bin within 1/3 octave of the
+  candidate minimum - not the connected region actually containing that
+  minimum. Two separate narrow notches close together got silently merged
+  into one inflated width estimate, which could push a genuinely narrow
+  (and otherwise-qualifying, >=8 dB deep) null over the 1/6-octave modal
+  cutoff and hide it. Verified with a synthetic two-notch signal: it
+  returned `MASK_CLEAR` (found nothing) before the fix. Now walks outward
+  from the confirmed minimum while the bin stays a "dip" bin, giving the
+  true width of just that null.
+
 ## 2026-08-01 - Fix two more bugs found preparing the real v9 re-run
 
 Found while running the fixed optimizer against real measurements and a

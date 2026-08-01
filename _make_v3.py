@@ -8,6 +8,13 @@ import zlib
 import math
 from pathlib import Path
 
+# Fully-qualified, not a bare "import device_profile" via sys.path.insert -
+# adding objective_module/ directly to sys.path let a bare `import _tunefit`
+# elsewhere (e.g. _optimizer.py) resolve to objective_module/_tunefit.py
+# directly instead of the root _tunefit.py compatibility shim, silently
+# duplicating every DSP function in that file as a second, different
+# object. Caught by CanonicalDspTests before it shipped. See CHANGELOG.md.
+from objective_module.device_profile import DEFAULT_DEVICE_PROFILE
 
 SRC = Path('baseline.afpx')
 DST = Path(__file__).resolve().with_name('baseline_updated.afpx')
@@ -22,7 +29,15 @@ def decode_afpx(path):
     if len(raw) < 5:
         raise ValueError('AFPX file is too short: %s' % path)
     declared_len = struct.unpack('>I', raw[:4])[0]
-    xml = zlib.decompress(raw[4:]).decode('utf-8', 'replace')
+    # Strict, not 'replace': every real AFPX checked so far (24 files spanning
+    # several PC-Tool versions) decodes as clean UTF-8. 'replace' would
+    # silently swap any malformed byte for U+FFFD, which then re-encodes to
+    # DIFFERENT bytes than the original on write - corrupting whatever
+    # attribute held it, even outside the one value this tool intends to
+    # change. Fail loudly instead; the length-mismatch warning below was
+    # already trying to catch exactly this, but only printed and continued.
+    # See CHANGELOG.md.
+    xml = zlib.decompress(raw[4:]).decode('utf-8', 'strict')
     actual_len = len(xml.encode('utf-8'))
     if declared_len != actual_len:
         print('warning: AFPX header length %d != decoded XML length %d' %
@@ -234,13 +249,16 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
             'channel_diffs': channel_diffs}
 
 
-def validate_peq_band(F, Q, G, protected_boost=False):
+def validate_peq_band(F, Q, G, protected_boost=False, device=DEFAULT_DEVICE_PROFILE):
     F, Q, G = float(F), float(Q), float(G)
-    if not (20.0 <= F <= 20000.0):
+    f_lo, f_hi = device.peq_frequency_range_hz
+    q_lo, q_hi = device.peq_q_range
+    g_lo, g_hi = device.peq_gain_range_db
+    if not (f_lo <= F <= f_hi):
         raise ValueError('PEQ frequency out of range: %.2f' % F)
-    if not (0.5 <= Q <= 15.0):
+    if not (q_lo <= Q <= q_hi):
         raise ValueError('PEQ Q out of range: %.3f' % Q)
-    if not (-15.0 <= G <= 6.0):
+    if not (g_lo <= G <= g_hi):
         raise ValueError('PEQ gain out of Helix range: %.2f' % G)
     if G > 3.0 and not protected_boost:
         print('warning: boost %.2f dB is inside hardware range but above the app safety cap' % G)

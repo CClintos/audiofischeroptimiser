@@ -11,7 +11,8 @@ def decode(path):
     if len(raw) < 5:
         raise ValueError('file too short to be a valid .afpx: %s' % path)
     declared = struct.unpack('>I', raw[:4])[0]
-    xml = zlib.decompress(raw[4:]).decode('utf-8', 'replace')
+    # Strict, not 'replace' - see _make_v3.decode_afpx for why.
+    xml = zlib.decompress(raw[4:]).decode('utf-8', 'strict')
     if declared != len(xml.encode('utf-8')):
         print('warning: header length %d != decoded length %d' % (declared, len(xml.encode('utf-8'))),
               file=sys.stderr)
