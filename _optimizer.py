@@ -1221,6 +1221,144 @@ def make_candidate_plan_scorer(band_set_scorer):
     return score_plan
 
 
+def candidate_plan_phase_conflicts(
+    freqs: np.ndarray,
+    plan: CandidatePlan,
+    phase_plan: List[Dict[str, object]] | None,
+    threshold_db: float = 0.5,
+) -> List[Dict[str, object]]:
+    groups = thaw_groups(plan.groups)
+    conflicts = phase_peq_conflicts(
+        freqs, groups, phase_plan, threshold_db
+    )
+    if not phase_plan or not plan.slot_edits:
+        return conflicts
+
+    for phase_edit in phase_plan:
+        try:
+            lo, hi = (
+                float(value)
+                for value in phase_edit.get("crossover_band", ())
+            )
+        except (TypeError, ValueError):
+            continue
+        selected = (freqs >= lo) & (freqs <= hi)
+        if not np.any(selected):
+            continue
+        crossover_channels = {
+            int(value)
+            for value in phase_edit.get("crossover_channels", ())
+        }
+        for slot_edit in plan.slot_edits:
+            if slot_edit.ref.channel not in crossover_channels:
+                continue
+            old_f, old_q, old_g = slot_edit.ref.original
+            old_response = peaking_db(
+                freqs, old_f, old_q, old_g
+            )
+            if slot_edit.replacement is None:
+                new_response = np.zeros_like(freqs)
+            else:
+                new_response = peaking_db(
+                    freqs, *slot_edit.replacement
+                )
+            maximum = float(np.max(np.abs(
+                new_response[selected] - old_response[selected]
+            )))
+            if maximum + 1e-12 < float(threshold_db):
+                continue
+            conflicts.append({
+                "source": phase_edit.get("source", "crossover"),
+                "crossover_band": [lo, hi],
+                "group": "existing_slot",
+                "channels": [slot_edit.ref.channel],
+                "slot": int(slot_edit.ref.slot),
+                "filter": {
+                    "F": float(
+                        slot_edit.ref.original[0]
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[0]
+                    ),
+                    "Q": float(
+                        slot_edit.ref.original[1]
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[1]
+                    ),
+                    "G": float(
+                        0.0
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[2]
+                    ),
+                },
+                "max_change_db": maximum,
+                "threshold_db": float(threshold_db),
+            })
+    return conflicts
+
+
+def make_candidate_plan_component_scorer(
+    band_set_scorer,
+    freqs: np.ndarray,
+    rich: RichTraceMap,
+    phase_plan: List[Dict[str, object]] | None,
+    phase_valid: bool,
+):
+    def score_plan(plan: CandidatePlan) -> Dict[str, float]:
+        resolved = resolve_candidate_plan(plan)
+        components = dict(band_set_scorer(resolved.band_sets))
+        groups = thaw_groups(plan.groups)
+        slot_conflicts = [
+            conflict
+            for conflict in candidate_plan_phase_conflicts(
+                freqs, plan, phase_plan
+            )
+            if conflict.get("group") == "existing_slot"
+        ]
+        if phase_valid and phase_plan:
+            verification = complex_crossover_verification(
+                freqs, rich, groups, phase_plan
+            )
+            components["complex_crossover_pass"] = float(
+                bool(verification["pass"])
+            )
+            components["complex_crossover_worst_deficit_db"] = max(
+                (
+                    -float(row["predicted_worst_deficit_db"])
+                    for row in verification["crossovers"]
+                ),
+                default=0.0,
+            )
+            if not verification["pass"]:
+                components["objective"] = (
+                    1e6 + 1000.0
+                    + components["complex_crossover_worst_deficit_db"]
+                )
+        else:
+            group_conflicts = phase_peq_conflicts(
+                freqs, groups, phase_plan
+            )
+            slot_conflicts.extend(group_conflicts)
+
+        components["phase_peq_conflict_count"] = float(
+            len(slot_conflicts)
+        )
+        components["phase_peq_conflict_max_db"] = max(
+            (
+                float(item["max_change_db"])
+                for item in slot_conflicts
+            ),
+            default=0.0,
+        )
+        if slot_conflicts:
+            components["objective"] = (
+                1e6
+                + 1000.0 * len(slot_conflicts)
+                + components["phase_peq_conflict_max_db"]
+            )
+        return components
+
+    return score_plan
+
 def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return _resolve_group_bands(groups)[0]
 
@@ -2599,8 +2737,11 @@ def write_candidate_plan(
     _simplify_appends: bool = False,
 ) -> Dict[str, object]:
     groups = thaw_groups(plan.groups)
-    conflicts = phase_peq_conflicts(
-        np.geomspace(20.0, 20000.0, 2048), groups, phase_plan, threshold_db=0.5
+    conflicts = candidate_plan_phase_conflicts(
+        np.geomspace(20.0, 20000.0, 2048),
+        plan,
+        phase_plan,
+        threshold_db=0.5,
     )
     if conflicts:
         first = conflicts[0]
@@ -2955,7 +3096,17 @@ def write_family_aliases(out_dir: Path, rows: List[Dict[str, object]], base_xml:
         old.unlink()
     for role, row in picks.items():
         file_name = f"family_{role}.afpx"
-        write_candidate(base_xml, out_dir / file_name, row["groups"], phase_plan=phase_plan)
+        plan = row.get("plan")
+        if isinstance(plan, CandidatePlan):
+            write_candidate_plan(
+                base_xml, out_dir / file_name, plan,
+                phase_plan=phase_plan,
+            )
+        else:
+            write_candidate(
+                base_xml, out_dir / file_name, row["groups"],
+                phase_plan=phase_plan,
+            )
         aliases[role] = file_name
     return aliases
 

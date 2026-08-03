@@ -9,6 +9,8 @@ from unittest.mock import patch
 import numpy as np
 
 import baseline_rehabilitation as rehab
+import _optimizer_stream as stream
+import _merge_stream_results as merge_stream
 import _optimizer as optimizer
 from _make_v3 import decode_afpx
 
@@ -1039,6 +1041,266 @@ class InteractionBeamTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertLessEqual(result.max_cascade_error_db, 0.1)
         self.assertEqual(result.candidate.components["filter_count"], 1.0)
+
+
+class StreamIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.ref = rehab.FilterRef(
+            2, 7, "FL Low", "17", (97.0, 3.0, -1.5)
+        )
+        self.edit = rehab.SlotEdit.modify(
+            self.ref, (100.0, 1.2, -1.5)
+        )
+        self.plan = rehab.CandidatePlan(slot_edits=(self.edit,))
+
+    def test_resume_round_trips_candidate_plan(self):
+        payload = stream.beam_entry_to_json(stream.BeamEntry(
+            objective=1.25,
+            signature=rehab.candidate_plan_signature(self.plan),
+            plan=self.plan,
+            components={"objective": 1.25, "tonal_masked": 0.8},
+        ))
+
+        loaded = stream.beam_entry_from_json(payload)
+
+        self.assertEqual(loaded.plan, self.plan)
+        self.assertEqual(loaded.components["tonal_masked"], 0.8)
+
+    def test_v1_group_only_entry_loads_as_candidate_plan(self):
+        payload = {
+            "objective": 2.0,
+            "groups": {"sub": [[50.0, 1.0, -2.0]]},
+        }
+
+        loaded = stream.beam_entry_from_json(payload)
+
+        self.assertEqual(loaded.plan.slot_edits, ())
+        self.assertEqual(
+            dict(loaded.plan.groups)["sub"], ((50.0, 1.0, -2.0),)
+        )
+
+    def test_guided_beam_keeps_rehabilitation_slot_edits(self):
+        pools = {group: [] for group in stream.opt.GROUPS}
+        group = next(iter(stream.opt.GROUPS))
+        pools[group] = [{
+            "F": 500.0, "Q": 1.0, "G": -2.0, "strength": 4.0,
+        }]
+        seen = []
+
+        def score_plan(plan):
+            seen.append(plan)
+            return {
+                "objective": 10.0 - len(plan.slot_edits) - sum(
+                    len(bands) for _name, bands in plan.groups
+                )
+            }
+
+        entries, _evaluations = stream.deterministic_beam_combinations(
+            pools,
+            score_plan=score_plan,
+            seed_plans=(rehab.CandidatePlan(), self.plan),
+            beam_width=8,
+            pool_limit=2,
+        )
+
+        self.assertTrue(any(
+            entry.plan.slot_edits == (self.edit,) for entry in entries
+        ))
+        self.assertTrue(any(
+            entry.plan.slot_edits == (self.edit,)
+            and any(bands for _name, bands in entry.plan.groups)
+            for entry in entries
+        ))
+        self.assertTrue(all(
+            isinstance(plan, rehab.CandidatePlan) for plan in seen
+        ))
+
+    def test_peq_runs_rehabilitation_before_guided_beam(self):
+        config = rehab.RehabilitationConfig(
+            frequency_octaves=(0.0, 1 / 24),
+            q_multipliers=(1.0,),
+            gain_offsets_db=(-0.5, 0.0),
+            retained_per_slot=2,
+            refinement_passes=0,
+            max_evaluations_per_slot=8,
+            role_limits=((
+                "FL Low", 80.0, 200.0, 0.5, 4.0, -6.0, 0.0
+            ),),
+        )
+
+        def score(plan):
+            edit = plan.slot_edits[0] if plan.slot_edits else None
+            replacement = None if edit is None else edit.replacement
+            distance = (
+                4.0
+                if replacement is None
+                else abs(replacement[0] - 100.0) / 10.0
+            )
+            return {
+                "objective": distance,
+                "tonal_masked": distance,
+                "filter_count": 1.0,
+                "positive_gain_penalty_db": 0.0,
+            }
+
+        result = stream.run_rehabilitation_stage(
+            mode="peq",
+            refs=(self.ref,),
+            score_plan=score,
+            total_seconds=2.0,
+            config=config,
+        )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertGreater(result["evaluations"], 0)
+        self.assertIsInstance(result["best_plan"], rehab.CandidatePlan)
+    def test_phase_mode_does_not_run_peq_rehabilitation(self):
+        result = stream.run_rehabilitation_stage(
+            mode="phase",
+            refs=(self.ref,),
+            score_plan=lambda _plan: {"objective": 1.0},
+            total_seconds=20.0,
+        )
+
+        self.assertEqual(result["status"], "not_applicable")
+        self.assertEqual(result["evaluations"], 0)
+
+    def test_v2_checkpoint_round_trips_candidate_plan_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream_state.json"
+            args = stream.argparse.Namespace(
+                seed=9,
+                profile="safe",
+                proposal="beam",
+                mode="peq",
+                filter_cost_scale=0.1,
+                worst_weight=0.1,
+                min_total_bands=0,
+                archive_size=4,
+                rehabilitation={"status": "complete", "evaluations": 3},
+            )
+            rng = np.random.default_rng(9)
+            entry = stream.BeamEntry(
+                1.25,
+                rehab.candidate_plan_signature(self.plan),
+                self.plan,
+                {"objective": 1.25, "tonal_masked": 0.8},
+            )
+
+            stream.save_state(path, [entry], rng, 3, 0.5, args)
+            payload = stream.json.loads(path.read_text(encoding="utf-8"))
+            loaded, _archive, _scores, _trials, _elapsed = stream.load_state(
+                path,
+                rng,
+                archive_size=4,
+                score_plan=lambda plan: {
+                    "objective": 1.25 if plan == self.plan else 10.0
+                },
+            )
+
+            self.assertEqual(
+                payload["schema"], "audiofischer-stream-state-v2"
+            )
+            self.assertEqual(loaded[0].plan, self.plan)
+    def test_checkpoint_rejects_changed_input_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stream_state.json"
+            args = stream.argparse.Namespace(
+                seed=9,
+                profile="safe",
+                proposal="beam",
+                mode="peq",
+                filter_cost_scale=0.1,
+                worst_weight=0.1,
+                min_total_bands=0,
+                archive_size=4,
+                rehabilitation={},
+                input_fingerprint="session-a",
+            )
+            rng = np.random.default_rng(9)
+            entry = stream.BeamEntry(
+                1.25,
+                rehab.candidate_plan_signature(self.plan),
+                self.plan,
+                {"objective": 1.25},
+            )
+            stream.save_state(path, [entry], rng, 3, 0.5, args)
+
+            loaded = stream.load_state(
+                path,
+                rng,
+                archive_size=4,
+                score_plan=lambda _plan: {"objective": 1.25},
+                expected_fingerprint="session-b",
+            )
+
+            self.assertEqual(loaded, ([], [], {}, 0, 0.0))
+    def test_merge_loader_preserves_candidate_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Path(tmp) / "worker_01"
+            worker.mkdir()
+            args = stream.argparse.Namespace(
+                seed=9,
+                profile="safe",
+                proposal="beam",
+                mode="peq",
+                filter_cost_scale=0.1,
+                worst_weight=0.1,
+                min_total_bands=0,
+                archive_size=4,
+                rehabilitation={},
+            )
+            entry = stream.BeamEntry(
+                1.25,
+                rehab.candidate_plan_signature(self.plan),
+                self.plan,
+                {"objective": 1.25},
+            )
+            stream.save_state(
+                worker / "stream_state.json",
+                [entry],
+                np.random.default_rng(9),
+                3,
+                0.5,
+                args,
+            )
+
+            loaded = merge_stream.load_worker_best(worker)
+
+            self.assertEqual(loaded[0][2], self.plan)
+    def test_candidate_plan_slot_edit_keeps_phase_conflict_veto(self):
+        freqs = np.geomspace(1000.0, 4000.0, 256)
+        phase_plan = [{
+            "source": "Mid to tweeter",
+            "crossover_band": (1800.0, 3000.0),
+            "crossover_channels": (0, 2),
+        }]
+        scorer = optimizer.make_candidate_plan_component_scorer(
+            lambda _band_sets: {"objective": 1.0},
+            freqs,
+            {},
+            phase_plan,
+            False,
+        )
+        plan = rehab.CandidatePlan(slot_edits=(
+            rehab.SlotEdit.modify(
+                self.ref, (2200.0, 1.0, -4.0)
+            ),
+        ))
+
+        band_sets = [[] for _ in range(8)]
+        band_sets[2] = [self.ref.original]
+        with patch.object(
+            optimizer, "baseline_band_sets", return_value=band_sets
+        ):
+            components = scorer(plan)
+
+        self.assertGreater(components["phase_peq_conflict_count"], 0)
+        self.assertGreater(components["objective"], 1e6)
+    def test_short_run_reserves_half_for_guided_beam(self):
+        budget = stream.rehabilitation_budget(12.0)
+        self.assertLessEqual(budget.seconds, 6.0)
+        self.assertGreater(budget.max_evaluations, 0)
 
 if __name__ == "__main__":
     unittest.main()
