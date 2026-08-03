@@ -56,6 +56,7 @@ from _make_v3 import (
     apply_band_actions,
     apply_output_trim,
     afpx_roundtrip_lint,
+    canonical_peq_band,
     choose_free_slots,
     decode_afpx,
     encode_afpx,
@@ -64,6 +65,7 @@ from _make_v3 import (
 from baseline_rehabilitation import (
     CandidatePlan,
     ResolvedPlan,
+    SlotEdit,
     apply_slot_edits,
     candidate_plan_signature,
     freeze_groups,
@@ -1019,23 +1021,9 @@ def _find_edit_target(
 def _resolve_group_bands(
     groups: GroupBands,
     starting_band_sets=None,
+    removed_bands_by_channel=None,
 ) -> Tuple[List[List[Band]], Dict[int, List[Tuple[str, "Band | None", "Band | None"]]]]:
-    """Resolve proposed group bands against the baseline into a final
-    per-channel band list, AND the exact action (append/edit/remove) that
-    produced each change - the single source of truth both scoring
-    (groups_to_band_sets) and AFPX writing (write_candidate) build on, so the
-    written file can never diverge from what was scored.
-
-    A proposed band close in frequency (EDIT_MATCH_TOLERANCE_OCT) to an
-    existing band in that channel edits it in place. A proposed band with
-    gain exactly REMOVE_BAND_GAIN (0.0) removes the existing band it matches.
-    Everything else appends, exactly as before this changed - DEFECT 1 was
-    that only this last case existed: the search could add a new band into a
-    free slot but could never modify or remove one of its own earlier picks,
-    so real fixes that were edits (recentre a mid filter, deepen a sub cut,
-    retire a now-unneeded band) were structurally unreachable. See
-    CHANGELOG.md.
-    """
+    """Resolve group proposals against evolving, serialization-canonical bands."""
     source_band_sets = (
         baseline_band_sets() if starting_band_sets is None else starting_band_sets
     )
@@ -1043,41 +1031,55 @@ def _resolve_group_bands(
     while len(band_sets) < 8:
         band_sets.append([])
     actions: Dict[int, List[Tuple[str, "Band | None", "Band | None"]]] = {
-        i: [] for i in range(len(band_sets))
+        channel: [] for channel in range(len(band_sets))
     }
-    # Parallel to band_sets[channel]: True while that entry still has a real
-    # AFPX slot behind it (baseline, or already edited from baseline), False
-    # for a same-pass append. write_candidate/apply_band_actions runs every
-    # edit/remove for a channel FIRST and only materializes appends into the
-    # XML afterwards in one batch, so a later proposal in this same
-    # resolution must never be allowed to "edit" an append from an earlier
-    # one - that slot does not exist in the file yet when the edit would run.
-    # (Bug found against the real v9 baseline: three close guided proposals
-    # in one group chained append->edit->edit on top of each other and the
-    # edit failed to find its target. See CHANGELOG.md.)
+    removed_bands = {
+        channel: [
+            canonical_peq_band(band)
+            for band in (removed_bands_by_channel or {}).get(channel, ())
+        ]
+        for channel in range(len(band_sets))
+    }
+
+    # True entries still have an AFPX slot. Same-pass appends are never eligible
+    # for a later edit because the writer materializes all appends last.
     from_baseline = [[True] * len(bands) for bands in band_sets]
     for group, bands in groups.items():
         if not bands:
             continue
         for channel in GROUPS[group]["channels"]:
-            for f, q, g in bands:
-                index = _find_edit_target(band_sets[channel], f, from_baseline[channel])
+            for proposed in bands:
+                f, q, g = canonical_peq_band(proposed)
+                index = _find_edit_target(
+                    band_sets[channel], f, from_baseline[channel]
+                )
+                if index is None and any(
+                    abs(math.log2(float(f) / float(removed[0])))
+                    <= EDIT_MATCH_TOLERANCE_OCT
+                    for removed in removed_bands[channel]
+                ):
+                    raise ValueError(
+                        "group action targets removed or consumed slot"
+                    )
                 if g == REMOVE_BAND_GAIN:
                     if index is not None:
                         old = band_sets[channel].pop(index)
                         from_baseline[channel].pop(index)
+                        removed_bands[channel].append(old)
                         actions[channel].append(("remove", old, None))
                     continue
                 if index is not None:
                     old = band_sets[channel][index]
-                    band_sets[channel][index] = (f, q, g)
-                    actions[channel].append(("edit", old, (f, q, g)))
+                    new = (f, q, g)
+                    band_sets[channel][index] = new
+                    actions[channel].append(("edit", old, new))
                 else:
-                    band_sets[channel].append((f, q, g))
+                    new = (f, q, g)
+                    band_sets[channel].append(new)
                     from_baseline[channel].append(False)
-                    actions[channel].append(("append", None, (f, q, g)))
+                    actions[channel].append(("append", None, new))
     for channel_bands in band_sets:
-        channel_bands.sort(key=lambda b: b[0])
+        channel_bands.sort(key=lambda band: band[0])
     return band_sets, actions
 
 
@@ -1088,6 +1090,7 @@ def _slot_edited_band_sets(plan: CandidatePlan):
 
     seen_slots = set()
     removed_refs = []
+    canonical_edits = []
     for edit in plan.slot_edits:
         slot_key = (edit.ref.channel, edit.ref.slot)
         if slot_key in seen_slots:
@@ -1100,50 +1103,27 @@ def _slot_edited_band_sets(plan: CandidatePlan):
 
         channel_bands = band_sets[edit.ref.channel]
         try:
-            index = channel_bands.index(edit.ref.original)
+            index = channel_bands.index(canonical_peq_band(edit.ref.original))
         except ValueError:
             raise ValueError(
                 "rehabilitation slot is absent from supplied measurement baseline"
             ) from None
-        if edit.replacement is None:
+        replacement = (
+            None
+            if edit.replacement is None
+            else canonical_peq_band(edit.replacement)
+        )
+        if replacement is None:
             channel_bands.pop(index)
             removed_refs.append(edit.ref)
         else:
-            channel_bands[index] = edit.replacement
-    return band_sets, tuple(removed_refs)
-
-
-def _reject_removed_slot_group_conflicts(groups, starting_band_sets, removed_refs):
-    removed_by_channel = {}
-    for ref in removed_refs:
-        removed_by_channel.setdefault(ref.channel, []).append(ref)
-
-    for group, bands in groups.items():
-        if not bands:
-            continue
-        for channel in GROUPS[group]["channels"]:
-            removed = removed_by_channel.get(channel, ())
-            if not removed:
-                continue
-            eligible = [True] * len(starting_band_sets[channel])
-            for frequency, _q, _gain in bands:
-                if (
-                    _find_edit_target(starting_band_sets[channel], frequency, eligible)
-                    is not None
-                ):
-                    continue
-                if any(
-                    abs(math.log2(float(frequency) / float(ref.original[0])))
-                    <= EDIT_MATCH_TOLERANCE_OCT
-                    for ref in removed
-                ):
-                    raise ValueError(
-                        "group action targets removed rehabilitation slot"
-                    )
+            channel_bands[index] = replacement
+        canonical_edits.append(SlotEdit(ref=edit.ref, replacement=replacement))
+    return band_sets, tuple(removed_refs), tuple(canonical_edits)
 
 
 def resolve_candidate_plan(plan: CandidatePlan) -> ResolvedPlan:
-    starting_band_sets, removed_refs = _slot_edited_band_sets(plan)
+    starting_band_sets, removed_refs, canonical_edits = _slot_edited_band_sets(plan)
     groups = thaw_groups(plan.groups)
     if not plan.slot_edits and not any(groups.values()):
         return ResolvedPlan(
@@ -1155,17 +1135,23 @@ def resolve_candidate_plan(plan: CandidatePlan) -> ResolvedPlan:
             signature=candidate_plan_signature(plan),
         )
 
-    _reject_removed_slot_group_conflicts(groups, starting_band_sets, removed_refs)
-    band_sets, actions = _resolve_group_bands(groups, starting_band_sets)
+    removed_bands_by_channel = {}
+    for ref in removed_refs:
+        removed_bands_by_channel.setdefault(ref.channel, []).append(ref.original)
+    band_sets, actions = _resolve_group_bands(
+        groups, starting_band_sets, removed_bands_by_channel
+    )
     return ResolvedPlan(
         band_sets=tuple(tuple(bands) for bands in band_sets),
-        slot_edits=plan.slot_edits,
+        slot_edits=canonical_edits,
         group_actions=tuple(
             (channel, tuple(channel_actions))
             for channel, channel_actions in sorted(actions.items())
         ),
         signature=candidate_plan_signature(plan),
     )
+
+
 def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return _resolve_group_bands(groups)[0]
 
@@ -1178,6 +1164,8 @@ def output_trim_for_band_sets(band_sets) -> Dict[int, float]:
         for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(band_sets).items()
         if abs(float(trim_db)) >= 0.01
     }
+
+
 def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
     needs_trim_check = any(
         GROUPS.get(group, {}).get("system_transfer") and any(G > 0.0 for _F, _Q, G in bands)

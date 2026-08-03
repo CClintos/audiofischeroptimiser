@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from _make_v3 import active_peq_slots, at, edit_filter_slot
+from _make_v3 import (
+    active_peq_slots,
+    at,
+    canonical_peq_band,
+    edit_filter_slot,
+)
 
 
 Band = tuple[float, float, float]
@@ -50,33 +55,43 @@ class ResolvedPlan:
 
 def freeze_groups(groups) -> tuple[tuple[str, tuple[Band, ...]], ...]:
     return tuple(
-        (str(group), tuple(tuple(float(value) for value in band) for band in bands))
+        (str(group), tuple(canonical_peq_band(band) for band in bands))
         for group, bands in groups.items()
     )
 
 
 def thaw_groups(groups) -> dict[str, list[Band]]:
-    return {group: list(bands) for group, bands in groups}
+    return {
+        group: [canonical_peq_band(band) for band in bands]
+        for group, bands in groups
+    }
 
 
 def candidate_plan_signature(plan: CandidatePlan) -> tuple:
     slot_signature = tuple(
         sorted(
-            [(
-                edit.ref.channel,
-                edit.ref.slot,
-                edit.ref.role,
-                edit.ref.filter_type,
-                edit.ref.original,
-                edit.ref.pair_key,
-                edit.replacement,
-            )
-            for edit in plan.slot_edits
+            [
+                (
+                    edit.ref.channel,
+                    edit.ref.slot,
+                    edit.ref.role,
+                    edit.ref.filter_type,
+                    canonical_peq_band(edit.ref.original),
+                    edit.ref.pair_key,
+                    None
+                    if edit.replacement is None
+                    else canonical_peq_band(edit.replacement),
+                )
+                for edit in plan.slot_edits
             ],
             key=lambda item: item[:2],
         )
     )
-    return ("candidate-plan-v1", slot_signature, plan.groups)
+    groups_signature = tuple(
+        (group, tuple(canonical_peq_band(band) for band in bands))
+        for group, bands in plan.groups
+    )
+    return ("candidate-plan-v1", slot_signature, groups_signature)
 
 
 def active_peq_slot_refs(xml, channel_roles):
@@ -88,7 +103,9 @@ def active_peq_slot_refs(xml, channel_roles):
                 slot=slot,
                 role=channel_roles[channel],
                 filter_type=at(tag, "T"),
-                original=tuple(float(at(tag, key)) for key in ("F", "Q", "G")),
+                original=canonical_peq_band(
+                    tuple(float(at(tag, key)) for key in ("F", "Q", "G"))
+                ),
             )
         )
     return tuple(refs)

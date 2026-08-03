@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 import baseline_rehabilitation as rehab
 import _optimizer as optimizer
 from _make_v3 import decode_afpx
@@ -101,21 +103,57 @@ class PlanResolverTests(unittest.TestCase):
 
     def test_plan_resolution_is_identical_for_score_report_and_write(self):
         plan = rehab.CandidatePlan(
-            slot_edits=(rehab.SlotEdit.modify(self.ref_97, (100.0, 1.2, -1.5)),),
-            groups=rehab.freeze_groups({"low_sym": [(184.0, 0.63, -4.0)]}),
+            slot_edits=(
+                rehab.SlotEdit.modify(
+                    self.ref_97, (100.1234, 1.2345, -1.5678)
+                ),
+            ),
+            groups=rehab.freeze_groups({
+                "low_sym": [(184.126, 0.63456, -3.98765)]
+            }),
         )
+
+        class FakeObjective:
+            def __init__(self):
+                self.scored = []
+
+            def score_bands(self, band_sets):
+                self.scored.append(band_sets)
+                return {"objective": 1.2345678901234567, "tonal_masked": 2.0}
+
+        objective = FakeObjective()
         with patch.object(
             optimizer, "baseline_band_sets", return_value=self.baseline
         ), patch.object(optimizer, "phase_peq_conflicts", return_value=[]), patch.object(
-            optimizer, "output_trim_for_band_sets", return_value={}
+            optimizer, "AFPX_OBJECTIVE", objective
         ):
             resolved = optimizer.resolve_candidate_plan(plan)
+            score = optimizer.make_band_set_component_scorer(
+                np.array([100.0]), {}, np.array([0.0])
+            )(resolved.band_sets)
             written = optimizer.write_candidate_plan(self.xml, self.out, plan)
 
         parsed = bands_from_afpx(self.out)
+        self.assertEqual(objective.scored, [resolved.band_sets])
+        self.assertEqual(score["filter_count"], sum(map(len, parsed)))
+        self.assertIn((100.12, 1.2345, -1.5678), resolved.band_sets[2])
+        self.assertIn((184.13, 0.63456, -3.98765), resolved.band_sets[2])
+        canonical_plan = rehab.CandidatePlan(
+            slot_edits=(
+                rehab.SlotEdit.modify(
+                    self.ref_97, (100.12, 1.2345, -1.5678)
+                ),
+            ),
+            groups=rehab.freeze_groups({
+                "low_sym": [(184.13, 0.63456, -3.98765)]
+            }),
+        )
+        self.assertEqual(
+            resolved.signature,
+            optimizer.candidate_plan_signature(canonical_plan),
+        )
         self.assertEqual(parsed, resolved.band_sets)
         self.assertEqual(written["operation_signature"], resolved.signature)
-        self.assertEqual(sum(map(len, parsed)), 3)
         self.assertEqual(
             [
                 (row["channel_index"], row["slot_index"])
@@ -165,10 +203,34 @@ class PlanResolverTests(unittest.TestCase):
             groups=rehab.freeze_groups({"low_sym": [(97.0, 1.2, -2.0)]}),
         )
         with patch.object(optimizer, "baseline_band_sets", return_value=self.baseline):
+            with self.assertRaisesRegex(ValueError, "group action targets removed"):
+                optimizer.resolve_candidate_plan(plan)
+
+    def test_group_cannot_reuse_slot_removed_by_an_earlier_group(self):
+        xml = fixture_afpx_xml({
+            2: [(4, 100.0, 1.0, -2.0), (9, 102.0, 1.0, -2.0)]
+        })
+        ref_100 = rehab.active_peq_slot_refs(xml, {2: "FL Low"})[0]
+        baseline = (
+            (),
+            (),
+            ((100.0, 1.0, -2.0), (102.0, 1.0, -2.0)),
+            ((102.0, 1.0, -2.0),),
+        ) + ((),) * 4
+        plan = rehab.CandidatePlan(
+            slot_edits=(rehab.SlotEdit.remove(ref_100),),
+            groups=rehab.freeze_groups({
+                "low_sym": [(102.0, 1.0, 0.0)],
+                "fl_low": [(102.5, 1.0, -2.0)],
+            }),
+        )
+
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
             with self.assertRaisesRegex(
-                ValueError, "group action targets removed rehabilitation slot"
+                ValueError, "group action targets removed or consumed slot"
             ):
                 optimizer.resolve_candidate_plan(plan)
+
 
 if __name__ == "__main__":
     unittest.main()

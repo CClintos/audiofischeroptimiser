@@ -63,6 +63,16 @@ def set_attr(text, key, value):
     return text[:-2] + ' %s="%s"/>' % (key, value) if text.endswith('/>') else text
 
 
+def canonical_peq_band(band):
+    """Return the numeric values produced by the AFPX PEQ serializers."""
+    frequency, q, gain = band
+    return (
+        float('%.2f' % float(frequency)),
+        float(str(float(q))),
+        float(str(float(gain))),
+    )
+
+
 def apply_output_trim(oc, trim_db):
     """Apply attenuation to one output's linear Vol value."""
     trim_db = float(trim_db)
@@ -324,6 +334,7 @@ def add_bands(oc, bands, protected_boost=False):
     # bands: list of (F, Q, G). Convert safe free slots (T="1") into active PEQs.
     slots = choose_free_slots(oc, len(bands))
     for (F, Q, G), slot in zip(bands, slots):
+        F, Q, G = canonical_peq_band((F, Q, G))
         validate_peq_band(F, Q, G, protected_boost=protected_boost)
         new = slot
         new = set_attr(new, 'T', '17')
@@ -387,6 +398,7 @@ def edit_filter_slot(xml, channel, slot, expected_type, expected_band,
         new_tag = set_attr(old_tag, 'T', '1')
         new_tag = set_attr(new_tag, 'G', '0')
     else:
+        replacement = canonical_peq_band(replacement)
         new_f, new_q, new_g = replacement
         validate_peq_band(new_f, new_q, new_g, protected_boost=protected_boost)
         new_tag = set_attr(old_tag, 'F', '%.2f' % float(new_f))
@@ -402,6 +414,7 @@ def edit_band(oc, old_band, new_band, protected_boost=False):
     are untouched - only the values change, matching the verified
     edit_tweeter() pattern above, generalised to any band."""
     new_f, new_q, new_g = new_band
+    new_f, new_q, new_g = canonical_peq_band((new_f, new_q, new_g))
     validate_peq_band(new_f, new_q, new_g, protected_boost=protected_boost)
     old_tag = _find_active_slot(oc, old_band)
     new_tag = set_attr(old_tag, 'Q', new_q)
