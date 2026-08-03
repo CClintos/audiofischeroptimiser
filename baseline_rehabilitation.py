@@ -157,6 +157,64 @@ class OperationCandidate:
 
 
 @dataclass(frozen=True)
+class ScoredCandidate:
+    plan: CandidatePlan
+    components: dict[str, object]
+    applied_operations: tuple[tuple, ...] = ()
+    depth: int = 0
+
+    @property
+    def slot_edits(self) -> tuple[SlotEdit, ...]:
+        return self.plan.slot_edits
+
+    @property
+    def objective(self) -> float:
+        return float(self.components["objective"])
+
+    @property
+    def minimum_headroom_db(self) -> float:
+        margins = self.components.get("headroom_margin_db", {})
+        if isinstance(margins, dict) and margins:
+            return min(float(value) for value in margins.values())
+        if isinstance(margins, (int, float)):
+            return float(margins)
+        return float(self.components.get("minimum_headroom_db", float("inf")))
+
+    @property
+    def parameter_movement(self) -> float:
+        movement = 0.0
+        for edit in self.slot_edits:
+            if edit.replacement is None:
+                movement += 1.0
+                continue
+            old_f, old_q, old_g = edit.ref.original
+            new_f, new_q, new_g = edit.replacement
+            movement += (
+                abs(math.log2(new_f / old_f))
+                + abs(new_q - old_q)
+                + abs(new_g - old_g)
+            )
+        return movement
+
+
+@dataclass(frozen=True)
+class RehabilitationResult:
+    baseline: ScoredCandidate
+    best: ScoredCandidate
+    candidates: tuple[ScoredCandidate, ...]
+    generations: tuple[tuple[ScoredCandidate, ...], ...]
+    score_count: int
+
+
+@dataclass(frozen=True)
+class ConsolidationResult:
+    accepted: bool
+    original: ScoredCandidate
+    candidate: ScoredCandidate
+    max_cascade_error_db: float
+    reason: str
+
+@dataclass(frozen=True)
 class CorrectionRegion:
     frequency: float
     q: float
@@ -790,6 +848,323 @@ def candidate_plan_signature(plan: CandidatePlan) -> tuple:
     )
     return ("candidate-plan-v1", slot_signature, groups_signature)
 
+
+_ACOUSTIC_TIE_COMPONENTS = (
+    "tonal_masked", "spatial_tonal_db", "presence_error_db",
+    "target_shape_error_db", "peak_penalty_db", "spatial_peak_db",
+    "balance_penalty_db",
+)
+
+
+def _component_value(candidate, *keys, default=0.0):
+    for key in keys:
+        if key in candidate.components:
+            return float(candidate.components[key])
+    return float(default)
+
+
+def _affected_frequencies(candidate):
+    frequencies = []
+    roles = []
+    for edit in candidate.slot_edits:
+        frequencies.append(float(
+            edit.ref.original[0] if edit.replacement is None else edit.replacement[0]
+        ))
+        roles.append(edit.ref.role)
+    return tuple(frequencies), tuple(roles)
+
+
+def _repeatability_allowance(first, second, repeatability_db):
+    if repeatability_db is not None:
+        if callable(repeatability_db):
+            frequencies = _affected_frequencies(first)[0] + _affected_frequencies(second)[0]
+            return float(repeatability_db(frequencies))
+        return float(repeatability_db)
+
+    from _tunefit import measurement_noise_floor_db
+
+    values = []
+    for candidate in (first, second):
+        frequencies, roles = _affected_frequencies(candidate)
+        for frequency, role in zip(frequencies, roles):
+            role_key = role.casefold()
+            branch = "high" if "high" in role_key or "tweet" in role_key else "low"
+            values.append(float(measurement_noise_floor_db([frequency], branch)[0]))
+    return max(values, default=0.1)
+
+
+def _acoustically_tied(first, second, repeatability_db=None):
+    allowance = _repeatability_allowance(first, second, repeatability_db)
+    compared = False
+    for key in _ACOUSTIC_TIE_COMPONENTS:
+        if key not in first.components or key not in second.components:
+            continue
+        compared = True
+        if abs(float(first.components[key]) - float(second.components[key])) > allowance:
+            return False
+    return compared
+
+
+def _filter_count(candidate):
+    for key in ("filter_count", "n_front_bands"):
+        if key in candidate.components:
+            return float(candidate.components[key])
+    return float(sum(edit.replacement is not None for edit in candidate.slot_edits))
+
+
+def tie_key(candidate):
+    return (
+        _filter_count(candidate),
+        _component_value(candidate, "positive_gain_penalty_db", default=0.0),
+        -candidate.minimum_headroom_db,
+        _component_value(
+            candidate, "asymmetric_eq_penalty_db", "asymmetric_eq_penalty",
+            default=0.0,
+        ),
+        candidate.parameter_movement,
+        candidate_plan_signature(candidate.plan),
+    )
+
+
+def compare_candidates(first, second, repeatability_db=None):
+    if _acoustically_tied(first, second, repeatability_db):
+        return min((first, second), key=tie_key)
+    return min(
+        (first, second),
+        key=lambda candidate: (candidate.objective, tie_key(candidate)),
+    )
+
+
+def _operation_keys(operation):
+    return frozenset((edit.ref.channel, edit.ref.slot) for edit in operation.edits)
+
+
+def _region_signature(candidate):
+    regions = []
+    for edit in candidate.slot_edits:
+        frequency = float(
+            edit.ref.original[0] if edit.replacement is None else edit.replacement[0]
+        )
+        regions.append((
+            edit.ref.channel,
+            int(math.floor(math.log2(max(frequency, 20.0) / 20.0) * 3.0)),
+        ))
+    return tuple(sorted(set(regions)))
+
+
+def _beam_sort_key(candidate):
+    return (candidate.objective, tie_key(candidate))
+
+
+def _retain_diverse(
+    candidates, baseline, beam_width, generation, repeatability_db=None
+):
+    if beam_width <= 0:
+        raise ValueError("beam_width must be positive")
+    by_signature = {
+        candidate_plan_signature(candidate.plan): candidate
+        for candidate in sorted(candidates, key=_beam_sort_key, reverse=True)
+    }
+    baseline_signature = candidate_plan_signature(baseline.plan)
+    retained = [by_signature[baseline_signature]]
+    chosen = {baseline_signature}
+
+    def add(candidate):
+        signature = candidate_plan_signature(candidate.plan)
+        if signature not in chosen and len(retained) < beam_width:
+            retained.append(candidate)
+            chosen.add(signature)
+
+    leaders = (
+        lambda item: item.objective,
+        lambda item: _component_value(item, "tonal_masked", "spatial_tonal_db", default=float("inf")),
+        lambda item: _component_value(item, "presence_error_db", default=float("inf")),
+        lambda item: _component_value(item, "balance_penalty_db", default=float("inf")),
+        lambda item: -item.minimum_headroom_db,
+        _filter_count,
+    )
+    pool = list(by_signature.values())
+    for key in leaders:
+        add(min(pool, key=lambda item: (key(item), _beam_sort_key(item))))
+
+    near_ties = [
+        item for item in pool
+        if item.depth == generation
+        and _acoustically_tied(item, baseline, repeatability_db)
+    ]
+    if near_ties:
+        add(min(near_ties, key=_beam_sort_key))
+
+    seen_regions = {_region_signature(item) for item in retained}
+    for candidate in sorted(pool, key=_beam_sort_key):
+        region = _region_signature(candidate)
+        if region not in seen_regions:
+            add(candidate)
+            seen_regions.add(region)
+    for candidate in sorted(pool, key=_beam_sort_key):
+        add(candidate)
+    return tuple(retained)
+
+
+def rehabilitation_beam(
+    baseline_plan,
+    operations,
+    score_plan,
+    *,
+    beam_width=16,
+    max_depth=4,
+    repeatability_db=None,
+):
+    score_cache = {}
+
+    def score(plan, applied_operations=(), depth=0):
+        signature = candidate_plan_signature(plan)
+        if signature not in score_cache:
+            components = dict(score_plan(plan))
+            if "objective" not in components:
+                raise ValueError("rehabilitation scorer must return an objective component")
+            score_cache[signature] = components
+        return ScoredCandidate(
+            plan=plan,
+            components=dict(score_cache[signature]),
+            applied_operations=tuple(applied_operations),
+            depth=depth,
+        )
+
+    baseline = score(baseline_plan)
+    unique_operations = {
+        candidate_plan_signature(operation.plan): operation
+        for operation in operations
+    }
+    ranked_operations = tuple(unique_operations.values())
+    beam = (baseline,)
+    generations = [beam]
+    all_candidates = {candidate_plan_signature(baseline.plan): baseline}
+
+    for generation in range(1, max_depth + 1):
+        expanded = {candidate_plan_signature(baseline.plan): baseline}
+        for parent in beam:
+            expanded[candidate_plan_signature(parent.plan)] = parent
+            reserved = {
+                (edit.ref.channel, edit.ref.slot) for edit in parent.slot_edits
+            }
+            applied = set(parent.applied_operations)
+            for operation in ranked_operations:
+                operation_signature = candidate_plan_signature(operation.plan)
+                if operation_signature in applied:
+                    continue
+                if reserved & _operation_keys(operation):
+                    continue
+                plan = CandidatePlan(
+                    slot_edits=parent.slot_edits + operation.edits,
+                    groups=parent.plan.groups + operation.plan.groups,
+                )
+                candidate = score(
+                    plan,
+                    parent.applied_operations + (operation_signature,),
+                    generation,
+                )
+                expanded[candidate_plan_signature(plan)] = candidate
+        beam = _retain_diverse(
+            tuple(expanded.values()), baseline, beam_width, generation,
+            repeatability_db,
+        )
+        generations.append(beam)
+        all_candidates.update({
+            candidate_plan_signature(candidate.plan): candidate
+            for candidate in expanded.values()
+        })
+        if not any(candidate.depth == generation for candidate in beam):
+            break
+
+    best = baseline
+    for candidate in all_candidates.values():
+        best = compare_candidates(best, candidate, repeatability_db)
+    return RehabilitationResult(
+        baseline=baseline,
+        best=best,
+        candidates=tuple(sorted(all_candidates.values(), key=_beam_sort_key)),
+        generations=tuple(generations),
+        score_count=len(score_cache),
+    )
+
+
+def _hard_gate_counts(components):
+    return {
+        key: float(value)
+        for key, value in components.items()
+        if key.endswith("violation_count") and isinstance(value, (int, float))
+    }
+
+
+def consolidate_candidate(candidate, score_plan, tolerance_db=0.1):
+    from objective_module.afpx_objective import fit_consolidated_peq_pair
+
+    original_plan = candidate.plan if isinstance(candidate, ScoredCandidate) else candidate
+    original = (
+        candidate
+        if isinstance(candidate, ScoredCandidate)
+        else ScoredCandidate(original_plan, dict(score_plan(original_plan)))
+    )
+    attempted_errors = []
+    rejection = "no overlapping same-channel PEQ pair"
+    edits = list(original_plan.slot_edits)
+
+    for first_index, first in enumerate(edits):
+        if first.replacement is None:
+            continue
+        for second_index in range(first_index + 1, len(edits)):
+            second = edits[second_index]
+            if second.replacement is None or first.ref.channel != second.ref.channel:
+                continue
+            fit = fit_consolidated_peq_pair(first.replacement, second.replacement)
+            if not fit.overlap:
+                continue
+            attempted_errors.append(fit.max_cascade_error_db)
+            if fit.max_cascade_error_db > tolerance_db + 1e-12:
+                rejection = "maximum cascade mismatch exceeds tolerance"
+                continue
+            trial_edits = list(edits)
+            trial_edits[first_index] = SlotEdit.modify(first.ref, fit.replacement)
+            trial_edits[second_index] = SlotEdit.remove(second.ref)
+            trial_plan = CandidatePlan(tuple(trial_edits), original_plan.groups)
+            trial = ScoredCandidate(trial_plan, dict(score_plan(trial_plan)))
+            if _filter_count(trial) >= _filter_count(original):
+                rejection = "filter count did not decrease"
+                continue
+            if trial.objective > original.objective + 1e-12:
+                rejection = "objective regressed"
+                continue
+            original_margins = original.components.get("headroom_margin_db", {})
+            trial_margins = trial.components.get("headroom_margin_db", {})
+            if isinstance(original_margins, dict) and original_margins:
+                headroom_regressed = any(
+                    float(trial_margins.get(channel, float("-inf")))
+                    < float(margin) - 1e-12
+                    for channel, margin in original_margins.items()
+                )
+            else:
+                headroom_regressed = (
+                    trial.minimum_headroom_db
+                    < original.minimum_headroom_db - 1e-12
+                )
+            if headroom_regressed:
+                rejection = "headroom regressed"
+                continue
+            original_gates = _hard_gate_counts(original.components)
+            trial_gates = _hard_gate_counts(trial.components)
+            if any(
+                trial_gates.get(key, 0.0) > original_gates.get(key, 0.0)
+                for key in original_gates.keys() | trial_gates.keys()
+            ):
+                rejection = "hard gate regressed"
+                continue
+            return ConsolidationResult(
+                True, original, trial, fit.max_cascade_error_db, "accepted"
+            )
+
+    max_error = min(attempted_errors) if attempted_errors else float("inf")
+    return ConsolidationResult(False, original, original, max_error, rejection)
 
 def active_peq_slot_refs(xml, channel_roles):
     refs = []

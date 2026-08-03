@@ -680,6 +680,186 @@ class FilterSearchTests(unittest.TestCase):
         self.assertIn("balance_penalty_db", row.probe_components)
         self.assertIn("positive_gain_penalty_db", row.probe_components)
 
+class InteractionBeamTests(unittest.TestCase):
+    def setUp(self):
+        self.left = rehab.FilterRef(2, 1, "FL Low", "17", (500.0, 1.0, -2.0))
+        self.second = rehab.FilterRef(2, 2, "FL Low", "17", (900.0, 1.0, -2.0))
+        self.edit_left = rehab.SlotEdit.modify(self.left, (520.0, 1.2, -2.5))
+        self.edit_second = rehab.SlotEdit.modify(self.second, (880.0, 1.1, -2.5))
+        self.baseline = self.components(10.0, 3)
+        self.operations = (
+            rehab.OperationCandidate(self.edit_left, rehab.CandidatePlan((self.edit_left,)), self.components(11.0, 3), self.baseline),
+            rehab.OperationCandidate(self.edit_second, rehab.CandidatePlan((self.edit_second,)), self.components(11.0, 3), self.baseline),
+        )
+
+    @staticmethod
+    def components(objective, filter_count, tonal=2.0, headroom=4.0):
+        return {
+            "objective": float(objective), "tonal_masked": float(tonal),
+            "presence_error_db": 1.0, "balance_penalty_db": 0.5,
+            "positive_gain_penalty_db": 0.0, "asymmetric_eq_penalty": 0.0,
+            "filter_count": float(filter_count),
+            "headroom_margin_db": {"FL Low": float(headroom)},
+            "headroom_violation_count": 0, "nearfield_skirt_violation_count": 0,
+            "balance_guardrail_violation_count": 0,
+            "filter_noise_floor_violation_count": 0,
+        }
+
+    def score_plan(self, plan):
+        keys = {(edit.ref.channel, edit.ref.slot) for edit in plan.slot_edits}
+        if keys == {(2, 1), (2, 2)}:
+            return self.components(5.0, 3, tonal=1.0)
+        if keys:
+            return self.components(11.0, 3, tonal=2.1)
+        return self.baseline
+
+    def test_interaction_beam_keeps_two_edits_that_win_only_together(self):
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), self.operations, self.score_plan,
+            beam_width=16, max_depth=4,
+        )
+        self.assertEqual(set(result.best.slot_edits), {self.edit_left, self.edit_second})
+
+    def test_unchanged_baseline_survives_every_generation(self):
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), self.operations,
+            lambda plan: self.components(10.0 + len(plan.slot_edits), 3, tonal=2.0 + len(plan.slot_edits)),
+            beam_width=2, max_depth=2,
+        )
+        baseline_signature = rehab.candidate_plan_signature(rehab.CandidatePlan())
+        self.assertEqual(result.best.slot_edits, ())
+        self.assertTrue(all(
+            baseline_signature in {rehab.candidate_plan_signature(candidate.plan) for candidate in generation}
+            for generation in result.generations
+        ))
+
+    def test_supplied_repeatability_keeps_partial_for_one_generation(self):
+        refs = tuple(
+            rehab.FilterRef(2, slot, "FL Low", "17", (500.0, 1.0, -2.0))
+            for slot in (3, 4, 5)
+        )
+        edits = tuple(
+            rehab.SlotEdit.modify(ref, (510.0 + index, 1.0, -2.5))
+            for index, ref in enumerate(refs)
+        )
+        operations = tuple(
+            rehab.OperationCandidate(
+                edit,
+                rehab.CandidatePlan((edit,)),
+                self.components(20.0, 3, tonal=2.15),
+                self.baseline,
+            )
+            for edit in edits
+        )
+
+        def score(plan):
+            if not plan.slot_edits:
+                return self.baseline
+            slot = plan.slot_edits[0].ref.slot
+            if slot == 3:
+                return self.components(20.0, 3, tonal=2.15)
+            return self.components(float(slot + 5), 3, tonal=3.0)
+
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), operations, score,
+            beam_width=3, max_depth=1, repeatability_db=0.2,
+        )
+        retained = {
+            rehab.candidate_plan_signature(candidate.plan)
+            for candidate in result.generations[1]
+        }
+        self.assertIn(
+            rehab.candidate_plan_signature(rehab.CandidatePlan((edits[0],))),
+            retained,
+        )
+    def test_acoustic_tie_prefers_removal(self):
+        keep = rehab.ScoredCandidate(rehab.CandidatePlan((self.edit_left,)), self.components(8.0, 79))
+        remove_edit = rehab.SlotEdit.remove(self.left)
+        remove = rehab.ScoredCandidate(rehab.CandidatePlan((remove_edit,)), self.components(8.3, 78))
+        self.assertIs(rehab.compare_candidates(keep, remove, repeatability_db=0.05), remove)
+
+    def test_default_repeatability_is_frequency_aware(self):
+        low_edit = rehab.SlotEdit.modify(self.left, (400.0, 1.0, -2.5))
+        high_ref = rehab.FilterRef(
+            0, 1, "FL High", "17", (10000.0, 1.0, -2.0)
+        )
+        high_edit = rehab.SlotEdit.modify(high_ref, (10000.0, 1.0, -2.5))
+        baseline = rehab.ScoredCandidate(
+            rehab.CandidatePlan(), self.components(10.0, 3, tonal=2.0)
+        )
+        low = rehab.ScoredCandidate(
+            rehab.CandidatePlan((low_edit,)),
+            self.components(9.0, 3, tonal=2.3),
+        )
+        high = rehab.ScoredCandidate(
+            rehab.CandidatePlan((high_edit,)),
+            self.components(9.0, 3, tonal=2.3),
+        )
+        self.assertIs(rehab.compare_candidates(baseline, low), low)
+        self.assertIs(rehab.compare_candidates(baseline, high), baseline)
+
+    def test_merge_rejects_any_channel_headroom_regression(self):
+        first = rehab.SlotEdit.modify(self.left, (1000.0, 1.0, -3.0))
+        second = rehab.SlotEdit.modify(self.second, (1000.0, 1.0, -0.02))
+        plan = rehab.CandidatePlan((first, second))
+
+        def score(candidate_plan):
+            count = sum(
+                edit.replacement is not None
+                for edit in candidate_plan.slot_edits
+            )
+            components = self.components(5.0, count, tonal=1.0)
+            components["headroom_margin_db"] = (
+                {"FL Low": 2.0, "FR Low": 5.0}
+                if count == 2
+                else {"FL Low": 3.0, "FR Low": 4.5}
+            )
+            return components
+
+        result = rehab.consolidate_candidate(plan, score)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "headroom regressed")
+    def test_merge_rejects_new_hard_gate_violation(self):
+        first = rehab.SlotEdit.modify(self.left, (1000.0, 1.0, -3.0))
+        second = rehab.SlotEdit.modify(self.second, (1000.0, 1.0, -0.02))
+        plan = rehab.CandidatePlan((first, second))
+
+        def score(candidate_plan):
+            count = sum(
+                edit.replacement is not None
+                for edit in candidate_plan.slot_edits
+            )
+            components = self.components(5.0, count, tonal=1.0, headroom=5.0)
+            if count == 2:
+                components.pop("nearfield_skirt_violation_count")
+            else:
+                components["nearfield_skirt_violation_count"] = 1
+            return components
+
+        result = rehab.consolidate_candidate(plan, score)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "hard gate regressed")
+
+    def test_merge_rejected_above_point_one_db(self):
+        first = rehab.SlotEdit.modify(self.left, (1000.0, 0.5, 6.0))
+        second = rehab.SlotEdit.modify(self.second, (1000.0, 10.0, -6.0))
+        result = rehab.consolidate_candidate(rehab.CandidatePlan((first, second)), self.score_plan)
+        self.assertFalse(result.accepted)
+        self.assertGreater(result.max_cascade_error_db, 0.1)
+
+    def test_merge_requires_fewer_filters_without_regression(self):
+        first = rehab.SlotEdit.modify(self.left, (1000.0, 1.0, -3.0))
+        second = rehab.SlotEdit.modify(self.second, (1000.0, 1.0, -0.02))
+        plan = rehab.CandidatePlan((first, second))
+
+        def score(candidate_plan):
+            count = sum(edit.replacement is not None for edit in candidate_plan.slot_edits)
+            return self.components(5.0, count, tonal=1.0, headroom=5.0)
+
+        result = rehab.consolidate_candidate(plan, score)
+        self.assertTrue(result.accepted)
+        self.assertLessEqual(result.max_cascade_error_db, 0.1)
+        self.assertEqual(result.candidate.components["filter_count"], 1.0)
 
 if __name__ == "__main__":
     unittest.main()
