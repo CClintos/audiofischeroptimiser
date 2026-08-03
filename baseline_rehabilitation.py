@@ -128,6 +128,8 @@ class OperationCandidate:
     components: dict[str, object]
     baseline_components: dict[str, object]
     paired_edit: SlotEdit | None = None
+    region: CorrectionRegion | None = None
+    owner_attributions: tuple[DriverAttribution, ...] = ()
 
     @property
     def edits(self) -> tuple[SlotEdit, ...]:
@@ -187,7 +189,6 @@ class FilterCensusRow:
     system_delta: float | None
     balance_delta: float | None
     headroom_delta: float | None
-    driver_rank: int = 0
 
 
 def _component_delta(current, baseline, key):
@@ -567,6 +568,67 @@ def attribute_correction_region(
     )
 
 
+def _candidate_region(candidate):
+    replacement = candidate.edit.replacement
+    if replacement is None:
+        return None
+    gain_change = replacement[2] - candidate.edit.ref.original[2]
+    gain_delta_db = 0.25 if gain_change > 0.0 else -0.25
+    return CorrectionRegion(
+        frequency=replacement[0],
+        q=replacement[1],
+        gain_delta_db=gain_delta_db,
+    )
+
+
+def _eligible_region_owners(
+    refs,
+    pairs,
+    region,
+    config,
+    asymmetry_eligible,
+):
+    owners = []
+    seen = set()
+    for ref in refs:
+        paired_ref = pairs.get(ref)
+        if paired_ref is None:
+            key = ((ref.channel, ref.slot),)
+            if key not in seen:
+                owners.append((ref,))
+                seen.add(key)
+            continue
+
+        pair = tuple(sorted((ref, paired_ref), key=lambda item: (
+            item.channel, item.slot
+        )))
+        pair_key = tuple((item.channel, item.slot) for item in pair)
+        if pair_key not in seen:
+            owners.append(pair)
+            seen.add(pair_key)
+
+        if asymmetry_eligible is None:
+            continue
+        replacement = _bounded_band(
+            (ref,),
+            (
+                region.frequency,
+                region.q,
+                ref.original[2] + region.gain_delta_db,
+            ),
+            config,
+        )
+        side_key = ((ref.channel, ref.slot),)
+        if (
+            replacement is not None
+            and side_key not in seen
+            and asymmetry_eligible(ref, replacement)
+        ):
+            owners.append((ref,))
+            seen.add(side_key)
+    return tuple(owners)
+
+
 def build_filter_census(
     refs,
     score_plan,
@@ -642,27 +704,50 @@ def build_filter_census(
             ),
         ))
 
-    ranked_refs = {
-        row.ref: rank
-        for rank, row in enumerate(sorted(
-            rows,
-            key=lambda item: (
-                item.probe_band is None,
-                float("inf")
-                if item.system_delta is None else item.system_delta,
-                float("inf")
-                if item.balance_delta is None else item.balance_delta,
-                float("inf")
-                if item.headroom_delta is None else item.headroom_delta,
-                item.ref.channel,
-                item.ref.slot,
-            ),
-        ), start=1)
-    }
-    return tuple(
-        replace(row, driver_rank=ranked_refs[row.ref])
+    regions = {
+        region
         for row in rows
-    )
+        for candidate in row.candidates
+        if (region := _candidate_region(candidate)) is not None
+    }
+    ownership_by_region = {}
+    for region in sorted(
+        regions,
+        key=lambda item: (item.frequency, item.q, item.gain_delta_db),
+    ):
+        owners = _eligible_region_owners(
+            refs,
+            pairs,
+            region,
+            config,
+            asymmetry_eligible,
+        )
+        ownership_by_region[region] = attribute_correction_region(
+            region,
+            owners,
+            score_plan,
+            config,
+        )
+
+    attributed_rows = []
+    for row in rows:
+        candidates = []
+        for candidate in row.candidates:
+            region = _candidate_region(candidate)
+            candidates.append(replace(
+                candidate,
+                region=region,
+                owner_attributions=(
+                    ()
+                    if region is None
+                    else ownership_by_region[region]
+                ),
+            ))
+        attributed_rows.append(replace(
+            row,
+            candidates=tuple(candidates),
+        ))
+    return tuple(attributed_rows)
 
 
 def freeze_groups(groups) -> tuple[tuple[str, tuple[Band, ...]], ...]:

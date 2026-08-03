@@ -364,6 +364,96 @@ class FilterSearchTests(unittest.TestCase):
             for item in one_sided if item.edit.replacement
         ))
 
+    def test_census_attaches_distinct_owner_rankings_to_retained_regions(self):
+        low_left = rehab.FilterRef(
+            2, 1, "FL Low", "17", (80.0, 1.0, -2.0), "low-80"
+        )
+        low_right = rehab.FilterRef(
+            3, 1, "FR Low", "17", (80.0, 1.0, -2.0), "low-80"
+        )
+        sub = rehab.FilterRef(6, 1, "Sub", "17", (60.0, 1.0, -2.0))
+        config = rehab.RehabilitationConfig(
+            retained_per_slot=6,
+            refinement_passes=2,
+            max_evaluations_per_slot=2500,
+            role_limits=(
+                ("FL Low", 50.0, 500.0, 0.5, 6.0, -6.0, 3.0),
+                ("FR Low", 50.0, 500.0, 0.5, 6.0, -6.0, 3.0),
+                ("Sub", 30.0, 90.0, 0.5, 5.0, -6.0, 0.0),
+            ),
+            paired_role_limits=(
+                ("FL Low", "FR Low", 50.0, 500.0, 0.5, 5.0, -6.0, 0.0),
+            ),
+        )
+
+        def score_plan(plan):
+            if not plan.slot_edits:
+                return {
+                    "objective": 100.0,
+                    "sum_rms_db": 100.0,
+                    "balance_penalty_db": 2.0,
+                    "positive_gain_penalty_db": 1.0,
+                }
+            replacement = plan.slot_edits[0].replacement
+            if replacement is None:
+                value = 120.0
+            else:
+                frequency, q, gain = replacement
+                channels = {edit.ref.channel for edit in plan.slot_edits}
+                target = 60.0 if channels == {6} else 80.0
+                value = (
+                    abs(frequency - target)
+                    + abs(q - 1.0)
+                    + abs(gain + 2.25)
+                )
+            return {
+                "objective": value,
+                "sum_rms_db": value,
+                "balance_penalty_db": 2.0,
+                "positive_gain_penalty_db": 1.0,
+            }
+
+        rows = rehab.build_filter_census(
+            (low_left, low_right, sub),
+            score_plan,
+            config,
+        )
+        retained = [
+            candidate
+            for row in rows
+            for candidate in row.candidates
+            if candidate.region is not None
+        ]
+        low_region = next(
+            item for item in retained
+            if abs(item.region.frequency - 80.0) <= 0.1
+            and abs(item.region.q - 1.0) <= 0.01
+        )
+        sub_region = next(
+            item for item in retained
+            if abs(item.region.frequency - 60.0) <= 0.1
+            and abs(item.region.q - 1.0) <= 0.01
+        )
+
+        expected_owners = {frozenset({2, 3}), frozenset({6})}
+        for candidate in (low_region, sub_region):
+            self.assertEqual(
+                {
+                    frozenset(ref.channel for ref in item.owner_refs)
+                    for item in candidate.owner_attributions
+                },
+                expected_owners,
+            )
+        self.assertEqual(
+            {ref.channel for ref in low_region.owner_attributions[0].owner_refs},
+            {2, 3},
+        )
+        self.assertEqual(
+            {ref.channel for ref in sub_region.owner_attributions[0].owner_refs},
+            {6},
+        )
+        self.assertFalse(hasattr(rows[0], "driver_rank"))
+
     def test_region_attribution_ranks_same_probe_across_low_pair_and_sub(self):
         low_left = rehab.FilterRef(
             2, 1, "FL Low", "17", (80.0, 1.0, -2.0), "low-80"
