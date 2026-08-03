@@ -474,8 +474,30 @@ def rehabilitation_config(channel_roles, *, explore=False, **overrides):
             float(cfg["gain_range"][0]),
             float(cfg["gain_range"][1]),
         )
+
+    paired_role_limits = []
+    for name, cfg in groups.items():
+        channels = tuple(cfg["channels"])
+        if len(channels) != 2:
+            continue
+        if name != "sub" and not name.endswith("_sym"):
+            continue
+        if any(channel not in channel_roles for channel in channels):
+            continue
+        paired_role_limits.append((
+            str(channel_roles[channels[0]]),
+            str(channel_roles[channels[1]]),
+            float(cfg["range"][0]),
+            float(cfg["range"][1]),
+            float(cfg["q_range"][0]),
+            float(cfg["q_range"][1]),
+            float(cfg["gain_range"][0]),
+            float(cfg["gain_range"][1]),
+        ))
+
     return RehabilitationConfig(
         role_limits=tuple(limits_by_role.values()),
+        paired_role_limits=tuple(paired_role_limits),
         **overrides,
     )
 

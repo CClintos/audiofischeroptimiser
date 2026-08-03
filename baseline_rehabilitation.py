@@ -72,6 +72,9 @@ class RehabilitationConfig:
     role_limits: tuple[
         tuple[str, float, float, float, float, float, float], ...
     ] = ()
+    paired_role_limits: tuple[
+        tuple[str, str, float, float, float, float, float, float], ...
+    ] = ()
 
     def limits_for(self, ref: FilterRef):
         for (
@@ -89,6 +92,32 @@ class RehabilitationConfig:
             2.5 if gain <= 0.0 else 2.0,
             gain_min,
             gain_max,
+        )
+
+    def limits_for_refs(self, refs):
+        refs = tuple(refs)
+        if len(refs) == 1:
+            return self.limits_for(refs[0])
+        roles = tuple(sorted(ref.role for ref in refs))
+        frequency = float(refs[0].original[0])
+        matches = []
+        for (
+            left_role, right_role,
+            f_min, f_max, q_min, q_max, gain_min, gain_max,
+        ) in self.paired_role_limits:
+            if tuple(sorted((left_role, right_role))) != roles:
+                continue
+            if f_min <= frequency <= f_max:
+                centre = math.sqrt(f_min * f_max)
+                matches.append((
+                    abs(math.log2(frequency / centre)),
+                    (f_min, f_max, q_min, q_max, gain_min, gain_max),
+                ))
+        if matches:
+            return min(matches, key=lambda item: item[0])[1]
+
+        raise ValueError(
+            "paired rehabilitation roles have no configured symmetric limits"
         )
 
 
@@ -126,16 +155,38 @@ class OperationCandidate:
 
 
 @dataclass(frozen=True)
+class CorrectionRegion:
+    frequency: float
+    q: float
+    gain_delta_db: float = -0.25
+
+
+@dataclass(frozen=True)
+class DriverAttribution:
+    region: CorrectionRegion
+    owner_refs: tuple[FilterRef, ...]
+    probe_band: Band | None
+    components: dict[str, object] | None
+    system_delta: float | None
+    balance_delta: float | None
+    headroom_delta: float | None
+    skip_reason: str | None = None
+    rank: int = 0
+
+
+@dataclass(frozen=True)
 class FilterCensusRow:
     ref: FilterRef
     paired_ref: FilterRef | None
     baseline_components: dict[str, object]
     removal_components: dict[str, object]
-    probe_components: dict[str, object]
+    probe_band: Band | None
+    probe_components: dict[str, object] | None
+    probe_skip_reason: str | None
     candidates: tuple[OperationCandidate, ...]
-    system_delta: float
-    balance_delta: float
-    headroom_delta: float
+    system_delta: float | None
+    balance_delta: float | None
+    headroom_delta: float | None
     driver_rank: int = 0
 
 
@@ -167,25 +218,32 @@ def _score_operation(refs, replacement, score_plan, baseline_components):
     )
 
 
-def _bounded_band(ref, band, config):
-    f_min, f_max, q_min, q_max, gain_min, gain_max = config.limits_for(ref)
-    frequency, q, gain = band
+def _bounded_band(refs, band, config):
+    refs = tuple(refs)
+    f_min, f_max, q_min, q_max, gain_min, gain_max = (
+        config.limits_for_refs(refs)
+    )
+    frequency, q, gain = canonical_peq_band((
+        round(band[0], 1),
+        round(band[1], 2),
+        round(band[2] * 4) / 4,
+    ))
     if not (f_min <= frequency <= f_max):
         return None
     if not (q_min <= q <= q_max):
         return None
     if not (gain_min <= gain <= gain_max):
         return None
-    return canonical_peq_band((
-        round(frequency, 1),
-        round(q, 2),
-        round(gain * 4) / 4,
-    ))
+    return (frequency, q, gain)
 
 
-def _coarse_bands(ref, config):
+def _coarse_bands(refs, config):
+    refs = tuple(refs)
+    ref = refs[0]
     frequency, q, gain = ref.original
-    f_min, f_max, q_min, q_max, gain_min, gain_max = config.limits_for(ref)
+    f_min, f_max, q_min, q_max, gain_min, gain_max = (
+        config.limits_for_refs(refs)
+    )
     frequencies = {canonical_peq_band(ref.original)[0]}
     for octave in config.frequency_octaves:
         moved = frequency * 2 ** octave
@@ -212,7 +270,7 @@ def _coarse_bands(ref, config):
         for moved_q in q_values
         for moved_gain in gains
         if (band := _bounded_band(
-            ref, (moved_f, moved_q, moved_gain), config
+            refs, (moved_f, moved_q, moved_gain), config
         )) is not None
         and band != canonical_peq_band(ref.original)
     }
@@ -246,7 +304,7 @@ def _search_for_refs(
         return candidate
 
     removal = evaluate(None) if eligible(None) else None
-    for band in sorted(_coarse_bands(refs[0], config)):
+    for band in sorted(_coarse_bands(refs, config)):
         if not eligible(band):
             continue
         if evaluate(band) is None:
@@ -284,7 +342,7 @@ def _search_for_refs(
                     ))
                 trials = []
                 for neighbour in neighbours:
-                    band = _bounded_band(refs[0], neighbour, config)
+                    band = _bounded_band(refs, neighbour, config)
                     if band is None or not eligible(band):
                         continue
                     candidate = evaluate(band)
@@ -403,13 +461,110 @@ def _pair_map(refs):
     return pairs
 
 
-def _probe_band(ref, config):
-    frequency, q, gain = canonical_peq_band(ref.original)
-    _f_min, _f_max, _q_min, _q_max, gain_min, gain_max = config.limits_for(ref)
-    moved_gain = gain - 0.25
-    if moved_gain < gain_min:
-        moved_gain = min(gain + 0.25, gain_max)
-    return canonical_peq_band((frequency, q, moved_gain))
+def _system_delta(components, baseline_components):
+    for key in ("sum_rms_db", "system_rms_db", "objective"):
+        if key in components and key in baseline_components:
+            return _component_delta(components, baseline_components, key)
+    raise ValueError("rehabilitation scorer has no system or objective component")
+
+
+def _probe_band(refs, config):
+    refs = tuple(refs)
+    original = canonical_peq_band(refs[0].original)
+    f_min, f_max, q_min, q_max, gain_min, gain_max = (
+        config.limits_for_refs(refs)
+    )
+    base = (
+        min(max(original[0], f_min), f_max),
+        min(max(original[1], q_min), q_max),
+        min(max(original[2], gain_min), gain_max),
+    )
+    proposals = (
+        (base[0], base[1], base[2] - 0.25),
+        (base[0], base[1], base[2] + 0.25),
+        (base[0], base[1] - 0.1, base[2]),
+        (base[0], base[1] + 0.1, base[2]),
+        (base[0] * 2 ** (-1 / 96), base[1], base[2]),
+        (base[0] * 2 ** (1 / 96), base[1], base[2]),
+        base,
+    )
+    for proposal in proposals:
+        band = _bounded_band(refs, proposal, config)
+        if band is not None and band != original:
+            return band, None
+    return None, "no valid bounded perturbation"
+
+
+def attribute_correction_region(
+    region,
+    eligible_owners,
+    score_plan,
+    config=None,
+):
+    config = config or RehabilitationConfig()
+    baseline_components = dict(score_plan(CandidatePlan()))
+    rows = []
+    for owner in eligible_owners:
+        owner_refs = (
+            (owner,) if isinstance(owner, FilterRef) else tuple(owner)
+        )
+        original_gain = canonical_peq_band(owner_refs[0].original)[2]
+        probe_band = _bounded_band(
+            owner_refs,
+            (
+                float(region.frequency),
+                float(region.q),
+                original_gain + float(region.gain_delta_db),
+            ),
+            config,
+        )
+        if probe_band is None:
+            rows.append(DriverAttribution(
+                region=region,
+                owner_refs=owner_refs,
+                probe_band=None,
+                components=None,
+                system_delta=None,
+                balance_delta=None,
+                headroom_delta=None,
+                skip_reason="correction region outside owner limits",
+            ))
+            continue
+        probe = _score_operation(
+            owner_refs, probe_band, score_plan, baseline_components
+        )
+        rows.append(DriverAttribution(
+            region=region,
+            owner_refs=owner_refs,
+            probe_band=probe_band,
+            components=dict(probe.components),
+            system_delta=_system_delta(
+                probe.components, baseline_components
+            ),
+            balance_delta=_component_delta(
+                probe.components, baseline_components, "balance_penalty_db"
+            ),
+            headroom_delta=_component_delta(
+                probe.components,
+                baseline_components,
+                "positive_gain_penalty_db",
+            ),
+        ))
+
+    ordered = sorted(
+        rows,
+        key=lambda item: (
+            item.probe_band is None,
+            float("inf") if item.system_delta is None else item.system_delta,
+            float("inf") if item.balance_delta is None else item.balance_delta,
+            float("inf") if item.headroom_delta is None else item.headroom_delta,
+            tuple((ref.channel, ref.slot) for ref in item.owner_refs),
+        ),
+    )
+    return tuple(
+        replace(item, rank=rank)
+        for rank, item in enumerate(ordered, start=1)
+    )
 
 
 def build_filter_census(
@@ -431,8 +586,16 @@ def build_filter_census(
         removal = _score_operation(
             operation_refs, None, score_plan, baseline_components
         )
-        probe = _score_operation(
-            operation_refs, _probe_band(ref, config), score_plan, baseline_components
+        probe_band, probe_skip_reason = _probe_band(operation_refs, config)
+        probe = (
+            None
+            if probe_band is None
+            else _score_operation(
+                operation_refs,
+                probe_band,
+                score_plan,
+                baseline_components,
+            )
         )
         candidates = search_filter_operations(
             ref,
@@ -442,21 +605,40 @@ def build_filter_census(
             asymmetry_eligible=asymmetry_eligible,
             deadline=deadline,
         )
+        probe_components = (
+            None if probe is None else dict(probe.components)
+        )
         rows.append(FilterCensusRow(
             ref=ref,
             paired_ref=paired_ref,
             baseline_components=dict(baseline_components),
             removal_components=dict(removal.components),
-            probe_components=dict(probe.components),
+            probe_band=probe_band,
+            probe_components=probe_components,
+            probe_skip_reason=probe_skip_reason,
             candidates=candidates,
-            system_delta=_component_delta(
-                probe.components, baseline_components, "objective"
+            system_delta=(
+                None
+                if probe is None
+                else _system_delta(probe.components, baseline_components)
             ),
-            balance_delta=_component_delta(
-                probe.components, baseline_components, "balance_penalty_db"
+            balance_delta=(
+                None
+                if probe is None
+                else _component_delta(
+                    probe.components,
+                    baseline_components,
+                    "balance_penalty_db",
+                )
             ),
-            headroom_delta=_component_delta(
-                probe.components, baseline_components, "positive_gain_penalty_db"
+            headroom_delta=(
+                None
+                if probe is None
+                else _component_delta(
+                    probe.components,
+                    baseline_components,
+                    "positive_gain_penalty_db",
+                )
             ),
         ))
 
@@ -465,9 +647,13 @@ def build_filter_census(
         for rank, row in enumerate(sorted(
             rows,
             key=lambda item: (
-                item.system_delta,
-                item.balance_delta,
-                item.headroom_delta,
+                item.probe_band is None,
+                float("inf")
+                if item.system_delta is None else item.system_delta,
+                float("inf")
+                if item.balance_delta is None else item.balance_delta,
+                float("inf")
+                if item.headroom_delta is None else item.headroom_delta,
                 item.ref.channel,
                 item.ref.slot,
             ),

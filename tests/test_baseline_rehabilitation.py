@@ -255,6 +255,9 @@ class FilterSearchTests(unittest.TestCase):
                 ("FR Low", 80.0, 2000.0, 0.5, 2.5, -6.0, 3.0),
                 ("Sub", 30.0, 90.0, 0.5, 5.0, -6.0, 0.0),
             ),
+            paired_role_limits=(
+                ("FL Low", "FR Low", 80.0, 2600.0, 0.5, 5.0, -6.0, 0.0),
+            ),
         )
 
     def score_plan(self, plan):
@@ -289,6 +292,176 @@ class FilterSearchTests(unittest.TestCase):
                 edit.replacement is None for edit in plan.slot_edits
             ),
         }
+
+    def test_paired_search_rejects_missing_symmetric_limits(self):
+        config = rehab.RehabilitationConfig(
+            role_limits=self.config.role_limits,
+            retained_per_slot=1,
+            max_evaluations_per_slot=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "symmetric limits"):
+            rehab.search_filter_operations(
+                self.ref_97_q3,
+                self.score_plan,
+                config,
+                paired_ref=self.ref_97_q3_right,
+            )
+
+    def test_paired_search_uses_symmetric_limits_but_asymmetric_uses_side_limits(
+        self
+    ):
+        config = optimizer.rehabilitation_config(
+            {2: "FL Low", 3: "FR Low"},
+            retained_per_slot=12,
+            max_evaluations_per_slot=5000,
+        )
+
+        def favour_side_only_values(plan):
+            if not plan.slot_edits:
+                return {
+                    "objective": 20.0,
+                    "balance_penalty_db": 2.0,
+                    "positive_gain_penalty_db": 1.0,
+                }
+            replacement = plan.slot_edits[0].replacement
+            if replacement is None:
+                return {
+                    "objective": 30.0,
+                    "balance_penalty_db": 2.0,
+                    "positive_gain_penalty_db": 1.0,
+                }
+            _frequency, q, gain = replacement
+            return {
+                "objective": abs(q - 5.5) + abs(gain - 1.0),
+                "balance_penalty_db": 2.0,
+                "positive_gain_penalty_db": max(gain, 0.0),
+            }
+
+        candidates = rehab.search_filter_operations(
+            self.ref_97_q3,
+            favour_side_only_values,
+            config,
+            paired_ref=self.ref_97_q3_right,
+            asymmetry_eligible=lambda ref, replacement: replacement is not None,
+        )
+        paired = [item for item in candidates if len(item.edits) == 2]
+        one_sided = [item for item in candidates if len(item.edits) == 1]
+
+        self.assertEqual(
+            config.limits_for_refs((self.ref_97_q3, self.ref_97_q3_right)),
+            (80.0, 2600.0, 0.5, 5.0, -6.0, 0.0),
+        )
+        self.assertTrue(paired)
+        self.assertTrue(all(
+            item.edit.replacement[1] <= 5.0
+            and item.edit.replacement[2] <= 0.0
+            for item in paired if item.edit.replacement
+        ))
+        self.assertTrue(any(
+            item.edit.replacement[1] > 5.0
+            or item.edit.replacement[2] > 0.0
+            for item in one_sided if item.edit.replacement
+        ))
+
+    def test_region_attribution_ranks_same_probe_across_low_pair_and_sub(self):
+        low_left = rehab.FilterRef(
+            2, 1, "FL Low", "17", (80.0, 1.0, -2.0), "low-80"
+        )
+        low_right = rehab.FilterRef(
+            3, 1, "FR Low", "17", (80.0, 1.0, -2.0), "low-80"
+        )
+        sub = rehab.FilterRef(6, 1, "Sub", "17", (80.0, 1.0, -2.0))
+        config = rehab.RehabilitationConfig(
+            role_limits=(
+                ("FL Low", 50.0, 500.0, 0.5, 6.0, -6.0, 3.0),
+                ("FR Low", 50.0, 500.0, 0.5, 6.0, -6.0, 3.0),
+                ("Sub", 30.0, 90.0, 0.5, 5.0, -6.0, 0.0),
+            ),
+            paired_role_limits=(
+                ("FL Low", "FR Low", 50.0, 500.0, 0.5, 5.0, -6.0, 0.0),
+            ),
+        )
+
+        def score_owner(plan):
+            if not plan.slot_edits:
+                return {
+                    "objective": 10.0,
+                    "sum_rms_db": 5.0,
+                    "balance_penalty_db": 2.0,
+                    "positive_gain_penalty_db": 1.0,
+                }
+            channels = {edit.ref.channel for edit in plan.slot_edits}
+            if channels == {6}:
+                values = (6.0, 3.0, 1.5, 1.0)
+            else:
+                values = (8.0, 4.0, 1.0, 1.2)
+            return {
+                "objective": values[0],
+                "sum_rms_db": values[1],
+                "balance_penalty_db": values[2],
+                "positive_gain_penalty_db": values[3],
+            }
+
+        ranked = rehab.attribute_correction_region(
+            rehab.CorrectionRegion(80.0, 1.0, -0.25),
+            ((low_left, low_right), (sub,)),
+            score_owner,
+            config,
+        )
+
+        self.assertEqual(ranked[0].owner_refs, (sub,))
+        self.assertEqual([item.rank for item in ranked], [1, 2])
+        self.assertEqual(
+            {item.probe_band[:2] for item in ranked},
+            {(80.0, 1.0)},
+        )
+        self.assertLess(ranked[0].system_delta, ranked[1].system_delta)
+        self.assertNotEqual(ranked[0].balance_delta, ranked[1].balance_delta)
+        self.assertNotEqual(ranked[0].headroom_delta, ranked[1].headroom_delta)
+
+    def test_census_probe_is_bounded_to_configured_q_cap(self):
+        captured = []
+
+        def capture_score(plan):
+            for edit in plan.slot_edits:
+                if edit.replacement is not None:
+                    captured.append(edit.replacement)
+            return {
+                "objective": 10.0,
+                "balance_penalty_db": 2.0,
+                "positive_gain_penalty_db": 1.0,
+            }
+
+        row = rehab.build_filter_census(
+            (self.ref_97_q3,),
+            capture_score,
+            self.config,
+        )[0]
+
+        self.assertIsNone(row.probe_skip_reason)
+        self.assertTrue(captured)
+        self.assertLessEqual(row.probe_band[1], 2.5)
+        self.assertTrue(all(80.0 <= band[0] <= 2000.0 for band in captured))
+        self.assertTrue(all(0.5 <= band[1] <= 2.5 for band in captured))
+
+    def test_census_probe_records_reason_when_no_valid_perturbation_exists(self):
+        fixed = rehab.FilterRef(2, 2, "Fixed", "17", (100.0, 1.0, -2.0))
+        config = rehab.RehabilitationConfig(
+            role_limits=(
+                ("Fixed", 100.0, 100.0, 1.0, 1.0, -2.0, -2.0),
+            ),
+            retained_per_slot=1,
+            max_evaluations_per_slot=1,
+        )
+
+        row = rehab.build_filter_census(
+            (fixed,), self.score_plan, config
+        )[0]
+
+        self.assertIsNone(row.probe_components)
+        self.assertIsNone(row.probe_band)
+        self.assertEqual(row.probe_skip_reason, "no valid bounded perturbation")
 
     def test_optimizer_plan_scorer_resolves_before_direct_scoring(self):
         captured = []
