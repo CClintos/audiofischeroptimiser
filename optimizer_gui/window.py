@@ -2198,7 +2198,10 @@ class OptimizerWindow(QMainWindow):
             f"{memory_line}\n"
         )
         self.memory_guard_error_logged = not self.memory_guard_available
-        self.phase_label.setText("Searching")
+        self.phase_label.setText(
+            "Preparing phase diagnostics"
+            if config.mode == "phase" else "Preparing existing tune"
+        )
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.poll_timer.start(1000)
@@ -2242,6 +2245,10 @@ class OptimizerWindow(QMainWindow):
         progress = collect_progress(Path(self.config.run_root))
         phase = progress["phase"]
         phase_names = {
+            "preparing": (
+                "Preparing phase diagnostics"
+                if self.config.mode == "phase" else "Preparing existing tune"
+            ),
             "searching": "Searching",
             "merging": "Merging",
             "verifying": "Verifying",
@@ -2251,7 +2258,10 @@ class OptimizerWindow(QMainWindow):
         if phase != self.current_run_phase:
             self.current_run_phase = phase
             self.run_log.append(f"Phase: {phase_names.get(phase, phase.title())}")
-        if phase == "searching":
+        if phase == "preparing":
+            self.phase_label.setText(phase_names["preparing"])
+            self.progress.setRange(0, 0)
+        elif phase == "searching":
             self.phase_label.setText("Searching")
             self.progress.setRange(0, 1000)
             self.progress.setValue(min(800, round(800 * elapsed / max(self.config.seconds, 1))))
@@ -2634,7 +2644,7 @@ class OptimizerWindow(QMainWindow):
         self.report_path = Path(path)
         if self.config:
             run_root = Path(self.config.run_root)
-            for name in ("searching", "merging", "verifying", "reporting"):
+            for name in ("preparing", "searching", "merging", "verifying", "reporting"):
                 (run_root / f".phase_{name}").unlink(missing_ok=True)
             (run_root / ".phase_complete").touch()
         self.open_report_button.setEnabled(self.report_path.exists())
@@ -2649,7 +2659,7 @@ class OptimizerWindow(QMainWindow):
         self.report_path = None
         if self.config:
             run_root = Path(self.config.run_root)
-            for name in ("searching", "merging", "verifying", "reporting"):
+            for name in ("preparing", "searching", "merging", "verifying", "reporting"):
                 (run_root / f".phase_{name}").unlink(missing_ok=True)
             (run_root / ".phase_complete").touch()
         self.open_report_button.setEnabled(False)

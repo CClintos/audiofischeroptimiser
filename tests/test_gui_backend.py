@@ -396,6 +396,8 @@ class GuiJobTests(unittest.TestCase):
     def test_progress_and_candidates_read_compact_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / ".phase_preparing").touch()
+            self.assertEqual(collect_progress(root)["phase"], "preparing")
             worker = root / "worker_01"
             worker.mkdir()
             (worker / "stream_state.json").write_text(json.dumps({
@@ -407,6 +409,7 @@ class GuiJobTests(unittest.TestCase):
                     "events": [{"elapsed_seconds": 4.0, "objective": 3.25}],
                 },
             }), encoding="utf-8")
+            (root / ".phase_searching").touch()
             progress = collect_progress(root)
             self.assertEqual(progress["trials"], 42)
             self.assertEqual(progress["best_objective"], 3.25)
@@ -557,6 +560,31 @@ class RehabilitationCacheLaunchTests(unittest.TestCase):
         _program, args = powershell_command(config, executable="C:\\python.exe")
 
         self.assertNotIn("-RehabilitationCache", args)
+
+    def test_launcher_passes_shared_stop_file_to_cache_preparation(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "run_guided_stream_workers.ps1"
+        ).read_text(encoding="utf-8-sig")
+        preparation = script.split("scripts\\build_rehabilitation_cache.py", 1)[1]
+        preparation = preparation.split("& $pythonExe @rehabilitationArgs", 1)[0]
+
+        self.assertIn('"--stop-file", $stopFilePath', preparation)
+    def test_windows_paths_with_spaces_remain_single_runner_arguments(self):
+        config = RunConfig(
+            "C:\\Fresh Measurements\\RTA session",
+            "C:\\Fresh Measurements\\baseline tune.afpx",
+            "C:\\Target Curves\\target curve.txt",
+            "C:\\Optimizer Runs\\run one",
+            mode="peq",
+        )
+
+        _program, args = powershell_command(
+            config, executable="C:\\Python Runtime\\python.exe"
+        )
+
+        self.assertEqual(args[args.index("-DataRoot") + 1], config.data_root)
+        self.assertEqual(args[args.index("-Baseline") + 1], config.baseline)
+        self.assertEqual(args[args.index("-Root") + 1], config.run_root)
 
 if __name__ == "__main__":
     unittest.main()

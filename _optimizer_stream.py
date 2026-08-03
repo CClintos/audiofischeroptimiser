@@ -205,6 +205,33 @@ def _json_safe(value):
     return value
 
 
+def _input_path_fingerprint(path):
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    if path.is_file():
+        return {
+            "path": str(path),
+            "kind": "file",
+            "content": opt.file_fingerprint(path),
+        }
+    if path.is_dir():
+        return {
+            "path": str(path),
+            "kind": "folder",
+            "files": [
+                {
+                    "relative_path": item.relative_to(path).as_posix(),
+                    "content": opt.file_fingerprint(item),
+                }
+                for item in sorted(
+                    (candidate for candidate in path.rglob("*") if candidate.is_file()),
+                    key=lambda candidate: candidate.relative_to(path).as_posix().lower(),
+                )
+            ],
+        }
+    return {"path": str(path), "kind": "missing"}
+
 def stream_input_fingerprint_payload(args, rehabilitation_config):
     manifest = dict(
         getattr(args, "measurement_session", {}).get("manifest", {})
@@ -231,6 +258,22 @@ def stream_input_fingerprint_payload(args, rehabilitation_config):
         "measurement_session_audit": dict(
             getattr(args, "measurement_session", {}).get("audit", {})
         ),
+        "level_calibration": {
+            "source": _input_path_fingerprint(
+                getattr(args, "level_calibration", None)
+            ),
+            "loaded_values": _json_safe(
+                getattr(args, "loaded_level_calibration", {})
+            ),
+        },
+        "repeatability": {
+            "source": _input_path_fingerprint(
+                getattr(args, "repeatability_folder", None)
+            ),
+            "model": _json_safe(
+                getattr(args, "measurement_noise_guard", {})
+            ),
+        },
         "phase_context": {
             "writes": str(getattr(args, "phase_writes", "off")),
             "sample_rate": float(getattr(args, "sample_rate", 96000.0)),
@@ -415,28 +458,93 @@ def compact_rehabilitation_cache_state(loaded, path):
 
 
 def build_or_load_rehabilitation_cache(
-    path, *, expected_fingerprint, fingerprint_inputs, config, build_stage
+    path,
+    *,
+    expected_fingerprint,
+    fingerprint_inputs,
+    config,
+    build_stage,
+    stop_requested=None,
+    lock_timeout_seconds=7200.0,
 ):
     path = Path(path)
+    stop_requested = stop_requested or (lambda: False)
+
+    def check_cancelled():
+        if stop_requested():
+            raise RuntimeError("rehabilitation cache preparation cancelled")
+
+    check_cancelled()
     if path.exists():
         return load_rehabilitation_cache(path, expected_fingerprint)
 
-    stage = build_stage()
-    payload = rehabilitation_cache_payload(
-        stage, config, expected_fingerprint, fingerprint_inputs
-    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    )
+    lock_path = path.with_name(f"{path.name}.lock")
+    temporary = None
+    owns_lock = False
+    wait_deadline = time.monotonic() + max(0.1, float(lock_timeout_seconds))
+    while not owns_lock:
+        check_cancelled()
+        if path.exists():
+            return load_rehabilitation_cache(path, expected_fingerprint)
+        try:
+            descriptor = os.open(
+                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+        except FileExistsError:
+            try:
+                owner_pid = int(lock_path.read_text(encoding="ascii").strip())
+                owner_alive = owner_pid == os.getpid()
+                if not owner_alive:
+                    try:
+                        os.kill(owner_pid, 0)
+                        owner_alive = True
+                    except (OSError, OverflowError):
+                        owner_alive = False
+                if not owner_alive:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except (OSError, ValueError):
+                pass
+            if time.monotonic() >= wait_deadline:
+                raise RuntimeError(
+                    f"timed out waiting for rehabilitation cache preparation: {path}"
+                )
+            time.sleep(0.025)
+            continue
+        try:
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(descriptor)
+        owns_lock = True
+
     try:
-        temporary.write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
+        check_cancelled()
+        if path.exists():
+            return load_rehabilitation_cache(path, expected_fingerprint)
+        for orphan in path.parent.glob(f"{path.name}.*.tmp"):
+            orphan.unlink(missing_ok=True)
+        stage = build_stage()
+        check_cancelled()
+        payload = rehabilitation_cache_payload(
+            stage, config, expected_fingerprint, fingerprint_inputs
         )
+        temporary = path.with_name(
+            f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        check_cancelled()
         temporary.replace(path)
+        temporary = None
+        return load_rehabilitation_cache(path, expected_fingerprint)
     finally:
-        temporary.unlink(missing_ok=True)
-    return load_rehabilitation_cache(path, expected_fingerprint)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if owns_lock:
+            lock_path.unlink(missing_ok=True)
 
 
 def saved_rehabilitation_plan(path, expected_fingerprint):
@@ -463,7 +571,7 @@ def saved_rehabilitation_plan(path, expected_fingerprint):
 
 def run_rehabilitation_stage(
     *, mode, refs, score_plan, total_seconds, config=None,
-    asymmetry_eligible=None,
+    asymmetry_eligible=None, stop_requested=None,
 ):
     if mode != "peq":
         return {
@@ -492,9 +600,15 @@ def run_rehabilitation_stage(
     )
     deadline = time.monotonic() + budget.seconds
     evaluations = 0
+    stop_requested = stop_requested or (lambda: False)
+
+    def check_cancelled():
+        if stop_requested():
+            raise RuntimeError("rehabilitation cache preparation cancelled")
 
     def counted_score_plan(plan):
         nonlocal evaluations
+        check_cancelled()
         evaluations += 1
         return score_plan(plan)
 
@@ -510,6 +624,8 @@ def run_rehabilitation_stage(
         for row in census
         for candidate in row.candidates
     )
+    check_cancelled()
+
     result = rehab.rehabilitation_beam(
         rehab.CandidatePlan(),
         operations,
@@ -2072,6 +2188,7 @@ def main():
     args.measurement_noise_guard = opt.configure_repeatability_floor(
         args.repeatability_folder, level_calibration
     )
+    args.loaded_level_calibration = dict(level_calibration or {})
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     configure_profile(args.profile)
     rng = np.random.default_rng(args.seed)

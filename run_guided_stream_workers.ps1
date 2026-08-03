@@ -124,6 +124,7 @@ if ($Mode -eq "peq") {
         "--sample-rate", "$SampleRate",
         "--phase-writes", "$PhaseWrites",
         "--phase-cache", $phaseCachePath,
+        "--stop-file", $stopFilePath,
         "--print-mode", "none"
     )
     if ($impulseRootPath -ne "") {

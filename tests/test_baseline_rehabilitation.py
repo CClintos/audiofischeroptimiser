@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1595,6 +1597,169 @@ class CacheTests(unittest.TestCase):
             )
 
         self.assertNotEqual(off, automatic)
+    def _fingerprint_args(self, root, **overrides):
+        baseline = root / "baseline.afpx"
+        target = root / "target.txt"
+        baseline.write_bytes(b"baseline")
+        target.write_text("20 0\n", encoding="utf-8")
+        values = dict(
+            baseline=baseline,
+            target=target,
+            measurement_session={"manifest": {}, "audit": {}},
+            measurement_noise_guard={"source": "default", "repeatability_db": 0.25},
+            loaded_level_calibration={},
+            filter_cost_scale=0.1,
+            worst_weight=0.1,
+            min_total_bands=0,
+            mode="peq",
+            profile="explore",
+            phase_cache=None,
+            phase_writes="off",
+            sample_rate=96000.0,
+            level_calibration=None,
+            repeatability_folder=None,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_cache_fingerprint_changes_with_calibration_content_and_loaded_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calibration = root / "level calibration.json"
+            calibration.write_text('{"FL Low": 1.0}', encoding="utf-8")
+            args = self._fingerprint_args(
+                root,
+                level_calibration=calibration,
+                loaded_level_calibration={"FL Low": 1.0},
+            )
+            first = stream.stream_input_fingerprint(args, self.config)
+            calibration.write_text('{"FL Low": 2.0}', encoding="utf-8")
+            second = stream.stream_input_fingerprint(args, self.config)
+            args.loaded_level_calibration = {"FL Low": 2.0}
+            third = stream.stream_input_fingerprint(args, self.config)
+
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(second, third)
+
+    def test_cache_fingerprint_changes_with_repeatability_content_and_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repeatability = root / "repeatability folder"
+            repeatability.mkdir()
+            capture = repeatability / "System Sum.txt"
+            capture.write_text("20 70\n", encoding="utf-8")
+            args = self._fingerprint_args(root, repeatability_folder=repeatability)
+            first = stream.stream_input_fingerprint(args, self.config)
+            capture.write_text("20 71\n", encoding="utf-8")
+            second = stream.stream_input_fingerprint(args, self.config)
+            args.measurement_noise_guard = {
+                "source": "empirical", "repeatability_db": 0.7
+            }
+            third = stream.stream_input_fingerprint(args, self.config)
+
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(second, third)
+
+    def test_cache_preparation_cancels_without_publishing_or_leaving_temporary_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            stopped = threading.Event()
+
+            def build_stage():
+                stopped.set()
+                return self._stage()
+
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                stream.build_or_load_rehabilitation_cache(
+                    path,
+                    expected_fingerprint="cancelled-session",
+                    fingerprint_inputs=self.fingerprint_inputs,
+                    config=self.config,
+                    build_stage=build_stage,
+                    stop_requested=stopped.is_set,
+                )
+
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.glob("rehabilitation_cache.json.*")), [])
+
+    def test_rehabilitation_scoring_stops_before_the_first_evaluation(self):
+        ref = rehab.FilterRef(2, 0, "FL Low", "PEQ", (500.0, 1.0, -2.0))
+        calls = []
+
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            stream.run_rehabilitation_stage(
+                mode="peq",
+                refs=(ref,),
+                score_plan=lambda _plan: calls.append("scored") or {"objective": 1.0},
+                total_seconds=60,
+                config=self.config,
+                stop_requested=lambda: True,
+            )
+
+        self.assertEqual(calls, [])
+    def test_abandoned_lock_and_temporary_file_are_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            path.with_name(f"{path.name}.lock").write_text(
+                "2147483647", encoding="ascii"
+            )
+            path.with_name(f"{path.name}.orphan.tmp").write_text(
+                "partial", encoding="utf-8"
+            )
+
+            loaded = stream.build_or_load_rehabilitation_cache(
+                path,
+                expected_fingerprint="recovered-session",
+                fingerprint_inputs=self.fingerprint_inputs,
+                config=self.config,
+                build_stage=self._stage,
+                lock_timeout_seconds=0.2,
+            )
+
+            self.assertEqual(loaded["fingerprint"], "recovered-session")
+            self.assertEqual(list(path.parent.glob("rehabilitation_cache.json.*")), [])
+    def test_concurrent_cache_preparation_builds_and_publishes_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            started = threading.Event()
+            release = threading.Event()
+            calls = []
+            results = []
+            errors = []
+
+            def build_stage():
+                calls.append("built")
+                started.set()
+                release.wait(2)
+                return self._stage()
+
+            def invoke():
+                try:
+                    results.append(stream.build_or_load_rehabilitation_cache(
+                        path,
+                        expected_fingerprint="concurrent-session",
+                        fingerprint_inputs=self.fingerprint_inputs,
+                        config=self.config,
+                        build_stage=build_stage,
+                    ))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            first = threading.Thread(target=invoke)
+            second = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(started.wait(1))
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(2)
+            second.join(2)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(calls, ["built"])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(json.loads(path.read_text())["fingerprint"], "concurrent-session")
+            self.assertEqual(list(path.parent.glob("rehabilitation_cache.json.*")), [])
     def test_malformed_cache_fails_instead_of_rescoring(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rehabilitation_cache.json"

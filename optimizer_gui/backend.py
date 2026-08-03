@@ -25,7 +25,7 @@ from scripts.make_measurement_manifest import (
 APP_NAME = "AudioFischer Optimizer"
 JOB_FILE = "gui_job.json"
 RUN_CLAIM_FILE = ".active_run.json"
-RUN_PHASES = ("searching", "merging", "verifying", "reporting", "complete")
+RUN_PHASES = ("preparing", "searching", "merging", "verifying", "reporting", "complete")
 RUN_SUCCESS_FILE = ".runner_success"
 RUN_FAILURE_FILE = ".runner_failed"
 
@@ -498,7 +498,7 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
     ])
     phase = next(
         (name for name in reversed(RUN_PHASES) if (run_root / f".phase_{name}").exists()),
-        "searching",
+        "searching" if states else "preparing",
     )
     convergence_rows = [
         dict(state.get("convergence") or {}) for state in states

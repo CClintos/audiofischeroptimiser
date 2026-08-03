@@ -57,7 +57,7 @@ trap {
     [Console]::Error.WriteLine($failureText)
     exit 1
 }
-$runPhases = @("searching", "merging", "verifying", "reporting", "complete")
+$runPhases = @("preparing", "searching", "merging", "verifying", "reporting", "complete")
 function Set-RunPhase([string]$Phase) {
     foreach ($name in $runPhases) {
         $marker = Join-Path $Root (".phase_" + $name)
@@ -89,11 +89,12 @@ if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
 if ($RepeatabilityFolder) { $launch.RepeatabilityFolder = $RepeatabilityFolder }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
 if ($RehabilitationCache) { $launch.RehabilitationCache = $RehabilitationCache }
-Set-RunPhase "searching"
+Set-RunPhase "preparing"
 & (Join-Path $here "run_guided_stream_workers.ps1") @launch
 if ($LASTEXITCODE -ne 0) {
     throw "Optimizer worker launch failed. See the run log above for the detailed error."
 }
+Set-RunPhase "searching"
 
 $processFile = Join-Path $Root "worker_processes.json"
 if (-not (Test-Path -LiteralPath $processFile)) { throw "Worker process manifest was not created." }

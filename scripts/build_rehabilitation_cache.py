@@ -38,6 +38,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--level-calibration", type=Path, default=None)
     result.add_argument("--repeatability-folder", type=Path, default=None)
     result.add_argument("--role-map", type=Path, default=None)
+    result.add_argument("--stop-file", type=Path, default=None)
     result.add_argument("--phase-writes", choices=("auto", "off"), default="off")
     result.add_argument("--print-mode", choices=("compact", "none"), default="compact")
     return result
@@ -67,7 +68,15 @@ def _validate_paths(args: argparse.Namespace) -> None:
 
 def build(args: argparse.Namespace) -> dict[str, object]:
     _configure_environment(args)
+    stop_requested = lambda: bool(args.stop_file and args.stop_file.exists())
+
+    def check_cancelled():
+        if stop_requested():
+            raise RuntimeError("rehabilitation cache preparation cancelled")
+
+    check_cancelled()
     _validate_paths(args)
+    check_cancelled()
     args.mode = "peq"
     args.measurement_session, level_calibration = opt.prepare_measurement_session(
         args.baseline, args.target, args.level_calibration
@@ -75,6 +84,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
     args.measurement_noise_guard = opt.configure_repeatability_floor(
         args.repeatability_folder, level_calibration
     )
+    args.loaded_level_calibration = dict(level_calibration or {})
+    check_cancelled()
+
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     stream.configure_profile(args.profile)
 
@@ -90,6 +102,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         return stream.load_rehabilitation_cache(args.out, fingerprint)
 
     freqs, traces, rich_traces = opt.load_measurements(level_calibration)
+    check_cancelled()
     raw_target = opt.load_target(args.target, freqs)
     target = raw_target + opt.target_anchor_offset(
         freqs, traces["System Sum"], raw_target
@@ -105,6 +118,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         )
         raise SystemExit("Measurement validation gate failed: " + details)
 
+    check_cancelled()
     phase_session = opt.analyze_phase_session(
         freqs,
         traces,
@@ -115,6 +129,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         args.phase_cache,
         writes=args.phase_writes != "off",
     )
+    check_cancelled()
     score_plan = opt.make_candidate_plan_component_scorer(
         opt.make_band_set_component_scorer(
             freqs,
@@ -128,6 +143,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         phase_session["writes"],
         bool(args.measurement_session["audit"].get("phase_valid")),
     )
+    check_cancelled()
     base_xml = opt.decode_afpx(args.baseline)
     refs = rehab.active_peq_slot_refs(base_xml, channel_roles)
 
@@ -142,7 +158,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             score_plan=score_plan,
             total_seconds=args.seconds,
             config=config,
+            stop_requested=stop_requested,
         ),
+        stop_requested=stop_requested,
     )
 
 
