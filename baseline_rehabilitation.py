@@ -162,6 +162,9 @@ class ScoredCandidate:
     components: dict[str, object]
     applied_operations: tuple[tuple, ...] = ()
     depth: int = 0
+    bridge_only: bool = False
+    export_eligible: bool = True
+    requires_meaningful_export: bool = False
 
     @property
     def slot_edits(self) -> tuple[SlotEdit, ...]:
@@ -935,6 +938,47 @@ def compare_candidates(first, second, repeatability_db=None):
     )
 
 
+def _acoustic_component_key(candidate):
+    return tuple(
+        float(candidate.components[key])
+        for key in _ACOUSTIC_TIE_COMPONENTS
+        if key in candidate.components
+    )
+
+
+def _acoustic_reference(candidates):
+    return min(
+        candidates,
+        key=lambda candidate: (
+            candidate.objective,
+            _acoustic_component_key(candidate),
+            candidate_plan_signature(candidate.plan),
+        ),
+    )
+
+
+def _meaningfully_better(candidate, reference, repeatability_db=None):
+    return (
+        candidate.objective < reference.objective - 1e-12
+        and not _acoustically_tied(candidate, reference, repeatability_db)
+    )
+
+
+def select_best_candidate(
+    candidates, repeatability_db=None, *, acoustic_reference=None
+):
+    candidates = tuple(candidates)
+    if not candidates:
+        raise ValueError("at least one rehabilitation candidate is required")
+    reference = acoustic_reference or _acoustic_reference(candidates)
+    equivalence_class = tuple(
+        candidate
+        for candidate in candidates
+        if _acoustically_tied(candidate, reference, repeatability_db)
+    )
+    return min(equivalence_class or (reference,), key=tie_key)
+
+
 def _operation_keys(operation):
     return frozenset((edit.ref.channel, edit.ref.slot) for edit in operation.edits)
 
@@ -969,9 +1013,16 @@ def _retain_diverse(
     retained = [by_signature[baseline_signature]]
     chosen = {baseline_signature}
 
-    def add(candidate):
+    def add(candidate, *, bridge_only=False):
         signature = candidate_plan_signature(candidate.plan)
         if signature not in chosen and len(retained) < beam_width:
+            if bridge_only:
+                candidate = replace(
+                    candidate,
+                    bridge_only=True,
+                    export_eligible=False,
+                    requires_meaningful_export=True,
+                )
             retained.append(candidate)
             chosen.add(signature)
 
@@ -993,7 +1044,7 @@ def _retain_diverse(
         and _acoustically_tied(item, baseline, repeatability_db)
     ]
     if near_ties:
-        add(min(near_ties, key=_beam_sort_key))
+        add(min(near_ties, key=_beam_sort_key), bridge_only=True)
 
     seen_regions = {_region_signature(item) for item in retained}
     for candidate in sorted(pool, key=_beam_sort_key):
@@ -1016,8 +1067,14 @@ def rehabilitation_beam(
     repeatability_db=None,
 ):
     score_cache = {}
+    bridge_signatures = set()
 
-    def score(plan, applied_operations=(), depth=0):
+    def score(
+        plan,
+        applied_operations=(),
+        depth=0,
+        requires_meaningful_export=False,
+    ):
         signature = candidate_plan_signature(plan)
         if signature not in score_cache:
             components = dict(score_plan(plan))
@@ -1029,6 +1086,11 @@ def rehabilitation_beam(
             components=dict(score_cache[signature]),
             applied_operations=tuple(applied_operations),
             depth=depth,
+            bridge_only=signature in bridge_signatures,
+            export_eligible=not (
+                signature in bridge_signatures or requires_meaningful_export
+            ),
+            requires_meaningful_export=requires_meaningful_export,
         )
 
     baseline = score(baseline_plan)
@@ -1059,11 +1121,23 @@ def rehabilitation_beam(
                     slot_edits=parent.slot_edits + operation.edits,
                     groups=parent.plan.groups + operation.plan.groups,
                 )
+                needs_meaningful_export = (
+                    parent.bridge_only or parent.requires_meaningful_export
+                )
                 candidate = score(
                     plan,
                     parent.applied_operations + (operation_signature,),
                     generation,
+                    needs_meaningful_export,
                 )
+                if needs_meaningful_export and _meaningfully_better(
+                    candidate, baseline, repeatability_db
+                ):
+                    candidate = replace(
+                        candidate,
+                        export_eligible=True,
+                        requires_meaningful_export=False,
+                    )
                 expanded[candidate_plan_signature(plan)] = candidate
         beam = _retain_diverse(
             tuple(expanded.values()), baseline, beam_width, generation,
@@ -1074,12 +1148,20 @@ def rehabilitation_beam(
             candidate_plan_signature(candidate.plan): candidate
             for candidate in expanded.values()
         })
+        for retained_candidate in beam:
+            signature = candidate_plan_signature(retained_candidate.plan)
+            if retained_candidate.bridge_only:
+                bridge_signatures.add(signature)
+            all_candidates[signature] = retained_candidate
         if not any(candidate.depth == generation for candidate in beam):
             break
 
-    best = baseline
-    for candidate in all_candidates.values():
-        best = compare_candidates(best, candidate, repeatability_db)
+    export_candidates = tuple(
+        candidate
+        for candidate in all_candidates.values()
+        if candidate.export_eligible and not candidate.bridge_only
+    )
+    best = select_best_candidate(export_candidates, repeatability_db)
     return RehabilitationResult(
         baseline=baseline,
         best=best,
@@ -1089,12 +1171,31 @@ def rehabilitation_beam(
     )
 
 
-def _hard_gate_counts(components):
-    return {
+def hard_gate_regressed(original_components, trial_components):
+    original_counts = {
         key: float(value)
-        for key, value in components.items()
-        if key.endswith("violation_count") and isinstance(value, (int, float))
+        for key, value in original_components.items()
+        if key.endswith("violation_count")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
     }
+    trial_counts = {
+        key: float(value)
+        for key, value in trial_components.items()
+        if key.endswith("violation_count")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    }
+    if any(
+        trial_counts.get(key, 0.0) > original_counts.get(key, 0.0)
+        for key in original_counts.keys() | trial_counts.keys()
+    ):
+        return True
+    return any(
+        value is True and trial_components.get(key) is not True
+        for key, value in original_components.items()
+        if isinstance(value, bool)
+    )
 
 
 def consolidate_candidate(candidate, score_plan, tolerance_db=0.1):
@@ -1151,12 +1252,7 @@ def consolidate_candidate(candidate, score_plan, tolerance_db=0.1):
             if headroom_regressed:
                 rejection = "headroom regressed"
                 continue
-            original_gates = _hard_gate_counts(original.components)
-            trial_gates = _hard_gate_counts(trial.components)
-            if any(
-                trial_gates.get(key, 0.0) > original_gates.get(key, 0.0)
-                for key in original_gates.keys() | trial_gates.keys()
-            ):
+            if hard_gate_regressed(original.components, trial.components):
                 rejection = "hard gate regressed"
                 continue
             return ConsolidationResult(

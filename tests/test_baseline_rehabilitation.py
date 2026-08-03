@@ -772,6 +772,165 @@ class InteractionBeamTests(unittest.TestCase):
             rehab.candidate_plan_signature(rehab.CandidatePlan((edits[0],))),
             retained,
         )
+
+    def test_global_tie_selection_cannot_chain_past_acoustic_reference(self):
+        candidates = tuple(
+            rehab.ScoredCandidate(
+                rehab.CandidatePlan((
+                    rehab.SlotEdit.modify(
+                        rehab.FilterRef(
+                            2, slot, "FL Low", "17", (500.0, 1.0, -2.0)
+                        ),
+                        (500.0, 1.0, -2.5),
+                    ),
+                )),
+                self.components(value, filter_count, tonal=value),
+            )
+            for slot, value, filter_count in (
+                (6, 0.00, 3),
+                (7, 0.04, 2),
+                (8, 0.08, 1),
+            )
+        )
+
+        winner = rehab.select_best_candidate(
+            candidates, repeatability_db=0.05
+        )
+
+        self.assertIs(winner, candidates[1])
+        self.assertLessEqual(
+            abs(winner.components["tonal_masked"] - 0.00), 0.05
+        )
+
+    def test_beam_final_selection_uses_global_acoustic_reference(self):
+        refs = tuple(
+            rehab.FilterRef(2, slot, "FL Low", "17", (500.0, 1.0, -2.0))
+            for slot in (6, 7, 8)
+        )
+        edits = tuple(
+            rehab.SlotEdit.modify(ref, (500.0, 1.0, -2.5))
+            for ref in refs
+        )
+        values = {6: (0.00, 3), 7: (0.04, 2), 8: (0.08, 1)}
+        operations = tuple(
+            rehab.OperationCandidate(
+                edit,
+                rehab.CandidatePlan((edit,)),
+                self.components(*values[edit.ref.slot], tonal=values[edit.ref.slot][0]),
+                self.baseline,
+            )
+            for edit in edits
+        )
+
+        def score(plan):
+            if not plan.slot_edits:
+                return self.components(10.0, 4, tonal=10.0)
+            objective, filter_count = values[plan.slot_edits[0].ref.slot]
+            return self.components(
+                objective, filter_count, tonal=objective
+            )
+
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), operations, score,
+            beam_width=4, max_depth=1, repeatability_db=0.05,
+        )
+
+        self.assertEqual(result.best.slot_edits, (edits[1],))
+    def test_survival_only_bridge_cannot_be_exported(self):
+        refs = tuple(
+            rehab.FilterRef(2, slot, "FL Low", "17", (500.0, 1.0, -2.0))
+            for slot in (6, 7)
+        )
+        edits = tuple(
+            rehab.SlotEdit.modify(ref, (510.0 + index, 1.0, -2.5))
+            for index, ref in enumerate(refs)
+        )
+        operations = tuple(
+            rehab.OperationCandidate(
+                edit,
+                rehab.CandidatePlan((edit,)),
+                self.components(
+                    20.0 + 10.0 * index,
+                    2 if index == 0 else 1,
+                    tonal=0.04 + index,
+                ),
+                self.baseline,
+            )
+            for index, edit in enumerate(edits)
+        )
+
+        def score(plan):
+            if not plan.slot_edits:
+                return self.components(10.0, 3, tonal=0.0)
+            slot = plan.slot_edits[0].ref.slot
+            if slot == 6:
+                return self.components(20.0, 2, tonal=0.04)
+            return self.components(30.0, 1, tonal=1.0)
+
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), operations, score,
+            beam_width=3, max_depth=1, repeatability_db=0.05,
+        )
+
+        bridge_signature = rehab.candidate_plan_signature(
+            rehab.CandidatePlan((edits[0],))
+        )
+        self.assertIn(
+            bridge_signature,
+            {
+                rehab.candidate_plan_signature(candidate.plan)
+                for candidate in result.generations[1]
+            },
+        )
+        self.assertEqual(result.best.slot_edits, ())
+
+    def test_bridge_can_seed_meaningful_completed_interaction(self):
+        refs = tuple(
+            rehab.FilterRef(2, slot, "FL Low", "17", (500.0, 1.0, -2.0))
+            for slot in (6, 7, 8)
+        )
+        edits = tuple(
+            rehab.SlotEdit.modify(ref, (510.0 + index, 1.0, -2.5))
+            for index, ref in enumerate(refs)
+        )
+        operations = tuple(
+            rehab.OperationCandidate(
+                edit,
+                rehab.CandidatePlan((edit,)),
+                self.components(20.0, 3, tonal=0.04),
+                self.baseline,
+            )
+            for edit in edits
+        )
+
+        def score(plan):
+            slots = {edit.ref.slot for edit in plan.slot_edits}
+            if not slots:
+                return self.components(10.0, 3, tonal=0.0)
+            if slots == {6}:
+                return self.components(20.0, 3, tonal=0.04)
+            if slots == {6, 7}:
+                return self.components(5.0, 3, tonal=-1.0)
+            if slots == {8}:
+                return self.components(11.0, 3, tonal=1.0)
+            return self.components(40.0, 3, tonal=1.0)
+
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(), operations, score,
+            beam_width=3, max_depth=2, repeatability_db=0.05,
+        )
+
+        bridge = next(
+            candidate
+            for candidate in result.generations[1]
+            if {edit.ref.slot for edit in candidate.slot_edits} == {6}
+        )
+        self.assertTrue(bridge.bridge_only)
+        self.assertFalse(bridge.export_eligible)
+        self.assertEqual(
+            {edit.ref.slot for edit in result.best.slot_edits}, {6, 7}
+        )
+
     def test_acoustic_tie_prefers_removal(self):
         keep = rehab.ScoredCandidate(rehab.CandidatePlan((self.edit_left,)), self.components(8.0, 79))
         remove_edit = rehab.SlotEdit.remove(self.left)
@@ -819,6 +978,26 @@ class InteractionBeamTests(unittest.TestCase):
         result = rehab.consolidate_candidate(plan, score)
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "headroom regressed")
+
+    def test_merge_rejects_boolean_pass_to_fail_gate_transition(self):
+        first = rehab.SlotEdit.modify(self.left, (1000.0, 1.0, -3.0))
+        second = rehab.SlotEdit.modify(self.second, (1000.0, 1.0, -0.02))
+        plan = rehab.CandidatePlan((first, second))
+
+        def score(candidate_plan):
+            count = sum(
+                edit.replacement is not None
+                for edit in candidate_plan.slot_edits
+            )
+            components = self.components(5.0, count, tonal=1.0, headroom=5.0)
+            components["spatial_hold_pass"] = count == 2
+            return components
+
+        result = rehab.consolidate_candidate(plan, score)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "hard gate regressed")
+
     def test_merge_rejects_new_hard_gate_violation(self):
         first = rehab.SlotEdit.modify(self.left, (1000.0, 1.0, -3.0))
         second = rehab.SlotEdit.modify(self.second, (1000.0, 1.0, -0.02))
