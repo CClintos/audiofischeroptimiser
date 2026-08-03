@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -1302,5 +1303,180 @@ class StreamIntegrationTests(unittest.TestCase):
         self.assertLessEqual(budget.seconds, 6.0)
         self.assertGreater(budget.max_evaluations, 0)
 
+
+class Task5ReviewRegressionTests(unittest.TestCase):
+    def setUp(self):
+        xml = fixture_afpx_xml({2: [(7, 100.0, 1.0, -2.0)]})
+        self.ref = rehab.active_peq_slot_refs(xml, {2: "FL Low"})[0]
+        self.edit = rehab.SlotEdit.modify(
+            self.ref, (105.0, 1.1, -2.5)
+        )
+
+    def test_coordinate_refinement_scores_complete_candidate_plan(self):
+        group = "fl_low"
+        plan = rehab.CandidatePlan(
+            slot_edits=(self.edit,),
+            groups=rehab.freeze_groups({group: [(500.0, 1.0, -2.0)]}),
+        )
+        entry = stream.BeamEntry(
+            10.0, rehab.candidate_plan_signature(plan), plan,
+            {"objective": 10.0},
+        )
+        seen = []
+
+        def score_plan(candidate):
+            seen.append(candidate)
+            self.assertEqual(candidate.slot_edits, (self.edit,))
+            return {"objective": 9.0}
+
+        stream.refine_entries(
+            [entry], score_plan=score_plan, top=1, passes=1
+        )
+
+        self.assertTrue(seen)
+        self.assertTrue(all(item.slot_edits == (self.edit,) for item in seen))
+
+    def test_rehabilitation_beam_stops_at_deadline(self):
+        operation = rehab.OperationCandidate(
+            edit=self.edit,
+            plan=rehab.CandidatePlan(slot_edits=(self.edit,)),
+            components={"objective": 0.5},
+            baseline_components={"objective": 1.0},
+        )
+        calls = []
+
+        result = rehab.rehabilitation_beam(
+            rehab.CandidatePlan(),
+            (operation,),
+            lambda plan: calls.append(plan) or {"objective": 1.0},
+            deadline=0.0,
+        )
+
+        self.assertEqual(result.score_count, 1)
+        self.assertEqual(calls, [rehab.CandidatePlan()])
+
+    def test_merge_rejects_missing_or_mismatched_worker_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Path(tmp) / "worker_01"
+            worker.mkdir()
+            state = worker / "stream_state.json"
+            state.write_text(json.dumps({"version": 7, "best": []}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing input fingerprint"):
+                merge_stream.load_worker_best(worker, expected_fingerprint="current")
+
+            state.write_text(json.dumps({
+                "version": 7,
+                "input_fingerprint": "stale",
+                "best": [],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match current inputs"):
+                merge_stream.load_worker_best(worker, expected_fingerprint="current")
+
+    def test_full_plan_diagnostics_resolve_slot_edits(self):
+        baseline = [[] for _ in range(8)]
+        baseline[2] = [self.ref.original]
+        plan = rehab.CandidatePlan(slot_edits=(self.edit,))
+
+        class Objective:
+            def __init__(self):
+                self.audit_sets = None
+                self.plot_sets = None
+
+            def response_audit(self, band_sets):
+                self.audit_sets = band_sets
+                return {"ok": True}
+
+            def report_plot_data(self, band_sets):
+                self.plot_sets = band_sets
+                return {"ok": True}
+
+        objective = Objective()
+        with patch.object(optimizer, "AFPX_OBJECTIVE", objective), patch.object(
+            optimizer, "baseline_band_sets", return_value=baseline
+        ):
+            optimizer.fixed_anchor_response_audit(plan)
+            optimizer.report_plot_data(plan)
+            headroom = optimizer.candidate_plan_headroom(
+                np.geomspace(20.0, 20000.0, 64), plan
+            )
+
+        self.assertIn(self.edit.replacement, objective.audit_sets[2])
+        self.assertIn(self.edit.replacement, objective.plot_sets[2])
+        self.assertIn("FL Low", headroom)
+
+    def test_candidate_plan_prediction_uses_slot_edit_delta(self):
+        freqs = np.geomspace(50.0, 5000.0, 96)
+        traces = {
+            name: np.zeros_like(freqs)
+            for name in optimizer.CH_TRACE.values()
+        }
+        traces["Sub"] = np.zeros_like(freqs)
+        for pair in optimizer.PAIR_DEFS.values():
+            traces[pair["together"]] = optimizer.power_sum_db([
+                traces[pair["left"]], traces[pair["right"]]
+            ])
+        traces["System Sum"] = optimizer.power_sum_db([
+            traces[pair["together"]]
+            for pair in optimizer.PAIR_DEFS.values()
+        ] + [traces["Sub"]])
+        baseline = [[] for _ in range(8)]
+        baseline[2] = [self.ref.original]
+        plan = rehab.CandidatePlan(slot_edits=(self.edit,))
+
+        with patch.object(
+            optimizer, "baseline_band_sets", return_value=baseline
+        ), patch.object(
+            optimizer, "output_trim_for_band_sets", return_value={}
+        ):
+            predicted = optimizer.predict_candidate_plan(
+                freqs, traces, plan
+            )
+
+        expected = (
+            optimizer.cascade_db(freqs, [self.edit.replacement])
+            - optimizer.cascade_db(freqs, [self.ref.original])
+        )
+        np.testing.assert_allclose(predicted["FL Low"], expected)
+        np.testing.assert_allclose(predicted["FR Low"], 0.0)
+    def test_build_rows_predicts_and_scores_the_full_plan(self):
+        plan = rehab.CandidatePlan(slot_edits=(self.edit,))
+        entry = stream.BeamEntry(
+            1.0, rehab.candidate_plan_signature(plan), plan,
+            {"objective": 1.0},
+        )
+        traces = {"System Sum": np.zeros(4)}
+        predicted = {"System Sum": np.ones(4)}
+        with patch.object(
+            stream.opt, "predict_candidate_plan", return_value=predicted,
+            create=True,
+        ) as predict, patch.object(
+            stream.opt, "tune_scorecard", return_value={"sum_rms_db": 1.0}
+        ), patch.object(
+            stream.opt, "candidate_plan_headroom", return_value={"FL Low": {}},
+            create=True,
+        ), patch.object(
+            stream.opt, "left_alone_note", return_value="left alone"
+        ):
+            rows = stream.build_rows(
+                np.arange(4.0), traces, np.zeros(4), [entry],
+                score_plan=lambda _plan: {"objective": 1.0},
+            )
+
+        predict.assert_called_once()
+        self.assertIs(predict.call_args.args[2], plan)
+        self.assertEqual(rows[0]["headroom"], {"FL Low": {}})
+
+    def test_guided_continuation_keeps_baseline_and_rehabilitated_lineages(self):
+        rehabilitated = rehab.CandidatePlan(slot_edits=(self.edit,))
+        groups = {group: [] for group in stream.opt.GROUPS}
+        groups["fl_low"] = [(500.0, 1.0, -2.0)]
+
+        plans = stream.guided_continuation_plans(
+            groups, (rehab.CandidatePlan(), rehabilitated)
+        )
+
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(plans[0].slot_edits, ())
+        self.assertEqual(plans[1].slot_edits, (self.edit,))
 if __name__ == "__main__":
     unittest.main()

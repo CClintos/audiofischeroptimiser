@@ -355,6 +355,7 @@ def run_rehabilitation_stage(
         counted_score_plan,
         beam_width=16,
         max_depth=4,
+        deadline=deadline,
     )
     return {
         "status": "complete",
@@ -1166,6 +1167,20 @@ def deterministic_beam_combinations(
         beam = list(unique.values())[:max(1, group_beam_width)]
     return beam, evaluations
 
+def guided_continuation_plans(groups, lineages):
+    frozen_groups = rehab.freeze_groups(groups)
+    plans = []
+    seen = set()
+    for lineage in lineages:
+        plan = rehab.CandidatePlan(
+            slot_edits=lineage.slot_edits, groups=frozen_groups
+        )
+        signature = rehab.candidate_plan_signature(plan)
+        if signature not in seen:
+            seen.add(signature)
+            plans.append(plan)
+    return tuple(plans)
+
 def beam_uses_timed_guided_continuation(proposal: str, mode: str) -> bool:
     """Whether a normal PEQ Beam pass should use the remaining run budget.
 
@@ -1393,9 +1408,7 @@ def coordinate_refine(groups: GroupBands, component_score, passes: int = 2):
     return current, current_components, evaluations
 
 
-def refine_entries(
-    entries, component_score, top: int, passes: int, *, score_plan=None
-):
+def refine_entries(entries, score_plan, top: int, passes: int):
     refined = []
     improved = 0
     evaluations = 0
@@ -1413,11 +1426,7 @@ def refine_entries(
                 slot_edits=base_plan.slot_edits,
                 groups=rehab.freeze_groups(candidate_groups),
             )
-            return (
-                score_plan(plan)
-                if score_plan is not None
-                else component_score(candidate_groups)
-            )
+            return score_plan(plan)
 
         new_groups, components, used = coordinate_refine(
             groups, score_groups, passes=passes
@@ -1552,7 +1561,7 @@ def build_rows(
             if isinstance(entry, BeamEntry)
             else rehab.CandidatePlan(groups=rehab.freeze_groups(groups))
         )
-        pred = opt.predict_traces(freqs, traces, groups)
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
         components = (
             dict(entry.components)
@@ -1573,10 +1582,7 @@ def build_rows(
             "plan": plan,
             "signature": signature,
             "lint": None,
-            "headroom": {
-                g: opt.headroom_report(freqs, b)
-                for g, b in groups.items()
-            },
+            "headroom": opt.candidate_plan_headroom(freqs, plan),
             "left_alone": opt.left_alone_note(freqs, traces),
         })
     return rows
@@ -2157,38 +2163,60 @@ def main():
             groups = random_groups(rng, args.profile)
         else:
             groups = guided_groups(rng, args.profile, guided_pools)
-        plan = rehab.CandidatePlan(
-            slot_edits=rehabilitation_plan.slot_edits,
-            groups=rehab.freeze_groups(groups),
+        continuation_lineages = (
+            (baseline_plan, rehabilitation_plan)
+            if args.proposal == "beam"
+            else (rehabilitation_plan,)
         )
-        components = dict(score_plan(plan))
-        if components.get("phase_peq_conflict_count", 0.0) > 0.0:
-            args.phase_peq_rejections.extend(
-                opt.phase_peq_conflicts(freqs, groups, args.phase_plan)
-            )
-        value = float(components["objective"])
-        if (
-            args.max_positive_gain_penalty > 0
-            and components["positive_gain_penalty_db"]
-            > args.max_positive_gain_penalty
+        cma_value = None
+        for plan in guided_continuation_plans(
+            groups, continuation_lineages
         ):
-            value = 1e6 + float(components["positive_gain_penalty_db"])
-            components["objective"] = value
-        signature = rehab.candidate_plan_signature(plan)
-        item = BeamEntry(value, signature, plan, components)
-        if value + 1e-12 < best_value_seen:
-            best_value_seen = value
-            last_improvement_time = now
-            convergence_events.append({
-                "elapsed_seconds": float(now - start),
-                "objective": float(value),
-                "phase": "guided_improvement",
-            })
-        best = insert_best(best, item, args.keep)
-        archive, archive_scores = insert_archive(archive, archive_scores, item, components, args.archive_size)
-        if cma_x is not None:
-            cma_proposal.tell(cma_x, value)
-        trials += 1
+            now = time.monotonic()
+            if stop_requested():
+                break
+            if args.seconds and now - start >= args.seconds:
+                break
+            if args.max_trials and trials >= args.max_trials:
+                break
+            components = dict(score_plan(plan))
+            if components.get("phase_peq_conflict_count", 0.0) > 0.0:
+                args.phase_peq_rejections.extend(
+                    opt.candidate_plan_phase_conflicts(
+                        freqs, plan, args.phase_plan
+                    )
+                )
+            value = float(components["objective"])
+            if (
+                args.max_positive_gain_penalty > 0
+                and components["positive_gain_penalty_db"]
+                > args.max_positive_gain_penalty
+            ):
+                value = 1e6 + float(
+                    components["positive_gain_penalty_db"]
+                )
+                components["objective"] = value
+            signature = rehab.candidate_plan_signature(plan)
+            item = BeamEntry(value, signature, plan, components)
+            if value + 1e-12 < best_value_seen:
+                best_value_seen = value
+                last_improvement_time = now
+                convergence_events.append({
+                    "elapsed_seconds": float(now - start),
+                    "objective": float(value),
+                    "phase": "guided_improvement",
+                })
+            best = insert_best(best, item, args.keep)
+            archive, archive_scores = insert_archive(
+                archive, archive_scores, item, components,
+                args.archive_size,
+            )
+            cma_value = (
+                value if cma_value is None else min(cma_value, value)
+            )
+            trials += 1
+        if cma_x is not None and cma_value is not None:
+            cma_proposal.tell(cma_x, cma_value)
 
         if best and args.checkpoint_seconds and now >= next_checkpoint:
             args._completed_trials = completed_before + trials
@@ -2252,7 +2280,7 @@ def main():
     else:
         refined_entries, args.refinement = refine_entries(
             final_entries,
-            component_score,
+            score_plan,
             top=args.refine_top,
             passes=args.refine_passes,
         )

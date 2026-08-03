@@ -1065,6 +1065,7 @@ def rehabilitation_beam(
     beam_width=16,
     max_depth=4,
     repeatability_db=None,
+    deadline=None,
 ):
     score_cache = {}
     bridge_signatures = set()
@@ -1104,6 +1105,9 @@ def rehabilitation_beam(
     all_candidates = {candidate_plan_signature(baseline.plan): baseline}
 
     for generation in range(1, max_depth + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        deadline_reached = False
         expanded = {candidate_plan_signature(baseline.plan): baseline}
         for parent in beam:
             expanded[candidate_plan_signature(parent.plan)] = parent
@@ -1112,6 +1116,9 @@ def rehabilitation_beam(
             }
             applied = set(parent.applied_operations)
             for operation in ranked_operations:
+                if deadline is not None and time.monotonic() >= deadline:
+                    deadline_reached = True
+                    break
                 operation_signature = candidate_plan_signature(operation.plan)
                 if operation_signature in applied:
                     continue
@@ -1139,6 +1146,10 @@ def rehabilitation_beam(
                         requires_meaningful_export=False,
                     )
                 expanded[candidate_plan_signature(plan)] = candidate
+            if deadline_reached:
+                break
+        if deadline_reached:
+            break
         beam = _retain_diverse(
             tuple(expanded.values()), baseline, beam_width, generation,
             repeatability_db,

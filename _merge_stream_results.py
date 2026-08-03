@@ -8,14 +8,41 @@ from pathlib import Path
 
 import _optimizer as opt
 import baseline_rehabilitation as rehab
-from _optimizer_stream import beam_entry_from_json, build_rows, interference_notes
+from _optimizer_stream import (
+    beam_entry_from_json, build_rows, configure_profile, interference_notes,
+    stream_input_fingerprint,
+)
 
 
-def load_worker_best(worker_dir: Path):
+def load_worker_payload(
+    worker_dir: Path, expected_fingerprint: str | None = None,
+):
     state = worker_dir / "stream_state.json"
     if not state.exists():
-        return []
-    payload = json.loads(state.read_text(encoding="utf-8"))
+        raise ValueError(f"{worker_dir.name} is missing stream_state.json")
+    try:
+        payload = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"{worker_dir.name} has an unreadable stream_state.json"
+        ) from exc
+    if expected_fingerprint is not None:
+        actual = payload.get("input_fingerprint")
+        if not actual:
+            raise ValueError(
+                f"{worker_dir.name} is missing input fingerprint"
+            )
+        if actual != expected_fingerprint:
+            raise ValueError(
+                f"{worker_dir.name} fingerprint does not match current inputs"
+            )
+    return payload
+
+
+def load_worker_best(
+    worker_dir: Path, expected_fingerprint: str | None = None,
+):
+    payload = load_worker_payload(worker_dir, expected_fingerprint)
     out = []
     for bucket in ("best", "archive"):
         for item in payload.get(bucket, []):
@@ -79,6 +106,8 @@ def main():
     parser.add_argument("--target", type=Path, default=opt.DEFAULT_TARGET)
     parser.add_argument("--filter-cost-scale", type=float, default=0.1)
     parser.add_argument("--worst-weight", type=float, default=0.10)
+    parser.add_argument("--min-total-bands", type=int, default=0)
+    parser.add_argument("--profile", choices=("safe", "explore"), default="explore")
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     parser.add_argument("--gate-ms", type=float, default=None,
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
@@ -107,15 +136,24 @@ def main():
         args.repeatability_folder, level_calibration
     )
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
+    configure_profile(args.profile)
+    args.measurement_session = measurement_session
+    channel_roles = dict(opt.CH_TRACE)
+    channel_roles.update({6: "Left Sub", 7: "Right Sub"})
+    rehabilitation_config = opt.rehabilitation_config(
+        channel_roles, explore=args.profile == "explore"
+    )
+    expected_fingerprint = stream_input_fingerprint(
+        args, rehabilitation_config
+    )
     worker_dirs = sorted(p for p in args.root.glob("worker_*") if p.is_dir())
-    worker_state_payloads = []
-    for worker in worker_dirs:
-        state_path = worker / "stream_state.json"
-        if state_path.is_file():
-            try:
-                worker_state_payloads.append(json.loads(state_path.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
+    try:
+        worker_state_payloads = [
+            load_worker_payload(worker, expected_fingerprint)
+            for worker in worker_dirs
+        ]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     proposal_audits = [
         dict(payload.get("proposal_audit", {}))
         for payload in worker_state_payloads if payload.get("proposal_audit")
@@ -152,7 +190,7 @@ def main():
     )
     items = []
     for worker in worker_dirs:
-        items.extend(load_worker_best(worker))
+        items.extend(load_worker_best(worker, expected_fingerprint))
     if not items:
         raise SystemExit("No stream_state.json best candidates found under " + str(args.root))
 
@@ -254,7 +292,7 @@ def main():
     for rank, (value, sig, plan, source) in enumerate(best, start=1):
         groups = {group: [] for group in opt.GROUPS}
         groups.update(rehab.thaw_groups(plan.groups))
-        pred = opt.predict_traces(freqs, traces, groups)
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
         components = dict(score_plan(plan))
         file_name = (
@@ -274,10 +312,7 @@ def main():
             "plan": plan,
             "signature": sig,
             "lint": lint,
-            "headroom": {
-                group: opt.headroom_report(freqs, bands)
-                for group, bands in groups.items()
-            },
+            "headroom": opt.candidate_plan_headroom(freqs, plan),
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
@@ -287,7 +322,7 @@ def main():
     ):
         groups = {group: [] for group in opt.GROUPS}
         groups.update(rehab.thaw_groups(plan.groups))
-        pred = opt.predict_traces(freqs, traces, groups)
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
         components = dict(score_plan(plan))
         family_rows.append({

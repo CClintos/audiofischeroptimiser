@@ -1383,16 +1383,34 @@ def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
     return output_trim_for_band_sets(groups_to_band_sets(groups))
 
 
-def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
+def candidate_band_sets(candidate) -> List[List[Band]]:
+    if isinstance(candidate, CandidatePlan):
+        return [list(bands) for bands in resolve_candidate_plan(candidate).band_sets]
+    return groups_to_band_sets(candidate)
+
+
+def candidate_plan_headroom(
+    freqs: np.ndarray, plan: CandidatePlan,
+) -> Dict[str, Dict[str, object]]:
+    band_sets = resolve_candidate_plan(plan).band_sets
+    roles = dict(CH_TRACE)
+    roles.update({6: "Left Sub", 7: "Right Sub"})
+    return {
+        roles.get(channel, f"Channel {channel}"): headroom_report(freqs, bands)
+        for channel, bands in enumerate(band_sets)
+    }
+
+
+def fixed_anchor_response_audit(candidate) -> Dict[str, object]:
     if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "response_audit"):
         return {}
-    return dict(AFPX_OBJECTIVE.response_audit(groups_to_band_sets(groups)))
+    return dict(AFPX_OBJECTIVE.response_audit(candidate_band_sets(candidate)))
 
 
-def report_plot_data(groups: GroupBands) -> Dict[str, object]:
+def report_plot_data(candidate) -> Dict[str, object]:
     if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "report_plot_data"):
         return {}
-    return dict(AFPX_OBJECTIVE.report_plot_data(groups_to_band_sets(groups)))
+    return dict(AFPX_OBJECTIVE.report_plot_data(candidate_band_sets(candidate)))
 
 
 def suggest_group_bands(trial: optuna.Trial, group: str) -> List[Band]:
@@ -1561,11 +1579,12 @@ def channel_deltas(freqs: np.ndarray, groups: GroupBands) -> Dict[int, np.ndarra
     return deltas
 
 
-def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> TraceMap:
+def _predict_traces_from_channel_deltas(
+    freqs: np.ndarray, traces: TraceMap, deltas: Dict[int, np.ndarray],
+    trim_plan: Dict[int, float] | None = None,
+) -> TraceMap:
     pred: TraceMap = dict(traces)
-
-    deltas = channel_deltas(freqs, groups)
-    trim_plan = output_trim_for_groups(groups)
+    trim_plan = trim_plan or {}
     for channel, trace_name in CH_TRACE.items():
         pred[trace_name] = (
             traces[trace_name]
@@ -1579,24 +1598,54 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
             sub_delta = sub_delta + deltas[channel]
             sub_count += 1
     if sub_count:
-        # The sub trace is a combined branch capture, and we only write shared
-        # sub filters. Average the duplicate channel deltas to model one shared
-        # acoustic change instead of double-counting it.
         sub_delta = sub_delta / sub_count
-    pred["Sub"] = traces["Sub"] + sub_delta + float(trim_plan.get(6, 0.0))
+    pred["Sub"] = (
+        traces["Sub"] + sub_delta + float(trim_plan.get(6, 0.0))
+    )
 
     branch_outputs = []
     for pair in PAIR_DEFS.values():
-        pair_power = power_sum_db([traces[pair["left"]], traces[pair["right"]]])
+        pair_power = power_sum_db([
+            traces[pair["left"]], traces[pair["right"]]
+        ])
         pair_residual = traces[pair["together"]] - pair_power
-        pred[pair["together"]] = power_sum_db([pred[pair["left"]], pred[pair["right"]]]) + pair_residual
+        pred[pair["together"]] = power_sum_db([
+            pred[pair["left"]], pred[pair["right"]]
+        ]) + pair_residual
         branch_outputs.append(pred[pair["together"]])
 
-    branch_power = power_sum_db([traces[pair["together"]] for pair in PAIR_DEFS.values()] + [traces["Sub"]])
+    branch_power = power_sum_db([
+        traces[pair["together"]] for pair in PAIR_DEFS.values()
+    ] + [traces["Sub"]])
     system_residual = traces["System Sum"] - branch_power
-    pred["System Sum"] = power_sum_db(branch_outputs + [pred["Sub"]]) + system_residual
+    pred["System Sum"] = power_sum_db(
+        branch_outputs + [pred["Sub"]]
+    ) + system_residual
     return pred
 
+
+def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> TraceMap:
+    return _predict_traces_from_channel_deltas(
+        freqs, traces, channel_deltas(freqs, groups),
+        output_trim_for_groups(groups),
+    )
+
+
+def predict_candidate_plan(
+    freqs: np.ndarray, traces: TraceMap, plan: CandidatePlan,
+) -> TraceMap:
+    resolved = resolve_candidate_plan(plan)
+    baseline = baseline_band_sets()
+    deltas = {}
+    for channel, candidate in enumerate(resolved.band_sets):
+        original = baseline[channel] if channel < len(baseline) else ()
+        delta = cascade_db(freqs, candidate) - cascade_db(freqs, original)
+        if np.any(np.abs(delta) > 1e-12):
+            deltas[channel] = delta
+    return _predict_traces_from_channel_deltas(
+        freqs, traces, deltas,
+        output_trim_for_band_sets(resolved.band_sets),
+    )
 
 def null_masks(freqs: np.ndarray, traces: TraceMap,
                position_traces: Dict[str, np.ndarray] | None = None) -> Dict[str, np.ndarray]:
@@ -3170,9 +3219,9 @@ def write_report(
     phase_plan = phase_plan or []
     best_row = rows[0] if rows else None
     fixed_anchor_audit = (
-        fixed_anchor_response_audit(best_row.get("groups", {})) if best_row else {}
+        fixed_anchor_response_audit(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
     )
-    response_plot = report_plot_data(best_row.get("groups", {})) if best_row else {}
+    response_plot = report_plot_data(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
     comparison_integrity = {
         "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
         "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
