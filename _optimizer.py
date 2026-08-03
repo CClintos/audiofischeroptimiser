@@ -61,6 +61,14 @@ from _make_v3 import (
     encode_afpx,
     set_attr,
 )
+from baseline_rehabilitation import (
+    CandidatePlan,
+    ResolvedPlan,
+    apply_slot_edits,
+    candidate_plan_signature,
+    freeze_groups,
+    thaw_groups,
+)
 from _tunefit import (
     allpass_fil_str,
     allpass_H,
@@ -1010,6 +1018,7 @@ def _find_edit_target(
 
 def _resolve_group_bands(
     groups: GroupBands,
+    starting_band_sets=None,
 ) -> Tuple[List[List[Band]], Dict[int, List[Tuple[str, "Band | None", "Band | None"]]]]:
     """Resolve proposed group bands against the baseline into a final
     per-channel band list, AND the exact action (append/edit/remove) that
@@ -1027,7 +1036,10 @@ def _resolve_group_bands(
     retire a now-unneeded band) were structurally unreachable. See
     CHANGELOG.md.
     """
-    band_sets = [list(bands) for bands in baseline_band_sets()]
+    source_band_sets = (
+        baseline_band_sets() if starting_band_sets is None else starting_band_sets
+    )
+    band_sets = [list(bands) for bands in source_band_sets]
     while len(band_sets) < 8:
         band_sets.append([])
     actions: Dict[int, List[Tuple[str, "Band | None", "Band | None"]]] = {
@@ -1069,10 +1081,103 @@ def _resolve_group_bands(
     return band_sets, actions
 
 
+def _slot_edited_band_sets(plan: CandidatePlan):
+    band_sets = [list(bands) for bands in baseline_band_sets()]
+    while len(band_sets) < 8:
+        band_sets.append([])
+
+    seen_slots = set()
+    removed_refs = []
+    for edit in plan.slot_edits:
+        slot_key = (edit.ref.channel, edit.ref.slot)
+        if slot_key in seen_slots:
+            raise ValueError(
+                "duplicate rehabilitation slot edit for channel %d slot %d" % slot_key
+            )
+        seen_slots.add(slot_key)
+        if edit.ref.channel < 0 or edit.ref.channel >= len(band_sets):
+            raise ValueError("rehabilitation slot channel is outside baseline band sets")
+
+        channel_bands = band_sets[edit.ref.channel]
+        try:
+            index = channel_bands.index(edit.ref.original)
+        except ValueError:
+            raise ValueError(
+                "rehabilitation slot is absent from supplied measurement baseline"
+            ) from None
+        if edit.replacement is None:
+            channel_bands.pop(index)
+            removed_refs.append(edit.ref)
+        else:
+            channel_bands[index] = edit.replacement
+    return band_sets, tuple(removed_refs)
+
+
+def _reject_removed_slot_group_conflicts(groups, starting_band_sets, removed_refs):
+    removed_by_channel = {}
+    for ref in removed_refs:
+        removed_by_channel.setdefault(ref.channel, []).append(ref)
+
+    for group, bands in groups.items():
+        if not bands:
+            continue
+        for channel in GROUPS[group]["channels"]:
+            removed = removed_by_channel.get(channel, ())
+            if not removed:
+                continue
+            eligible = [True] * len(starting_band_sets[channel])
+            for frequency, _q, _gain in bands:
+                if (
+                    _find_edit_target(starting_band_sets[channel], frequency, eligible)
+                    is not None
+                ):
+                    continue
+                if any(
+                    abs(math.log2(float(frequency) / float(ref.original[0])))
+                    <= EDIT_MATCH_TOLERANCE_OCT
+                    for ref in removed
+                ):
+                    raise ValueError(
+                        "group action targets removed rehabilitation slot"
+                    )
+
+
+def resolve_candidate_plan(plan: CandidatePlan) -> ResolvedPlan:
+    starting_band_sets, removed_refs = _slot_edited_band_sets(plan)
+    groups = thaw_groups(plan.groups)
+    if not plan.slot_edits and not any(groups.values()):
+        return ResolvedPlan(
+            band_sets=tuple(tuple(bands) for bands in starting_band_sets),
+            slot_edits=(),
+            group_actions=tuple(
+                (channel, ()) for channel in range(len(starting_band_sets))
+            ),
+            signature=candidate_plan_signature(plan),
+        )
+
+    _reject_removed_slot_group_conflicts(groups, starting_band_sets, removed_refs)
+    band_sets, actions = _resolve_group_bands(groups, starting_band_sets)
+    return ResolvedPlan(
+        band_sets=tuple(tuple(bands) for bands in band_sets),
+        slot_edits=plan.slot_edits,
+        group_actions=tuple(
+            (channel, tuple(channel_actions))
+            for channel, channel_actions in sorted(actions.items())
+        ),
+        signature=candidate_plan_signature(plan),
+    )
 def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return _resolve_group_bands(groups)[0]
 
 
+def output_trim_for_band_sets(band_sets) -> Dict[int, float]:
+    if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "output_trim_plan"):
+        return {}
+    return {
+        int(channel): float(trim_db)
+        for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(band_sets).items()
+        if abs(float(trim_db)) >= 0.01
+    }
 def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
     needs_trim_check = any(
         GROUPS.get(group, {}).get("system_transfer") and any(G > 0.0 for _F, _Q, G in bands)
@@ -1080,11 +1185,7 @@ def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
     )
     if not needs_trim_check or AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "output_trim_plan"):
         return {}
-    return {
-        int(channel): float(trim_db)
-        for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(groups_to_band_sets(groups)).items()
-        if abs(float(trim_db)) >= 0.01
-    }
+    return output_trim_for_band_sets(groups_to_band_sets(groups))
 
 
 def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
@@ -2195,6 +2296,93 @@ def trust_meter_lines(row: Dict[str, object], crossover_rows: List[Dict[str, obj
     return notes
 
 
+def _normalise_external_components(comp, band_sets) -> Dict[str, float]:
+    center_tonal = float(comp.get("tonal_masked", 0.0))
+    tonal = float(comp.get("spatial_tonal_db", center_tonal))
+    tonal_anchor = float(comp.get("sum_tonal_anchor_db", tonal))
+    presence = float(comp.get("presence_error_db", tonal))
+    peak = float(comp.get("spatial_peak_db", comp.get("peak_penalty_db", 0.0)))
+    worst = float(comp.get("spatial_worst_db", comp.get("worst_masked", 0.0)))
+    low_bias = float(comp.get(
+        "low_balance",
+        comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0,
+    ))
+    mid_bias = float(comp.get("mid_balance", 0.0))
+    tweeter_bias = float(comp.get("tweeter_balance", 0.0))
+    low_balance = float(comp.get(
+        "low_balance_rms_db",
+        comp.get("mid_balance_rms_db", abs(low_bias))
+        if FRONT_LAYOUT != "3way" else abs(low_bias),
+    ))
+    mid_balance = float(comp.get("mid_balance_rms_db", abs(mid_bias)))
+    tweeter_balance = float(comp.get("tweeter_balance_rms_db", abs(tweeter_bias)))
+    balance_terms = [tweeter_balance]
+    if FRONT_LAYOUT == "3way":
+        balance_terms.extend([low_balance, mid_balance])
+    else:
+        balance_terms.append(low_balance)
+    reported_balance = math.sqrt(
+        sum(value * value for value in balance_terms) / max(len(balance_terms), 1)
+    )
+    balance = float(comp.get("balance_penalty_db", reported_balance))
+    headroom = (
+        float(comp.get("headroom_peak", 0.0))
+        + float(comp.get("null_boost_avg", 0.0))
+    )
+    complete_groups = {
+        str(channel): list(bands) for channel, bands in enumerate(band_sets)
+    }
+    comp.update({
+        "objective": float(comp["objective"]),
+        "tonal_error_db": tonal,
+        "center_tonal_error_db": center_tonal,
+        "sum_tonal_anchor_db": tonal_anchor,
+        "presence_error_db": presence,
+        "target_shape_error_db": float(comp.get("target_shape_error_db", 0.0)),
+        "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
+        "peak_penalty_db": peak,
+        "balance_penalty_db": balance,
+        "worst_presence_dev_db": worst,
+        "positive_gain_penalty_db": headroom,
+        "positive_gain_rms_db": float(comp.get("headroom_peak", 0.0)),
+        "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
+        "filter_count": float(sum(len(bands) for bands in band_sets)),
+        "filter_cost_units": float(filter_cost(complete_groups)),
+        "guardrail_penalty_db": float(comp.get("guardrail_penalty", 0.0)),
+        "shape_penalty_db": float(comp.get("shape_penalty", 0.0)),
+        "unsupported_filter_penalty_db": float(
+            comp.get("unsupported_filter_penalty", 0.0)
+        ),
+        "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
+        "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
+        "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
+        "low_balance_rms_db": low_balance,
+        "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
+        "high_balance_rms_db": tweeter_balance,
+        "low_balance_median_db": low_bias,
+        "mid_balance_median_db": mid_bias if FRONT_LAYOUT == "3way" else 0.0,
+        "high_balance_median_db": tweeter_bias,
+    })
+    return comp
+
+
+def make_band_set_component_scorer(
+    freqs: np.ndarray,
+    traces: TraceMap,
+    target: np.ndarray,
+    filter_cost_scale: float = 0.1,
+    worst_weight: float = 0.10,
+):
+    if AFPX_OBJECTIVE is None:
+        raise RuntimeError("direct band-set scoring requires the external AFPX objective")
+
+    def band_set_score(band_sets) -> Dict[str, float]:
+        comp = dict(AFPX_OBJECTIVE.score_bands(band_sets))
+        return _normalise_external_components(comp, band_sets)
+
+    return band_set_score
+
+
 def make_component_scorer(
     freqs: np.ndarray,
     traces: TraceMap,
@@ -2203,63 +2391,17 @@ def make_component_scorer(
     worst_weight: float = 0.10,
 ):
     if AFPX_OBJECTIVE is not None:
-        def external_score(groups: GroupBands) -> Dict[str, float]:
-            comp = dict(AFPX_OBJECTIVE.score_bands(groups_to_band_sets(groups)))
-            center_tonal = float(comp.get("tonal_masked", 0.0))
-            tonal = float(comp.get("spatial_tonal_db", center_tonal))
-            tonal_anchor = float(comp.get("sum_tonal_anchor_db", tonal))
-            presence = float(comp.get("presence_error_db", tonal))
-            peak = float(comp.get("spatial_peak_db", comp.get("peak_penalty_db", 0.0)))
-            worst = float(comp.get("spatial_worst_db", comp.get("worst_masked", 0.0)))
-            low_bias = float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0))
-            mid_bias = float(comp.get("mid_balance", 0.0))
-            tweeter_bias = float(comp.get("tweeter_balance", 0.0))
-            low_balance = float(comp.get(
-                "low_balance_rms_db",
-                comp.get("mid_balance_rms_db", abs(low_bias)) if FRONT_LAYOUT != "3way" else abs(low_bias),
-            ))
-            mid_balance = float(comp.get("mid_balance_rms_db", abs(mid_bias)))
-            tweeter_balance = float(comp.get("tweeter_balance_rms_db", abs(tweeter_bias)))
-            balance_terms = [tweeter_balance]
-            if FRONT_LAYOUT == "3way":
-                balance_terms.extend([low_balance, mid_balance])
-            else:
-                balance_terms.append(low_balance)
-            reported_balance = math.sqrt(sum(x * x for x in balance_terms) / max(len(balance_terms), 1))
-            balance = float(comp.get("balance_penalty_db", reported_balance))
-            headroom = float(comp.get("headroom_peak", 0.0)) + float(comp.get("null_boost_avg", 0.0))
-            comp.update({
-                "objective": float(comp["objective"]),
-                "tonal_error_db": tonal,
-                "center_tonal_error_db": center_tonal,
-                "sum_tonal_anchor_db": tonal_anchor,
-                "presence_error_db": presence,
-                "target_shape_error_db": float(comp.get("target_shape_error_db", 0.0)),
-                "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
-                "peak_penalty_db": peak,
-                "balance_penalty_db": balance,
-                "worst_presence_dev_db": worst,
-                "positive_gain_penalty_db": headroom,
-                "positive_gain_rms_db": float(comp.get("headroom_peak", 0.0)),
-                "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
-                "filter_count": float(comp.get("n_front_bands", 0.0)),
-                "filter_cost_units": float(filter_cost(groups)),
-                "guardrail_penalty_db": float(comp.get("guardrail_penalty", 0.0)),
-                "shape_penalty_db": float(comp.get("shape_penalty", 0.0)),
-                "unsupported_filter_penalty_db": float(comp.get("unsupported_filter_penalty", 0.0)),
-                "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
-                "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
-                "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
-                "low_balance_rms_db": low_balance,
-                "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
-                "high_balance_rms_db": tweeter_balance,
-                "low_balance_median_db": low_bias,
-                "mid_balance_median_db": mid_bias if FRONT_LAYOUT == "3way" else 0.0,
-                "high_balance_median_db": tweeter_bias,
-            })
-            return comp
+        band_set_score = make_band_set_component_scorer(
+            freqs, traces, target, filter_cost_scale, worst_weight
+        )
 
-        return external_score
+        def group_score(groups: GroupBands) -> Dict[str, float]:
+            components = band_set_score(groups_to_band_sets(groups))
+            components["filter_count"] = float(components.get("n_front_bands", 0.0))
+            components["filter_cost_units"] = float(filter_cost(groups))
+            return components
+
+        return group_score
 
     smooth = make_fast_smoother(freqs)
     masks = null_masks(freqs, traces)
@@ -2392,8 +2534,14 @@ def replace_oc_blocks(xml: str, blocks: List[str]) -> str:
     return out
 
 
-def write_candidate(base_xml: str, path: Path, groups: GroupBands,
-                    phase_plan: List[Dict[str, object]] | None = None) -> Dict[str, object]:
+def write_candidate_plan(
+    base_xml: str,
+    path: Path,
+    plan: CandidatePlan,
+    phase_plan: List[Dict[str, object]] | None = None,
+    _simplify_appends: bool = False,
+) -> Dict[str, object]:
+    groups = thaw_groups(plan.groups)
     conflicts = phase_peq_conflicts(
         np.geomspace(20.0, 20000.0, 2048), groups, phase_plan, threshold_db=0.5
     )
@@ -2403,65 +2551,75 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
             "PEQ/phase crossover conflict: %s %s changes %s by %.2f dB"
             % (first["group"], first["filter"], first["source"], first["max_change_db"])
         )
-    blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
-    new_blocks = list(blocks)
-    # _resolve_group_bands is the SAME resolution groups_to_band_sets uses for
-    # scoring, so an edit/removal is written exactly as it was scored - never
-    # a silent extra append alongside an untouched original slot.
-    band_sets, actions_by_channel = _resolve_group_bands(groups)
-    # Repo-review finding: post-quantization filter reduction, applied only
-    # here (write time, a handful of finalists) - never in the hot search
-    # loop above this file's own resolution, which runs for every candidate
-    # the beam search evaluates. Only ever drops a purely-APPENDED band
-    # (never an edit or removal, both already-deliberate actions) whose
-    # removal changes that channel's own cascade by less than
-    # FILTER_SIMPLIFICATION_TOLERANCE_DB everywhere - one fewer filter slot
-    # used for the same audible result.
-    if AFPX_OBJECTIVE is not None and hasattr(AFPX_OBJECTIVE, "simplify_removable_bands"):
-        for channel, channel_actions in actions_by_channel.items():
-            removable = [new for kind, _old, new in channel_actions if kind == "append"]
-            if not removable or channel >= len(band_sets):
-                continue
-            try:
-                _kept, dropped = AFPX_OBJECTIVE.simplify_removable_bands(band_sets[channel], removable)
-            except Exception:
-                # Degrades gracefully to "no simplification" - e.g. a test
-                # or tool scoring synthetic bands with no real measurement
-                # session behind them. Never blocks the write itself.
-                continue
-            if not dropped:
-                continue
-            dropped_set = set(dropped)
-            actions_by_channel[channel] = [
-                action for action in channel_actions
-                if not (action[0] == "append" and action[2] in dropped_set)
-            ]
+
+    resolved = resolve_candidate_plan(plan)
     protected_channels = {
         channel
         for group, bands in groups.items() if bands
         for channel in GROUPS[group]["channels"]
         if GROUPS[group].get("system_transfer")
     }
+    edited_xml = apply_slot_edits(
+        base_xml,
+        resolved.slot_edits,
+        protected_channels=protected_channels,
+    )
+    blocks = [
+        match.group() for match in re.finditer(r"<OC\b.*?</OC>", edited_xml, re.S)
+    ]
+    new_blocks = list(blocks)
+    actions_by_channel = {
+        channel: list(channel_actions)
+        for channel, channel_actions in resolved.group_actions
+    }
+    if (
+        _simplify_appends
+        and AFPX_OBJECTIVE is not None
+        and hasattr(AFPX_OBJECTIVE, "simplify_removable_bands")
+    ):
+        for channel, channel_actions in actions_by_channel.items():
+            removable = [new for kind, _old, new in channel_actions if kind == "append"]
+            if not removable or channel >= len(resolved.band_sets):
+                continue
+            try:
+                _kept, dropped = AFPX_OBJECTIVE.simplify_removable_bands(
+                    resolved.band_sets[channel], removable
+                )
+            except Exception:
+                continue
+            dropped_set = set(dropped)
+            actions_by_channel[channel] = [
+                action for action in channel_actions
+                if not (action[0] == "append" and action[2] in dropped_set)
+            ]
     for channel, channel_actions in actions_by_channel.items():
         if not channel_actions or channel >= len(new_blocks):
             continue
         new_blocks[channel] = apply_band_actions(
-            new_blocks[channel], channel_actions,
+            new_blocks[channel],
+            list(channel_actions),
             protected_boost=channel in protected_channels,
         )
 
-    trim_plan = output_trim_for_groups(groups)
+    trim_plan = (
+        output_trim_for_groups(groups) if _simplify_appends
+        else output_trim_for_band_sets(resolved.band_sets)
+    )
     for channel, trim_db in trim_plan.items():
         if channel >= len(new_blocks):
             raise ValueError(f"Protective output trim targets missing channel {channel}")
         new_blocks[channel] = apply_output_trim(new_blocks[channel], trim_db)
 
-    new_xml = replace_oc_blocks(base_xml, new_blocks)
+    new_xml = replace_oc_blocks(edited_xml, new_blocks)
     new_xml = apply_phase_writes(new_xml, phase_plan)
     encode_afpx(new_xml, path)
     written = decode_afpx(path)
-    allow_delay = any(int(edit.get("delay_samples", 0)) != 0 for edit in (phase_plan or []))
-    allow_polarity = any(bool(edit.get("polarity_channels")) for edit in (phase_plan or []))
+    allow_delay = any(
+        int(edit.get("delay_samples", 0)) != 0 for edit in (phase_plan or [])
+    )
+    allow_polarity = any(
+        bool(edit.get("polarity_channels")) for edit in (phase_plan or [])
+    )
     allow_apf = any(bool(edit.get("apf_channels")) for edit in (phase_plan or []))
     lint = afpx_roundtrip_lint(
         base_xml,
@@ -2470,10 +2628,29 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
         allow_polarity_changes=allow_polarity,
         allowed_added_types=("17", "20") if allow_apf else ("17",),
         allowed_volume_trims=trim_plan,
+        allowed_filter_slot_changes=tuple(
+            (edit.ref.channel, edit.ref.slot) for edit in resolved.slot_edits
+        ),
     )
     if not lint["pass"]:
         raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
+    lint["operation_signature"] = resolved.signature
     return lint
+
+
+def write_candidate(
+    base_xml: str,
+    path: Path,
+    groups: GroupBands,
+    phase_plan: List[Dict[str, object]] | None = None,
+) -> Dict[str, object]:
+    return write_candidate_plan(
+        base_xml,
+        path,
+        CandidatePlan(groups=freeze_groups(groups)),
+        _simplify_appends=True,
+        phase_plan=phase_plan,
+    )
 
 
 def mask_ranges(freqs: np.ndarray, mask: np.ndarray, band: Tuple[float, float]) -> List[Tuple[float, float]]:

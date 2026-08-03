@@ -186,7 +186,8 @@ def multiset_delta(old_items, new_items):
 
 def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
                         allow_crossover_changes=False, allow_polarity_changes=False,
-                        allowed_added_types=('17', '20'), allowed_volume_trims=None):
+                        allowed_added_types=('17', '20'), allowed_volume_trims=None,
+                        allowed_filter_slot_changes=()):
     old_inv = channel_filter_inventory(old_xml)
     new_inv = channel_filter_inventory(new_xml)
     channel_diffs = []
@@ -201,6 +202,28 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
     old_all = [semantic_filter_key(f) for f in active_filter_tags(old_xml)]
     new_all = [semantic_filter_key(f) for f in active_filter_tags(new_xml)]
     added_all, _ = multiset_delta(old_all, new_all)
+    permitted_slot_changes = []
+    old_channels = re.findall(r'<OC\b.*?</OC>', old_xml, re.S)
+    new_channels = re.findall(r'<OC\b.*?</OC>', new_xml, re.S)
+    for channel, slot in allowed_filter_slot_changes:
+        if channel >= len(old_channels) or channel >= len(new_channels):
+            continue
+        old_filters = re.findall(r'<Fil\b[^>]*/?>', old_channels[channel])
+        new_filters = re.findall(r'<Fil\b[^>]*/?>', new_channels[channel])
+        if slot >= len(old_filters) or slot >= len(new_filters):
+            continue
+        old_key = semantic_filter_key(old_filters[slot])
+        new_key = semantic_filter_key(new_filters[slot])
+        if old_key == new_key:
+            continue
+        permitted_slot_changes.append({
+            'channel_index': channel,
+            'slot_index': slot,
+            'old': old_key,
+            'new': new_key,
+        })
+        if new_key in added_all:
+            added_all.remove(new_key)
     for item in added_all:
         t = dict(item).get('T')
         if t not in allowed_added_types:
@@ -259,7 +282,8 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
             'output_volume_changes_valid': volume_changes_valid,
             'delay_attributes_changed': delay_attributes_changed,
             'forbidden_added_filters': forbidden,
-            'channel_diffs': channel_diffs}
+            'channel_diffs': channel_diffs,
+            'permitted_filter_slot_changes': permitted_slot_changes}
 
 
 def validate_peq_band(F, Q, G, protected_boost=False, device=DEFAULT_DEVICE_PROFILE):

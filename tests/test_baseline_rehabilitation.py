@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import re
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import baseline_rehabilitation as rehab
+import _optimizer as optimizer
+from _make_v3 import decode_afpx
 
 
 def fixture_afpx_xml(active_by_channel):
     channels = []
-    for channel in range(4):
+    for channel in range(8):
         active = {
             slot: (frequency, q, gain)
             for slot, frequency, q, gain in active_by_channel.get(channel, ())
@@ -37,6 +42,18 @@ def filter_slots(xml, channel):
         for tag in re.findall(r"<Fil\b[^>]*/?>", outputs[channel])
     ]
 
+
+def bands_from_afpx(path):
+    xml = decode_afpx(path)
+    band_sets = []
+    for channel in range(8):
+        active = [
+            (float(slot["F"]), float(slot["Q"]), float(slot["G"]))
+            for slot in filter_slots(xml, channel)
+            if slot["T"] == "17" and float(slot["G"]) != 0.0
+        ]
+        band_sets.append(tuple(sorted(active)))
+    return tuple(band_sets)
 
 class SlotIdentityTests(unittest.TestCase):
     def test_recentre_beyond_old_frequency_tolerance_keeps_same_slot(self):
@@ -72,6 +89,86 @@ class SlotIdentityTests(unittest.TestCase):
         ):
             rehab.apply_slot_edits(changed, (rehab.SlotEdit.remove(ref),))
 
+
+class PlanResolverTests(unittest.TestCase):
+    def setUp(self):
+        self.xml = fixture_afpx_xml({2: [(7, 97.0, 3.0, -1.5)]})
+        self.ref_97 = rehab.active_peq_slot_refs(self.xml, {2: "FL Low"})[0]
+        self.baseline = ((), (), ((97.0, 3.0, -1.5),), (), (), (), (), ())
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.out = Path(self.temp_dir.name) / "candidate.afpx"
+
+    def test_plan_resolution_is_identical_for_score_report_and_write(self):
+        plan = rehab.CandidatePlan(
+            slot_edits=(rehab.SlotEdit.modify(self.ref_97, (100.0, 1.2, -1.5)),),
+            groups=rehab.freeze_groups({"low_sym": [(184.0, 0.63, -4.0)]}),
+        )
+        with patch.object(
+            optimizer, "baseline_band_sets", return_value=self.baseline
+        ), patch.object(optimizer, "phase_peq_conflicts", return_value=[]), patch.object(
+            optimizer, "output_trim_for_band_sets", return_value={}
+        ):
+            resolved = optimizer.resolve_candidate_plan(plan)
+            written = optimizer.write_candidate_plan(self.xml, self.out, plan)
+
+        parsed = bands_from_afpx(self.out)
+        self.assertEqual(parsed, resolved.band_sets)
+        self.assertEqual(written["operation_signature"], resolved.signature)
+        self.assertEqual(sum(map(len, parsed)), 3)
+        self.assertEqual(
+            [
+                (row["channel_index"], row["slot_index"])
+                for row in written["permitted_filter_slot_changes"]
+            ],
+            [(2, 7)],
+        )
+
+    def test_unchanged_plan_resolves_to_exact_baseline(self):
+        baseline = (((200.0, 1.0, -2.0), (100.0, 1.2, -1.0)),) + ((),) * 7
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            resolved = optimizer.resolve_candidate_plan(rehab.CandidatePlan())
+
+        self.assertEqual(resolved.band_sets, baseline)
+
+    def test_frozen_groups_preserve_resolution_order(self):
+        baseline = (
+            ((1000.0, 1.5, -2.0),),
+            ((1000.0, 1.5, -2.0),),
+        ) + ((),) * 6
+        plan = rehab.CandidatePlan(
+            groups=rehab.freeze_groups({
+                "high_sym": [(1010.0, 1.4, -2.5)],
+                "fl_high": [(1020.0, 1.3, -3.0)],
+            })
+        )
+
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            resolved = optimizer.resolve_candidate_plan(plan)
+
+        self.assertEqual(resolved.band_sets[0], ((1020.0, 1.3, -3.0),))
+
+    def test_duplicate_slot_edits_are_rejected(self):
+        plan = rehab.CandidatePlan(
+            slot_edits=(
+                rehab.SlotEdit.remove(self.ref_97),
+                rehab.SlotEdit.modify(self.ref_97, (100.0, 1.2, -1.5)),
+            )
+        )
+        with patch.object(optimizer, "baseline_band_sets", return_value=self.baseline):
+            with self.assertRaisesRegex(ValueError, "duplicate rehabilitation slot edit"):
+                optimizer.resolve_candidate_plan(plan)
+
+    def test_group_cannot_reedit_slot_removed_by_rehabilitation(self):
+        plan = rehab.CandidatePlan(
+            slot_edits=(rehab.SlotEdit.remove(self.ref_97),),
+            groups=rehab.freeze_groups({"low_sym": [(97.0, 1.2, -2.0)]}),
+        )
+        with patch.object(optimizer, "baseline_band_sets", return_value=self.baseline):
+            with self.assertRaisesRegex(
+                ValueError, "group action targets removed rehabilitation slot"
+            ):
+                optimizer.resolve_candidate_plan(plan)
 
 if __name__ == "__main__":
     unittest.main()

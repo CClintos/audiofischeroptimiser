@@ -38,6 +38,47 @@ class CandidatePlan:
     groups: tuple[tuple[str, tuple[Band, ...]], ...] = ()
 
 
+@dataclass(frozen=True)
+class ResolvedPlan:
+    band_sets: tuple[tuple[Band, ...], ...]
+    slot_edits: tuple[SlotEdit, ...]
+    group_actions: tuple[
+        tuple[int, tuple[tuple[str, Band | None, Band | None], ...]], ...
+    ]
+    signature: tuple
+
+
+def freeze_groups(groups) -> tuple[tuple[str, tuple[Band, ...]], ...]:
+    return tuple(
+        (str(group), tuple(tuple(float(value) for value in band) for band in bands))
+        for group, bands in groups.items()
+    )
+
+
+def thaw_groups(groups) -> dict[str, list[Band]]:
+    return {group: list(bands) for group, bands in groups}
+
+
+def candidate_plan_signature(plan: CandidatePlan) -> tuple:
+    slot_signature = tuple(
+        sorted(
+            [(
+                edit.ref.channel,
+                edit.ref.slot,
+                edit.ref.role,
+                edit.ref.filter_type,
+                edit.ref.original,
+                edit.ref.pair_key,
+                edit.replacement,
+            )
+            for edit in plan.slot_edits
+            ],
+            key=lambda item: item[:2],
+        )
+    )
+    return ("candidate-plan-v1", slot_signature, plan.groups)
+
+
 def active_peq_slot_refs(xml, channel_roles):
     refs = []
     for channel, slot, tag in active_peq_slots(xml, channel_roles):
