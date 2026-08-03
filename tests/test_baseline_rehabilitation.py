@@ -231,6 +231,192 @@ class PlanResolverTests(unittest.TestCase):
             ):
                 optimizer.resolve_candidate_plan(plan)
 
+class FilterSearchTests(unittest.TestCase):
+    def setUp(self):
+        self.ref_97_q3 = rehab.FilterRef(
+            channel=2, slot=7, role="FL Low", filter_type="17",
+            original=(97.0, 3.0, -1.5), pair_key="low-97",
+        )
+        self.ref_97_q3_right = rehab.FilterRef(
+            channel=3, slot=7, role="FR Low", filter_type="17",
+            original=(97.0, 3.0, -1.5), pair_key="low-97",
+        )
+        self.ref_sub_33 = rehab.FilterRef(
+            channel=6, slot=4, role="Sub", filter_type="17",
+            original=(33.0, 3.0, -2.0),
+        )
+        self.refs = (self.ref_97_q3, self.ref_97_q3_right, self.ref_sub_33)
+        self.config = rehab.RehabilitationConfig(
+            retained_per_slot=8,
+            refinement_passes=4,
+            max_evaluations_per_slot=5000,
+            role_limits=(
+                ("FL Low", 80.0, 2000.0, 0.5, 2.5, -6.0, 3.0),
+                ("FR Low", 80.0, 2000.0, 0.5, 2.5, -6.0, 3.0),
+                ("Sub", 30.0, 90.0, 0.5, 5.0, -6.0, 0.0),
+            ),
+        )
+
+    def score_plan(self, plan):
+        objective = 20.0
+        balance = 2.0
+        headroom = 1.0
+        for edit in plan.slot_edits:
+            if edit.replacement is None:
+                objective += 3.0
+                continue
+            frequency, q, gain = edit.replacement
+            if edit.ref.role == "Sub":
+                objective += (
+                    abs(frequency - 33.0) * 0.2
+                    + abs(q - 2.2) * 2.0
+                    + abs(gain + 3.5)
+                )
+                headroom += max(gain, 0.0)
+            else:
+                objective += (
+                    abs(frequency - 100.0) * 0.1
+                    + abs(q - 1.2) * 2.0
+                    + abs(gain + 1.5)
+                )
+                if len(plan.slot_edits) == 1:
+                    balance += 1.0
+        return {
+            "objective": objective,
+            "balance_penalty_db": balance,
+            "positive_gain_penalty_db": headroom,
+            "filter_count": 3.0 - sum(
+                edit.replacement is None for edit in plan.slot_edits
+            ),
+        }
+
+    def test_optimizer_plan_scorer_resolves_before_direct_scoring(self):
+        captured = []
+        baseline = ((), (), ((97.0, 3.0, -1.5),),) + ((),) * 5
+        plan = rehab.CandidatePlan(slot_edits=(
+            rehab.SlotEdit.modify(self.ref_97_q3, (100.0, 1.2, -1.5)),
+        ))
+
+        with patch.object(optimizer, "baseline_band_sets", return_value=baseline):
+            score = optimizer.make_candidate_plan_scorer(
+                lambda band_sets: captured.append(band_sets)
+                or {"objective": 1.0}
+            )(plan)
+
+        self.assertEqual(score["objective"], 1.0)
+        self.assertEqual(
+            captured,
+            [((), (), ((100.0, 1.2, -1.5),),) + ((),) * 5],
+        )
+
+    def test_optimizer_config_uses_detected_role_passbands(self):
+        config = optimizer.rehabilitation_config({
+            2: "FL Low",
+            3: "FR Low",
+            6: "Sub",
+        })
+
+        self.assertEqual(config.limits_for(self.ref_97_q3)[:2], (80.0, 2000.0))
+        self.assertEqual(config.limits_for(self.ref_sub_33)[:2], (30.0, 90.0))
+
+    def test_every_eligible_existing_filter_gets_removal_trial(self):
+        result = rehab.build_filter_census(self.refs, self.score_plan, self.config)
+        self.assertEqual({row.ref for row in result}, set(self.refs))
+        self.assertTrue(all(row.removal_components is not None for row in result))
+
+    def test_coarse_search_reaches_known_recentre_and_q_change(self):
+        candidates = rehab.search_filter_operations(
+            self.ref_97_q3, self.score_plan, self.config
+        )
+        settings = {
+            item.edit.replacement for item in candidates if item.edit.replacement
+        }
+        self.assertIn((100.0, 1.2, -1.5), settings)
+
+    def test_sub_search_reaches_gain_and_q_change(self):
+        candidates = rehab.search_filter_operations(
+            self.ref_sub_33, self.score_plan, self.config
+        )
+        self.assertTrue(any(
+            abs(item.edit.replacement[0] - 33.0) <= 0.1
+            and abs(item.edit.replacement[1] - 2.2) <= 0.01
+            and item.edit.replacement[2] <= -3.25
+            for item in candidates if item.edit.replacement
+        ))
+
+    def test_matched_filters_are_searched_as_one_symmetric_operation(self):
+        rows = rehab.build_filter_census(
+            (self.ref_97_q3, self.ref_97_q3_right),
+            self.score_plan,
+            self.config,
+        )
+        paired = [
+            candidate
+            for row in rows
+            for candidate in row.candidates
+            if len(candidate.edits) == 2
+        ]
+        self.assertTrue(paired)
+        self.assertTrue(all(
+            {edit.ref.channel for edit in candidate.edits} == {2, 3}
+            for candidate in paired
+        ))
+        self.assertFalse(any(
+            len(candidate.edits) == 1
+            for row in rows
+            for candidate in row.candidates
+        ))
+
+    def test_asymmetric_variant_requires_evidence_callback(self):
+        rows = rehab.build_filter_census(
+            (self.ref_97_q3, self.ref_97_q3_right),
+            self.score_plan,
+            self.config,
+            asymmetry_eligible=lambda ref, replacement: ref.channel == 2,
+        )
+        one_sided = [
+            candidate
+            for row in rows
+            for candidate in row.candidates
+            if len(candidate.edits) == 1
+        ]
+        self.assertTrue(one_sided)
+        self.assertTrue(all(item.edit.ref.channel == 2 for item in one_sided))
+
+
+    def test_rejected_asymmetric_variants_never_reach_scorer(self):
+        def paired_only_scorer(plan):
+            if len(plan.slot_edits) == 1:
+                raise AssertionError("one-sided plan reached scorer without evidence")
+            return self.score_plan(plan)
+
+        rows = rehab.build_filter_census(
+            (self.ref_97_q3, self.ref_97_q3_right),
+            paired_only_scorer,
+            self.config,
+            asymmetry_eligible=lambda ref, replacement: False,
+        )
+
+        self.assertTrue(rows)
+        self.assertTrue(all(
+            len(candidate.edits) == 2
+            for row in rows
+            for candidate in row.candidates
+        ))
+
+    def test_census_records_probe_driver_deltas(self):
+        row = rehab.build_filter_census(
+            (self.ref_sub_33,), self.score_plan, self.config
+        )[0]
+        self.assertIsNotNone(row.probe_components)
+        self.assertAlmostEqual(
+            row.system_delta,
+            row.probe_components["objective"]
+            - row.baseline_components["objective"],
+        )
+        self.assertIn("balance_penalty_db", row.probe_components)
+        self.assertIn("positive_gain_penalty_db", row.probe_components)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,6 +64,7 @@ from _make_v3 import (
 )
 from baseline_rehabilitation import (
     CandidatePlan,
+    RehabilitationConfig,
     ResolvedPlan,
     SlotEdit,
     apply_slot_edits,
@@ -439,6 +440,45 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
 GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
 SAFE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
 EXPLORE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=True)
+
+
+def rehabilitation_config(channel_roles, *, explore=False, **overrides):
+    groups = groups_for_layout(FRONT_LAYOUT, explore=explore)
+    limits_by_role = {}
+    for channel, role in channel_roles.items():
+        eligible = [
+            (name, cfg)
+            for name, cfg in groups.items()
+            if channel in cfg["channels"]
+        ]
+        if not eligible:
+            continue
+        single_channel = [
+            item for item in eligible if len(item[1]["channels"]) == 1
+        ]
+        if channel in (6, 7):
+            selected = next(
+                (item for item in eligible if item[0] == "sub"), None
+            )
+        else:
+            selected = single_channel[0] if single_channel else eligible[0]
+        if selected is None:
+            continue
+        cfg = selected[1]
+        limits_by_role[str(role)] = (
+            str(role),
+            float(cfg["range"][0]),
+            float(cfg["range"][1]),
+            float(cfg["q_range"][0]),
+            float(cfg["q_range"][1]),
+            float(cfg["gain_range"][0]),
+            float(cfg["gain_range"][1]),
+        )
+    return RehabilitationConfig(
+        role_limits=tuple(limits_by_role.values()),
+        **overrides,
+    )
+
 
 if FRONT_LAYOUT == "3way":
     CH_TRACE = {
@@ -1150,6 +1190,13 @@ def resolve_candidate_plan(plan: CandidatePlan) -> ResolvedPlan:
         ),
         signature=candidate_plan_signature(plan),
     )
+
+
+def make_candidate_plan_scorer(band_set_scorer):
+    def score_plan(plan: CandidatePlan):
+        return band_set_scorer(resolve_candidate_plan(plan).band_sets)
+
+    return score_plan
 
 
 def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
