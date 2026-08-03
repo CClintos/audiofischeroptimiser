@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -1478,5 +1479,128 @@ class Task5ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(len(plans), 2)
         self.assertEqual(plans[0].slot_edits, ())
         self.assertEqual(plans[1].slot_edits, (self.edit,))
+
+
+class CacheTests(unittest.TestCase):
+    def setUp(self):
+        self.config = rehab.RehabilitationConfig()
+        self.fingerprint_inputs = {
+            "baseline": {"sha256": "baseline"},
+            "target": {"sha256": "target"},
+        }
+
+    def _stage(self):
+        return {
+            "status": "no_eligible_filters",
+            "evaluations": 1,
+            "best_plan": rehab.CandidatePlan(),
+            "result": None,
+            "census": (),
+        }
+
+    def test_shared_cache_reused_without_rescoring(self):
+        calls = []
+
+        def build_stage():
+            calls.append("built")
+            return self._stage()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            first = stream.build_or_load_rehabilitation_cache(
+                path,
+                expected_fingerprint="same-session",
+                fingerprint_inputs=self.fingerprint_inputs,
+                config=self.config,
+                build_stage=build_stage,
+            )
+            second = stream.build_or_load_rehabilitation_cache(
+                path,
+                expected_fingerprint="same-session",
+                fingerprint_inputs=self.fingerprint_inputs,
+                config=self.config,
+                build_stage=lambda: self.fail("cache reuse rescored rehabilitation"),
+            )
+
+        self.assertEqual(calls, ["built"])
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        self.assertEqual(first["best_plan"], rehab.CandidatePlan())
+
+    def test_cache_rejects_changed_target_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            stream.build_or_load_rehabilitation_cache(
+                path,
+                expected_fingerprint="target-a",
+                fingerprint_inputs=self.fingerprint_inputs,
+                config=self.config,
+                build_stage=self._stage,
+            )
+            with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
+                stream.build_or_load_rehabilitation_cache(
+                    path,
+                    expected_fingerprint="target-b",
+                    fingerprint_inputs={
+                        **self.fingerprint_inputs,
+                        "target": {"sha256": "different"},
+                    },
+                    config=self.config,
+                    build_stage=lambda: self.fail("stale cache was silently rebuilt"),
+                )
+
+    def test_worker_keeps_compact_cache_state_after_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            loaded = stream.build_or_load_rehabilitation_cache(
+                path,
+                expected_fingerprint="same-session",
+                fingerprint_inputs=self.fingerprint_inputs,
+                config=self.config,
+                build_stage=self._stage,
+            )
+
+            state = stream.compact_rehabilitation_cache_state(loaded, path)
+
+        self.assertNotIn("census_detail", state)
+        self.assertNotIn("scored_candidates", state)
+        self.assertEqual(state["cache_fingerprint"], "same-session")
+        self.assertEqual(state["cache_path"], str(path.resolve()))
+
+    def test_cache_fingerprint_includes_phase_scoring_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline.afpx"
+            target = root / "target.txt"
+            baseline.write_bytes(b"baseline")
+            target.write_text("20 0\n", encoding="utf-8")
+            common = dict(
+                baseline=baseline,
+                target=target,
+                measurement_session={"manifest": {}, "audit": {}},
+                filter_cost_scale=0.1,
+                worst_weight=0.1,
+                min_total_bands=0,
+                mode="peq",
+                profile="explore",
+                phase_cache=None,
+                sample_rate=96000.0,
+                level_calibration=None,
+                repeatability_folder=None,
+            )
+            off = stream.stream_input_fingerprint(
+                SimpleNamespace(**common, phase_writes="off"), self.config
+            )
+            automatic = stream.stream_input_fingerprint(
+                SimpleNamespace(**common, phase_writes="auto"), self.config
+            )
+
+        self.assertNotEqual(off, automatic)
+    def test_malformed_cache_fails_instead_of_rescoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rehabilitation_cache.json"
+            path.write_text("{not-json", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "malformed"):
+                stream.load_rehabilitation_cache(path, "same-session")
+
 if __name__ == "__main__":
     unittest.main()

@@ -205,11 +205,11 @@ def _json_safe(value):
     return value
 
 
-def stream_input_fingerprint(args, rehabilitation_config):
+def stream_input_fingerprint_payload(args, rehabilitation_config):
     manifest = dict(
         getattr(args, "measurement_session", {}).get("manifest", {})
     )
-    payload = {
+    return {
         "baseline": opt.file_fingerprint(args.baseline),
         "target": opt.file_fingerprint(args.target),
         "role_map": manifest.get("resolved_roles", {}),
@@ -228,9 +228,27 @@ def stream_input_fingerprint(args, rehabilitation_config):
         "rehabilitation_config": _json_safe(
             rehabilitation_config.__dict__
         ),
+        "measurement_session_audit": dict(
+            getattr(args, "measurement_session", {}).get("audit", {})
+        ),
+        "phase_context": {
+            "writes": str(getattr(args, "phase_writes", "off")),
+            "sample_rate": float(getattr(args, "sample_rate", 96000.0)),
+            "cache": (
+                opt.file_fingerprint(Path(args.phase_cache))
+                if getattr(args, "phase_cache", None)
+                else None
+            ),
+        },
         "mode": str(args.mode),
         "profile": str(args.profile),
     }
+
+
+def stream_input_fingerprint(args, rehabilitation_config):
+    payload = stream_input_fingerprint_payload(
+        args, rehabilitation_config
+    )
     encoded = json.dumps(
         _json_safe(payload), sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -276,6 +294,149 @@ def rehabilitation_state_payload(stage, config):
         ],
         "best_plan": candidate_plan_to_json(stage["best_plan"]),
     }
+
+
+
+REHABILITATION_CACHE_SCHEMA = "audiofischer-rehabilitation-cache-v1"
+
+
+def rehabilitation_cache_payload(
+    stage, config, fingerprint, fingerprint_inputs
+):
+    state = rehabilitation_state_payload(stage, config)
+    result = stage.get("result")
+    state["census_detail"] = [
+        {
+            "ref": _filter_ref_to_json(row.ref),
+            "paired_ref": (
+                None
+                if row.paired_ref is None
+                else _filter_ref_to_json(row.paired_ref)
+            ),
+            "baseline_components": _json_safe(row.baseline_components),
+            "removal_components": _json_safe(row.removal_components),
+            "probe_band": (
+                None if row.probe_band is None else _band_to_json(row.probe_band)
+            ),
+            "probe_components": _json_safe(row.probe_components),
+            "probe_skip_reason": row.probe_skip_reason,
+            "system_delta": row.system_delta,
+            "balance_delta": row.balance_delta,
+            "headroom_delta": row.headroom_delta,
+            "retained_candidates": [
+                {
+                    "plan": candidate_plan_to_json(candidate.plan),
+                    "components": _json_safe(candidate.components),
+                }
+                for candidate in row.candidates
+            ],
+        }
+        for row in stage.get("census", ())
+    ]
+    state["scored_candidates"] = [
+        {
+            "plan": candidate_plan_to_json(candidate.plan),
+            "components": _json_safe(candidate.components),
+            "depth": int(candidate.depth),
+            "export_eligible": bool(candidate.export_eligible),
+        }
+        for candidate in (() if result is None else result.candidates)
+    ]
+    return {
+        "schema": REHABILITATION_CACHE_SCHEMA,
+        "fingerprint": str(fingerprint),
+        "fingerprint_inputs": _json_safe(fingerprint_inputs),
+        "config": _json_safe(config.__dict__),
+        "rehabilitation": state,
+    }
+
+
+def load_rehabilitation_cache(path, expected_fingerprint):
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"rehabilitation cache is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"rehabilitation cache is malformed: {path}")
+    if payload.get("schema") != REHABILITATION_CACHE_SCHEMA:
+        raise RuntimeError(
+            f"rehabilitation cache schema is unsupported: {path}"
+        )
+    actual = str(payload.get("fingerprint", ""))
+    if actual != str(expected_fingerprint):
+        raise RuntimeError(
+            "rehabilitation cache fingerprint mismatch: "
+            f"expected {expected_fingerprint}, found {actual or 'missing'}"
+        )
+    state = payload.get("rehabilitation")
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: missing rehabilitation state: {path}"
+        )
+    if state.get("completion_status") not in (
+        "complete", "no_eligible_filters"
+    ):
+        raise RuntimeError(
+            "rehabilitation cache is incomplete: "
+            f"{state.get('completion_status', 'missing')}"
+        )
+    try:
+        best_plan = candidate_plan_from_json(state["best_plan"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: invalid best plan: {path}"
+        ) from exc
+    return {
+        "fingerprint": actual,
+        "fingerprint_inputs": payload.get("fingerprint_inputs", {}),
+        "best_plan": best_plan,
+        "rehabilitation": state,
+        "payload": payload,
+    }
+
+
+def compact_rehabilitation_cache_state(loaded, path):
+    state = dict(loaded["rehabilitation"])
+    for key in (
+        "census_detail",
+        "scored_candidates",
+        "retained_operation_candidates",
+        "candidate_plans",
+    ):
+        state.pop(key, None)
+    state["cache_path"] = str(Path(path).resolve())
+    state["cache_fingerprint"] = str(loaded["fingerprint"])
+    return state
+
+
+def build_or_load_rehabilitation_cache(
+    path, *, expected_fingerprint, fingerprint_inputs, config, build_stage
+):
+    path = Path(path)
+    if path.exists():
+        return load_rehabilitation_cache(path, expected_fingerprint)
+
+    stage = build_stage()
+    payload = rehabilitation_cache_payload(
+        stage, config, expected_fingerprint, fingerprint_inputs
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return load_rehabilitation_cache(path, expected_fingerprint)
 
 
 def saved_rehabilitation_plan(path, expected_fingerprint):
@@ -1881,6 +2042,8 @@ def main():
                         help="Optional folder containing companion WAV/text impulse exports.")
     parser.add_argument("--phase-cache", type=Path, default=None,
                         help="Shared fingerprinted crossover diagnostic cache.")
+    parser.add_argument("--rehabilitation-cache", type=Path, default=None,
+                        help="Shared fingerprinted existing-PEQ rehabilitation cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--repeatability-folder", type=Path, default=None,
@@ -2016,11 +2179,32 @@ def main():
             [], [], {}, 0, 0.0
         )
 
+    if args.mode == "phase" and args.rehabilitation_cache is not None:
+        raise SystemExit(
+            "Phase workers must not receive a PEQ rehabilitation cache."
+        )
+    cached_rehabilitation = None
+    if args.rehabilitation_cache is not None:
+        try:
+            cached_rehabilitation = load_rehabilitation_cache(
+                args.rehabilitation_cache, args.input_fingerprint
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
     saved_rehabilitation = (
         saved_rehabilitation_plan(state_path, args.input_fingerprint)
         if args.resume else None
     )
-    if saved_rehabilitation is not None:
+    if cached_rehabilitation is not None:
+        rehabilitation_plan = cached_rehabilitation["best_plan"]
+        args.rehabilitation = compact_rehabilitation_cache_state(
+            cached_rehabilitation, args.rehabilitation_cache
+        )
+        cached_rehabilitation = None
+        rehabilitation_trials = 0
+        rehabilitation_status = "cached"
+    elif saved_rehabilitation is not None:
         rehabilitation_plan, args.rehabilitation = saved_rehabilitation
         rehabilitation_trials = 0
         rehabilitation_status = "resumed"
@@ -2039,7 +2223,6 @@ def main():
         )
         rehabilitation_trials = int(stage["evaluations"])
         rehabilitation_status = str(stage["status"])
-
     baseline_plan = rehab.CandidatePlan()
     baseline_components = dict(score_plan(baseline_plan))
     baseline_item = BeamEntry(

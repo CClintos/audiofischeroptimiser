@@ -531,5 +531,32 @@ class GuiJobTests(unittest.TestCase):
         self.assertIn("Tonal accuracy", report)
 
 
+
+
+class RehabilitationCacheLaunchTests(unittest.TestCase):
+    def test_peq_runner_receives_one_shared_rehabilitation_cache_path(self):
+        config = RunConfig(
+            "C:\\Measurements", "C:\\baseline.afpx", "C:\\target.txt",
+            "C:\\run", mode="peq",
+        )
+
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+
+        self.assertEqual(args.count("-RehabilitationCache"), 1)
+        self.assertEqual(
+            args[args.index("-RehabilitationCache") + 1],
+            str(Path(config.run_root) / "rehabilitation_cache.json"),
+        )
+
+    def test_phase_runner_receives_no_rehabilitation_cache(self):
+        config = RunConfig(
+            "C:\\Measurements", "C:\\baseline.afpx", "C:\\target.txt",
+            "C:\\run", mode="phase",
+        )
+
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+
+        self.assertNotIn("-RehabilitationCache", args)
+
 if __name__ == "__main__":
     unittest.main()

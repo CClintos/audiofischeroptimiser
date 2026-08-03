@@ -415,6 +415,11 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
         "-SubBlend", config.sub_blend,
         "-PythonExe", python_exe,
     ]
+    if config.mode == "peq":
+        args.extend([
+            "-RehabilitationCache",
+            str(Path(config.run_root) / "rehabilitation_cache.json"),
+        ])
     if config.headroom_db is not None:
         args.extend(["-HeadroomDb", str(config.headroom_db)])
     if config.level_calibration:

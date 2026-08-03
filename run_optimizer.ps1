@@ -22,6 +22,7 @@ param(
     [double]$HeadroomDb = -1,
     [ValidateSet("off", "audition")]
     [string]$VoicingVariants = "off",
+    [string]$RehabilitationCache = "",
     [string]$PythonExe = ""
 )
 
@@ -87,6 +88,7 @@ if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
 if ($RepeatabilityFolder) { $launch.RepeatabilityFolder = $RepeatabilityFolder }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
+if ($RehabilitationCache) { $launch.RehabilitationCache = $RehabilitationCache }
 Set-RunPhase "searching"
 & (Join-Path $here "run_guided_stream_workers.ps1") @launch
 if ($LASTEXITCODE -ne 0) {
@@ -113,6 +115,7 @@ foreach ($row in $workerRows) {
 if ($failed.Count) { throw ($failed -join [Environment]::NewLine) }
 
 Set-RunPhase "merging"
+Write-Host "Merging candidates"
 $phaseCache = Join-Path $Root "phase_diagnostics.json"
 $mergeArgs = @(
     "_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"),

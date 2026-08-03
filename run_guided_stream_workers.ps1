@@ -27,6 +27,7 @@ param(
     [string]$RoleMap = "",
     [string]$Baseline = "",
     [string]$Target = "",
+    [string]$RehabilitationCache = "",
     [string]$PythonExe = ""
 )
 
@@ -57,7 +58,13 @@ $impulseRootPath = if ($ImpulseRoot -ne "") { (Resolve-Path -LiteralPath $Impuls
 $levelCalibrationPath = if ($LevelCalibration -ne "") { (Resolve-Path -LiteralPath $LevelCalibration).Path } else { "" }
 $repeatabilityFolderPath = if ($RepeatabilityFolder -ne "") { (Resolve-Path -LiteralPath $RepeatabilityFolder).Path } else { "" }
 $roleMapPath = if ($RoleMap -ne "") { (Resolve-Path -LiteralPath $RoleMap).Path } else { "" }
-$phaseCachePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "phase_diagnostics.json"
+$resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+$phaseCachePath = Join-Path $resolvedRoot "phase_diagnostics.json"
+$rehabilitationCachePath = if ($RehabilitationCache -ne "") {
+    [IO.Path]::GetFullPath($RehabilitationCache)
+} else {
+    Join-Path $resolvedRoot "rehabilitation_cache.json"
+}
 $stopFilePath = Join-Path (Resolve-Path -LiteralPath $Root).Path "stop_requested"
 Remove-Item -LiteralPath $stopFilePath -Force -ErrorAction SilentlyContinue
 
@@ -98,6 +105,50 @@ if ($levelCalibrationPath -ne "") { $cacheArgs += @("--level-calibration", $leve
 & $pythonExe @cacheArgs
 if ($LASTEXITCODE -ne 0) { throw "Phase diagnostic cache preparation failed." }
 
+$workerSeconds = $Seconds
+if ($Mode -eq "peq") {
+    Write-Host "Preparing existing tune"
+    $rehabilitationTimer = [Diagnostics.Stopwatch]::StartNew()
+    $rehabilitationArgs = @(
+        "scripts\build_rehabilitation_cache.py",
+        "--data-root", $dataRootPath,
+        "--baseline", $baselinePath,
+        "--target", $targetPath,
+        "--out", $rehabilitationCachePath,
+        "--seconds", "$workerSeconds",
+        "--profile", "explore",
+        "--filter-cost-scale", "0.1",
+        "--worst-weight", "0.10",
+        "--min-total-bands", "0",
+        "--validation-threshold", "$ValidationThreshold",
+        "--sample-rate", "$SampleRate",
+        "--phase-writes", "$PhaseWrites",
+        "--phase-cache", $phaseCachePath,
+        "--print-mode", "none"
+    )
+    if ($impulseRootPath -ne "") {
+        $rehabilitationArgs += @("--impulse-root", $impulseRootPath)
+    }
+    if ($levelCalibrationPath -ne "") {
+        $rehabilitationArgs += @("--level-calibration", $levelCalibrationPath)
+    }
+    if ($repeatabilityFolderPath -ne "") {
+        $rehabilitationArgs += @("--repeatability-folder", $repeatabilityFolderPath)
+    }
+    if ($roleMapPath -ne "") {
+        $rehabilitationArgs += @("--role-map", $roleMapPath)
+    }
+    & $pythonExe @rehabilitationArgs
+    $rehabilitationTimer.Stop()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Existing-tune preparation failed; no optimizer workers were started."
+    }
+    $workerSeconds = [Math]::Max(
+        1, $Seconds - [Math]::Ceiling($rehabilitationTimer.Elapsed.TotalSeconds)
+    )
+    Write-Host "Searching remaining response"
+}
+
 $started = @()
 for ($i = 1; $i -le $Workers; $i++) {
     $name = "worker_{0:D2}" -f $i
@@ -110,7 +161,7 @@ for ($i = 1; $i -le $Workers; $i++) {
         "_optimizer_stream.py",
         "--baseline", $baselinePath,
         "--target", $targetPath,
-        "--seconds", "$Seconds",
+        "--seconds", "$workerSeconds",
         "--top", "$Top",
         "--keep", "$Keep",
         "--archive-size", "$ArchiveSize",
@@ -134,6 +185,9 @@ for ($i = 1; $i -le $Workers; $i++) {
         "--resume",
         "--out", $out
     )
+    if ($Mode -eq "peq") {
+        $args += @("--rehabilitation-cache", $rehabilitationCachePath)
+    }
     if ($GateMs -gt 0) {
         $args += @("--gate-ms", "$GateMs")
     }
@@ -197,5 +251,5 @@ if ($failed.Count -gt 0) {
 $started | Format-Table -AutoSize
 $started | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root "worker_processes.json") -Encoding UTF8
 Write-Host ""
-Write-Host "Started $Workers guided streaming workers for $Seconds seconds."
+Write-Host "Started $Workers guided streaming workers for $workerSeconds seconds."
 Write-Host "Run this same script again with the same -Root to resume/continue."
