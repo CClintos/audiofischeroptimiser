@@ -4,6 +4,27 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-10 - v0.9.0 automatic baseline rehabilitation
+
+- The PEQ workflow now audits every eligible existing filter before adding new
+  ones. It can remove harmful bands, adjust gain/Q/frequency in place, combine
+  overlapping corrections, retain the unchanged baseline, and continue Beam
+  search for residual problems.
+- Candidate plans preserve exact AFPX slot identity through scoring,
+  checkpoints, resume, worker merging, refinement, reporting, and final file
+  writing. Delay, polarity, crossover, and APF protections remain enforced.
+- Multiworker PEQ runs build one atomic, fingerprinted rehabilitation cache
+  instead of repeating the same baseline analysis in every worker. Cache
+  invalidation includes measurements, target, calibration, repeatability data,
+  role mapping, and scoring context; preparation supports safe cancellation.
+- Result summaries distinguish the supplied tune, improved existing tune, and
+  final candidate when they are genuinely different. Reports include concrete
+  filter operations, component deltas, headroom, guardrail outcomes, and
+  repeatability-aware wording rather than claiming numerical ties as wins.
+- Added extensive regression coverage for slot edits, removals, interaction
+  Beam behavior, fixed-baseline scoring, stale resume/cache rejection, phase
+  workflow separation, bounded runtime, reporting, and Windows launcher paths.
+
 ## 2026-08-01 - Platform fixes from a repo review ("Batch C")
 
 Final tier of the same review - packaging, parsing, and CI, not acoustic
