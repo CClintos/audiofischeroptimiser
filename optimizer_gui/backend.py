@@ -299,6 +299,20 @@ def _cancel_process(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
 
+def _communicate_cancellable(
+    process: subprocess.Popen, cancel_event: Any = None,
+) -> tuple[str, str, bool]:
+    """Drain worker pipes while retaining responsive cancellation."""
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.1)
+            return stdout, stderr, False
+        except subprocess.TimeoutExpired:
+            if cancel_event is not None and cancel_event.is_set():
+                _cancel_process(process)
+                stdout, stderr = process.communicate()
+                return stdout, stderr, True
+
 
 def validate_config(config: RunConfig, cancel_event: Any = None) -> dict[str, Any]:
     data_root = Path(config.data_root)
@@ -357,16 +371,13 @@ def validate_config(config: RunConfig, cancel_event: Any = None) -> dict[str, An
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, creationflags=flags,
         )
-        while process.poll() is None:
-            if cancel_event is not None and cancel_event.is_set():
-                _cancel_process(process)
-                return {
-                    "valid": False, "cancelled": True, "errors": [],
-                    "manifest": manifest, "compact": compact_manifest(manifest),
-                    "preflight": None, "diagnostics": diagnostics,
-                }
-            time.sleep(0.05)
-        stdout, stderr = process.communicate()
+        stdout, stderr, cancelled = _communicate_cancellable(process, cancel_event)
+        if cancelled:
+            return {
+                "valid": False, "cancelled": True, "errors": [],
+                "manifest": manifest, "compact": compact_manifest(manifest),
+                "preflight": None, "diagnostics": diagnostics,
+            }
         diagnostics["stdout"] = stdout
         diagnostics["stderr"] = stderr
         diagnostics["return_code"] = process.returncode

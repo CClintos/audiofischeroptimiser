@@ -4,6 +4,14 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-10 - v0.9.1 validation deadlock hotfix
+
+- Fixed Windows validation hanging indefinitely when the preflight diagnostic
+  JSON filled the child-process output pipe. The GUI now drains stdout/stderr
+  while the validator runs and retains responsive cancellation.
+- Added a regression that drains 200 KB from a validator child without
+  deadlocking. Verified against a real mapped measurement session that
+  previously remained stuck on `VALIDATING`.
 ## 2026-08-10 - v0.9.0 automatic baseline rehabilitation
 
 - The PEQ workflow now audits every eligible existing filter before adding new

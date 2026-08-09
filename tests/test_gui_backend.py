@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -21,6 +22,7 @@ from optimizer_gui.backend import (
     export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
     locate_summary, record_run_decision, runner_completed_successfully, runner_failure_reason, save_role_map,
     start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
+    _communicate_cancellable,
 )
 from optimizer_gui import __version__
 import optimizer_gui.reporting as reporting
@@ -34,6 +36,15 @@ from scripts.make_measurement_manifest import build_manifest
 
 
 class GuiJobTests(unittest.TestCase):
+    def test_validation_worker_drains_large_stdout_without_deadlock(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 200000)"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        stdout, stderr, cancelled = _communicate_cancellable(process)
+        self.assertFalse(cancelled)
+        self.assertEqual(len(stdout), 200000)
+        self.assertEqual(stderr, "")
     def test_run_tab_uses_scrollable_high_dpi_safe_layout(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = OptimizerWindow()
@@ -55,7 +66,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.9.0")
+        self.assertEqual(__version__, "0.9.1")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -200,7 +211,7 @@ class GuiJobTests(unittest.TestCase):
                 return 7
 
             @staticmethod
-            def communicate():
+            def communicate(timeout=None):
                 return "not-json", "worker import failed"
 
         with tempfile.TemporaryDirectory() as tmp:
