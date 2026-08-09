@@ -34,20 +34,31 @@ ALL_MEASUREMENT_ROLES = (
 )
 
 
-def load_role_map(role_map: Path | str | None) -> dict[str, str]:
+def _load_role_map_payload(role_map: Path | str | None) -> dict[str, object]:
     if not role_map:
         return {}
     path = Path(role_map)
     if not path.is_file():
         return {}
     payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    values = payload.get("roles", payload) if isinstance(payload, dict) else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_role_map(role_map: Path | str | None) -> dict[str, str]:
+    payload = _load_role_map_payload(role_map)
+    values = payload.get("roles", payload)
     return {
         str(role): str(filename)
         for role, filename in dict(values).items()
         if role in ALL_MEASUREMENT_ROLES and filename
     }
 
+
+def load_role_map_layout(role_map: Path | str | None) -> str:
+    layout = str(_load_role_map_payload(role_map).get("layout", ""))
+    if layout in {"front_2way_plus_sub", "front_3way_plus_sub"}:
+        return layout
+    return ""
 
 def mapped_measurement(root: Path, role: str, role_map: dict[str, str]) -> Path | None:
     filename = role_map.get(role)
@@ -177,7 +188,11 @@ def core_measurement_roles(layout: str) -> set[str]:
     return set(measurement_spec(layout)) - optional_pair_roles(layout)
 
 
-def detect_layout(root: Path, role_map: dict[str, str] | None = None) -> str:
+def detect_layout(
+    root: Path, role_map: dict[str, str] | None = None, declared_layout: str = "",
+) -> str:
+    if declared_layout in {"front_2way_plus_sub", "front_3way_plus_sub"}:
+        return declared_layout
     mapped = role_map or {}
     has_mid = all(
         mapped_measurement(root, role, mapped) or first_existing(root, aliases)
@@ -199,7 +214,7 @@ def build_manifest(
     role_map: Path | str | None = None,
 ) -> dict[str, object]:
     mapped_roles = load_role_map(role_map)
-    layout = detect_layout(root, mapped_roles)
+    layout = detect_layout(root, mapped_roles, load_role_map_layout(role_map))
     spec = measurement_spec(layout)
     present: list[str] = []
     missing: list[str] = []

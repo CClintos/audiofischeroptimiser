@@ -66,7 +66,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.9.1")
+        self.assertEqual(__version__, "0.9.2")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -277,6 +277,34 @@ class GuiJobTests(unittest.TestCase):
             Path(manifest["resolved_roles"]["FL High"]).name, "FL High Sweep.txt",
         )
         self.assertEqual(manifest["detected_layout"], "front_2way_plus_sub")
+
+    def test_declared_two_way_layout_wins_when_midbass_files_use_mid_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mapping = {
+                "System Sum": "System Sum.txt",
+                "Sub": "Subwoofer.txt",
+                "FL High": "Front L Tweeter.txt",
+                "FR High": "Front R Tweeter.txt",
+                "FL Low": "Front L Mid.txt",
+                "FR Low": "Front R Mid.txt",
+            }
+            rows = "\n".join(f"{20 + index} {70 + index / 10}" for index in range(20))
+            for filename in mapping.values():
+                (root / filename).write_text(rows, encoding="utf-8")
+            baseline = root / "baseline.afpx"
+            target = root / "target.txt"
+            baseline.write_bytes(b"test")
+            target.write_text("20 6\n1000 0\n20000 -4\n", encoding="utf-8")
+            role_map = save_role_map(
+                root / "run" / "role_map.json", mapping, "front_2way_plus_sub",
+            )
+
+            manifest = build_manifest(root, baseline, target, role_map)
+
+        self.assertEqual(manifest["detected_layout"], "front_2way_plus_sub")
+        self.assertIn("FL Low", manifest["resolved_roles"])
+        self.assertNotIn("FL Mid", manifest["resolved_roles"])
 
     def test_together_traces_are_optional_for_peq_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

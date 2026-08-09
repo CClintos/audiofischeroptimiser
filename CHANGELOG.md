@@ -4,6 +4,15 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-10 - v0.9.2 two-way role-map hotfix
+
+- Fixed PEQ runs misclassifying a declared two-way system as three-way when
+  midbass measurements used names such as `Front L Mid.txt`. The manifest and
+  optimizer now preserve the explicit layout stored in `role_map.json`.
+- Added a regression for two-way role maps whose `FL Low` and `FR Low` roles
+  point to mid-named files. Verified the previously failing real session through
+  existing-tune preparation with 11,352 filter evaluations.
+
 ## 2026-08-10 - v0.9.1 validation deadlock hotfix
 
 - Fixed Windows validation hanging indefinitely when the preflight diagnostic

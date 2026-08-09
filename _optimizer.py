@@ -47,6 +47,7 @@ import optuna
 from scripts.make_measurement_manifest import (
     build_manifest,
     load_role_map,
+    load_role_map_layout,
     mapped_measurement,
     optional_pair_roles,
 )
@@ -115,6 +116,7 @@ DEFAULT_BASELINE = Path(os.environ.get("AFPX_BASELINE", str(DATA_ROOT / "baselin
 DEFAULT_TARGET = Path(os.environ.get("AFPX_TARGET", str(ROOT / "ResoNix Target Curve 2026.txt")))
 ROLE_MAP_PATH = os.environ.get("AFPX_ROLE_MAP", "")
 ROLE_MAP = load_role_map(ROLE_MAP_PATH)
+ROLE_MAP_LAYOUT = load_role_map_layout(ROLE_MAP_PATH)
 OBJECTIVE_PATH = ROOT / "objective_module" / "afpx_objective.py"
 
 
@@ -184,6 +186,10 @@ def _has_any(data_root: Path, aliases: Tuple[str, ...]) -> bool:
 
 
 def detect_front_layout(data_root: Path = DATA_ROOT) -> str:
+    if ROLE_MAP_LAYOUT == "front_2way_plus_sub":
+        return "2way"
+    if ROLE_MAP_LAYOUT == "front_3way_plus_sub":
+        return "3way"
     has_mid = all(
         mapped_measurement(data_root, role, ROLE_MAP) or _has_any(data_root, aliases)
         for role, aliases in (
