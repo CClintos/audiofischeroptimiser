@@ -25,7 +25,7 @@ from scripts.make_measurement_manifest import (
 APP_NAME = "AudioFischer Optimizer"
 JOB_FILE = "gui_job.json"
 RUN_CLAIM_FILE = ".active_run.json"
-RUN_PHASES = ("searching", "merging", "verifying", "reporting", "complete")
+RUN_PHASES = ("preparing", "searching", "merging", "verifying", "reporting", "complete")
 RUN_SUCCESS_FILE = ".runner_success"
 RUN_FAILURE_FILE = ".runner_failed"
 
@@ -415,6 +415,11 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
         "-SubBlend", config.sub_blend,
         "-PythonExe", python_exe,
     ]
+    if config.mode == "peq":
+        args.extend([
+            "-RehabilitationCache",
+            str(Path(config.run_root) / "rehabilitation_cache.json"),
+        ])
     if config.headroom_db is not None:
         args.extend(["-HeadroomDb", str(config.headroom_db)])
     if config.level_calibration:
@@ -493,7 +498,7 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
     ])
     phase = next(
         (name for name in reversed(RUN_PHASES) if (run_root / f".phase_{name}").exists()),
-        "searching",
+        "searching" if states else "preparing",
     )
     convergence_rows = [
         dict(state.get("convergence") or {}) for state in states
@@ -582,19 +587,38 @@ def candidate_files(summary: dict[str, Any], summary_path: Path) -> list[dict[st
                 baseline_path = configured
         except (OSError, ValueError, TypeError):
             baseline_path = None
+    rehabilitation = summary.get("rehabilitation") or {}
+    comparison_stages = rehabilitation.get("comparison_stages") or []
+    stage_keys = {
+        str(row.get("key")) for row in comparison_stages if isinstance(row, dict)
+    }
+    staged = bool(comparison_stages)
     rows.append({
-        "role": "Current tune (baseline)",
+        "role": "Supplied" if staged else "Current tune (baseline)",
         "file": baseline_name,
         "objective": baseline.get("objective"),
         "path": str(baseline_path) if baseline_path else "",
         "is_baseline": True,
         "exportable": False,
+        "comparison_stage": "supplied",
     })
-    best = summary.get("best") or {}
-    if best.get("file"):
+    rehabilitation_file = str(rehabilitation.get("file") or "")
+    if staged and rehabilitation_file:
         rows.append({
-            "role": "Recommended candidate", "file": best["file"],
-            "objective": best.get("objective"), "is_baseline": False,
+            "role": "Existing tune improved",
+            "file": rehabilitation_file,
+            "objective": rehabilitation.get("objective"),
+            "is_baseline": False,
+            "comparison_stage": "rehabilitated",
+        })
+    best = summary.get("best") or {}
+    if best.get("file") and (not staged or "final" in stage_keys):
+        rows.append({
+            "role": "Final" if staged else "Recommended candidate",
+            "file": best["file"],
+            "objective": best.get("objective"),
+            "is_baseline": False,
+            "comparison_stage": "final",
         })
     for role, data in (summary.get("families") or {}).items():
         rows.append({"role": role.title(), "file": data.get("file", ""), "objective": data.get("objective")})

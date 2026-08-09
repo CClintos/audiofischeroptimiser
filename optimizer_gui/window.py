@@ -39,7 +39,7 @@ from .backend import (
 )
 from . import __version__
 from .reporting import (
-    GROUP_LABELS, generate_tuning_report, improvement_verdict, load_response_plot,
+    GROUP_LABELS, generate_tuning_report, improvement_verdict, load_response_comparisons, load_response_plot,
     metric_card_data, response_chart_series,
 )
 from .warning_text import warning_info
@@ -1163,7 +1163,7 @@ class OptimizerWindow(QMainWindow):
             box.setContentsMargins(10, 8, 10, 8)
             name = QLabel(label)
             name.setObjectName("metricName")
-            value = QLabel("—")
+            value = QLabel("-")
             value.setObjectName("metricValue")
             detail = QLabel("Waiting for results")
             detail.setObjectName("metricName")
@@ -1232,7 +1232,7 @@ class OptimizerWindow(QMainWindow):
         layout.addLayout(result_actions)
 
         filter_heading = QHBoxLayout()
-        filter_title = QLabel("Added filters")
+        filter_title = QLabel("DSP changes")
         filter_title.setObjectName("workflowTitle")
         self.copy_filters_button = QPushButton("Copy Filters as Text")
         self.copy_filters_button.clicked.connect(self._copy_filters)
@@ -1241,18 +1241,21 @@ class OptimizerWindow(QMainWindow):
         filter_heading.addStretch()
         filter_heading.addWidget(self.copy_filters_button)
         layout.addLayout(filter_heading)
-        self.filter_table = QTableWidget(0, 4)
+        self.filter_table = QTableWidget(0, 6)
         self.filter_table.setAlternatingRowColors(True)
+        self.filter_table.setWordWrap(True)
         self.filter_table.setHorizontalHeaderLabels(
-            ["Driver / group", "Frequency", "Q", "Gain"],
+            ["Action", "Driver / group", "Slot", "Previous", "New", "Why"],
         )
-        self.filter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3):
+        for column in (0, 1, 2, 3, 4):
             self.filter_table.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeToContents,
             )
+        self.filter_table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.Stretch,
+        )
         self.filter_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.filter_table.setMaximumHeight(220)
+        self.filter_table.setMaximumHeight(280)
         layout.addWidget(self.filter_table)
 
         lower = QHBoxLayout()
@@ -2198,7 +2201,10 @@ class OptimizerWindow(QMainWindow):
             f"{memory_line}\n"
         )
         self.memory_guard_error_logged = not self.memory_guard_available
-        self.phase_label.setText("Searching")
+        self.phase_label.setText(
+            "Preparing phase diagnostics"
+            if config.mode == "phase" else "Preparing existing tune"
+        )
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.poll_timer.start(1000)
@@ -2242,6 +2248,10 @@ class OptimizerWindow(QMainWindow):
         progress = collect_progress(Path(self.config.run_root))
         phase = progress["phase"]
         phase_names = {
+            "preparing": (
+                "Preparing phase diagnostics"
+                if self.config.mode == "phase" else "Preparing existing tune"
+            ),
             "searching": "Searching",
             "merging": "Merging",
             "verifying": "Verifying",
@@ -2251,7 +2261,10 @@ class OptimizerWindow(QMainWindow):
         if phase != self.current_run_phase:
             self.current_run_phase = phase
             self.run_log.append(f"Phase: {phase_names.get(phase, phase.title())}")
-        if phase == "searching":
+        if phase == "preparing":
+            self.phase_label.setText(phase_names["preparing"])
+            self.progress.setRange(0, 0)
+        elif phase == "searching":
             self.phase_label.setText("Searching")
             self.progress.setRange(0, 1000)
             self.progress.setValue(min(800, round(800 * elapsed / max(self.config.seconds, 1))))
@@ -2496,6 +2509,7 @@ class OptimizerWindow(QMainWindow):
             role.setData(Qt.UserRole, row.get("path", ""))
             role.setData(Qt.UserRole + 1, bool(row.get("exportable")))
             role.setData(Qt.UserRole + 2, bool(row.get("is_baseline")))
+            role.setData(Qt.UserRole + 3, str(row.get("comparison_stage") or "final"))
             objective = "-" if row["objective"] is None else f"{float(row['objective']):.6f}"
             self.result_table.setItem(index, 0, role)
             self.result_table.setItem(index, 1, QTableWidgetItem(objective))
@@ -2516,11 +2530,18 @@ class OptimizerWindow(QMainWindow):
             f"background:{theme.WARN_SOFT_BG};border-left:4px solid {theme.WARN};padding:10px;"
             f"color:{theme.WARN_TEXT};font-weight:650;"
         )
+        rehabilitation = self.summary.get("rehabilitation") or {}
+        repeatability_tie = (
+            rehabilitation.get("verdict") == "no_meaningful_improvement"
+        )
         for index, card in enumerate(metric_card_data(baseline, best_components)):
             delta = card["delta_db"]
             percent = card["percent"]
             if delta is None or percent is None:
                 value, detail = "Not available", "Older summary has no comparable metric"
+            elif repeatability_tie:
+                value = "No meaningful change"
+                detail = f"{abs(delta):.2f} dB modelled difference; within repeatability"
             else:
                 value = f"{abs(percent):.0f}% {'better' if delta >= 0 else 'worse'}"
                 detail = f"{abs(delta):.2f} dB {'less' if delta >= 0 else 'more'} error"
@@ -2532,23 +2553,25 @@ class OptimizerWindow(QMainWindow):
             }[card["state"]])
             self.result_metric_details[index].setText(detail)
 
-        filters = []
-        for group, bands in (best.get("added_filters") or {}).items():
-            for band in bands or []:
-                if len(band) >= 3:
-                    filters.append((str(group), float(band[0]), float(band[1]), float(band[2])))
-        self.result_filters = filters
-        self.filter_table.setRowCount(len(filters))
-        for row_index, (group, frequency, q_value, gain) in enumerate(filters):
-            values = (
-                GROUP_LABELS.get(group, group),
-                f"{frequency:.1f} Hz",
-                f"{q_value:.2f}",
-                f"{gain:+.2f} dB",
-            )
-            for column, value in enumerate(values):
-                self.filter_table.setItem(row_index, column, QTableWidgetItem(value))
-        self.copy_filters_button.setEnabled(bool(filters))
+        operations = list(rehabilitation.get("accepted_operations") or [])
+        if not operations:
+            for group, bands in (best.get("added_filters") or {}).items():
+                for band in bands or []:
+                    if len(band) >= 3:
+                        operations.append({
+                            "operation": "append",
+                            "group": str(group),
+                            "old": None,
+                            "new": {
+                                "frequency_hz": float(band[0]),
+                                "q": float(band[1]),
+                                "gain_db": float(band[2]),
+                            },
+                            "reason": "Added by the final guided search.",
+                        })
+        self.result_operations = operations
+        self.result_plots = load_response_comparisons(summary_path)
+        self._show_result_operations("final")
 
         warning_tokens = list(self.summary.get("warnings") or [])
         if best.get("left_alone"):
@@ -2582,12 +2605,15 @@ class OptimizerWindow(QMainWindow):
             "candidate has passed listening and any requested re-measurement checks."
         )
         mode = str((self.summary.get("search") or {}).get("mode") or "peq")
-        plot = load_response_plot(summary_path)
+        plot = self.result_plots.get("final") or load_response_plot(summary_path)
         frequencies = plot.get("frequency_hz") or []
         if mode != "phase" and frequencies:
             self.results_chart.set_series(
                 response_chart_series(plot),
-                markers=[frequency for _group, frequency, _q, _gain in filters],
+                markers=[
+                    frequency
+                    for _group, frequency, _q, _gain in self.result_filters
+                ],
                 fallback="Response graph data was unavailable.",
             )
             self.results_chart_note.setText(
@@ -2634,7 +2660,7 @@ class OptimizerWindow(QMainWindow):
         self.report_path = Path(path)
         if self.config:
             run_root = Path(self.config.run_root)
-            for name in ("searching", "merging", "verifying", "reporting"):
+            for name in ("preparing", "searching", "merging", "verifying", "reporting"):
                 (run_root / f".phase_{name}").unlink(missing_ok=True)
             (run_root / ".phase_complete").touch()
         self.open_report_button.setEnabled(self.report_path.exists())
@@ -2649,7 +2675,7 @@ class OptimizerWindow(QMainWindow):
         self.report_path = None
         if self.config:
             run_root = Path(self.config.run_root)
-            for name in ("searching", "merging", "verifying", "reporting"):
+            for name in ("preparing", "searching", "merging", "verifying", "reporting"):
                 (run_root / f".phase_{name}").unlink(missing_ok=True)
             (run_root / ".phase_complete").touch()
         self.open_report_button.setEnabled(False)
@@ -2665,19 +2691,93 @@ class OptimizerWindow(QMainWindow):
         self.report_task = None
         self._hide_busy()
 
+    @staticmethod
+    def _format_operation_band(value):
+        if not isinstance(value, dict):
+            return "-"
+        return (
+            f"{float(value.get('frequency_hz', 0.0)):.1f} Hz | "
+            f"Q {float(value.get('q', 0.0)):.2f} | "
+            f"{float(value.get('gain_db', 0.0)):+.2f} dB"
+        )
+
+    def _show_result_operations(self, stage: str):
+        all_operations = list(getattr(self, "result_operations", []))
+        if stage == "supplied":
+            operations = []
+        elif stage == "rehabilitated":
+            operations = [
+                row for row in all_operations
+                if str(row.get("operation")) != "append"
+            ]
+        else:
+            operations = all_operations
+        self.filter_table.setRowCount(len(operations))
+        self.result_filters = []
+        for row_index, operation in enumerate(operations):
+            action = str(operation.get("operation") or "change").title()
+            role = str(
+                operation.get("channel_role")
+                or GROUP_LABELS.get(
+                    str(operation.get("group") or ""),
+                    str(operation.get("group") or "DSP"),
+                )
+            )
+            slot = (
+                str(int(operation["slot"]))
+                if operation.get("slot") is not None else "-"
+            )
+            old = self._format_operation_band(operation.get("old"))
+            new = self._format_operation_band(operation.get("new"))
+            reason = str(operation.get("reason") or "")
+            for column, value in enumerate((action, role, slot, old, new, reason)):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.filter_table.setItem(row_index, column, item)
+            band = operation.get("new")
+            if isinstance(band, dict):
+                self.result_filters.append((
+                    str(operation.get("group") or role),
+                    float(band.get("frequency_hz", 0.0)),
+                    float(band.get("q", 0.0)),
+                    float(band.get("gain_db", 0.0)),
+                ))
+        self.displayed_result_operations = operations
+        self.filter_table.resizeRowsToContents()
+        self.copy_filters_button.setEnabled(bool(operations))
     def _result_selected(self):
         rows = self.result_table.selectionModel().selectedRows()
         item = self.result_table.item(rows[0].row(), 0) if rows else None
         self.export_button.setEnabled(bool(item and item.data(Qt.UserRole + 1)))
+        stage = str(item.data(Qt.UserRole + 3) or "final") if item else "final"
+        self._show_result_operations(stage)
+        plot = getattr(self, "result_plots", {}).get(stage)
+        if (
+            plot
+            and str((self.summary.get("search") or {}).get("mode") or "peq")
+            != "phase"
+        ):
+            self.results_chart.set_series(
+                response_chart_series(plot),
+                markers=[
+                    frequency
+                    for _group, frequency, _q, _gain in self.result_filters
+                ],
+                fallback="Response graph data was unavailable.",
+            )
         if item and item.data(Qt.UserRole + 2):
             self.results_notice.setText(
-                "Current tune selected. Keeping it requires no export; it remains your safe "
-                "fallback if the candidate is not meaningfully or audibly better."
+                "Supplied tune selected. It remains the safe fallback and requires no export."
+            )
+        elif item and stage == "rehabilitated":
+            self.results_notice.setText(
+                "Existing tune improved selected. This contains only supported edits to "
+                "existing PEQ bands; the Final row may add residual corrections."
             )
         elif item:
             self.results_notice.setText(
-                "Candidate selected. Export it as a new AFPX, keep the current tune available, "
-                "then complete the listening and re-measurement checks above."
+                "Final candidate selected. Export it as a new AFPX, keep the supplied tune "
+                "available, then complete the listening and re-measurement checks above."
             )
 
     def _selected_candidate(self) -> Path | None:
@@ -2689,24 +2789,42 @@ class OptimizerWindow(QMainWindow):
         return Path(path) if path and Path(path).is_file() else None
 
     def _copy_filters(self):
-        filters = getattr(self, "result_filters", [])
-        if not filters:
+        operations = list(getattr(self, "displayed_result_operations", []))
+        if not operations:
             return
-        lines = ["AudioFischer Optimizer – added filters"]
-        current_group = ""
-        for group, frequency, q_value, gain in filters:
-            label = GROUP_LABELS.get(group, group)
-            if label != current_group:
-                lines.extend(["", label])
-                current_group = label
-            lines.append(f"  {frequency:.1f} Hz | Q {q_value:.2f} | {gain:+.2f} dB")
+        lines = ["AudioFischer Optimizer - DSP changes"]
+        for operation in operations:
+            role = str(
+                operation.get("channel_role")
+                or GROUP_LABELS.get(
+                    str(operation.get("group") or ""),
+                    str(operation.get("group") or "DSP"),
+                )
+            )
+            slot = (
+                f" slot {int(operation['slot'])}"
+                if operation.get("slot") is not None else ""
+            )
+            lines.append(
+                f"{str(operation.get('operation') or 'change').upper()}: "
+                f"{role}{slot}"
+            )
+            lines.append(
+                f"  {self._format_operation_band(operation.get('old'))} -> "
+                f"{self._format_operation_band(operation.get('new'))}"
+            )
+            if operation.get("reason"):
+                lines.append(f"  Why: {operation['reason']}")
         best = self.summary.get("best") or {}
         trims = best.get("output_volume_changes_db") or {}
         if trims:
             lines.extend(["", "Protective output trims"])
-            lines.extend(f"  {channel}: {float(value):+.2f} dB" for channel, value in trims.items())
+            lines.extend(
+                f"  {channel}: {float(value):+.2f} dB"
+                for channel, value in trims.items()
+            )
         QApplication.clipboard().setText("\n".join(lines))
-        self.copy_filters_button.setText("Filters Copied")
+        self.copy_filters_button.setText("Changes Copied")
         QTimer.singleShot(
             1600, lambda: self.copy_filters_button.setText("Copy Filters as Text"),
         )

@@ -56,10 +56,21 @@ from _make_v3 import (
     apply_band_actions,
     apply_output_trim,
     afpx_roundtrip_lint,
+    canonical_peq_band,
     choose_free_slots,
     decode_afpx,
     encode_afpx,
     set_attr,
+)
+from baseline_rehabilitation import (
+    CandidatePlan,
+    RehabilitationConfig,
+    ResolvedPlan,
+    SlotEdit,
+    apply_slot_edits,
+    candidate_plan_signature,
+    freeze_groups,
+    thaw_groups,
 )
 from _tunefit import (
     allpass_fil_str,
@@ -429,6 +440,67 @@ def groups_for_layout(layout: str, explore: bool = False) -> Dict[str, Dict[str,
 GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
 SAFE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=False)
 EXPLORE_GROUPS = groups_for_layout(FRONT_LAYOUT, explore=True)
+
+
+def rehabilitation_config(channel_roles, *, explore=False, **overrides):
+    groups = groups_for_layout(FRONT_LAYOUT, explore=explore)
+    limits_by_role = {}
+    for channel, role in channel_roles.items():
+        eligible = [
+            (name, cfg)
+            for name, cfg in groups.items()
+            if channel in cfg["channels"]
+        ]
+        if not eligible:
+            continue
+        single_channel = [
+            item for item in eligible if len(item[1]["channels"]) == 1
+        ]
+        if channel in (6, 7):
+            selected = next(
+                (item for item in eligible if item[0] == "sub"), None
+            )
+        else:
+            selected = single_channel[0] if single_channel else eligible[0]
+        if selected is None:
+            continue
+        cfg = selected[1]
+        limits_by_role[str(role)] = (
+            str(role),
+            float(cfg["range"][0]),
+            float(cfg["range"][1]),
+            float(cfg["q_range"][0]),
+            float(cfg["q_range"][1]),
+            float(cfg["gain_range"][0]),
+            float(cfg["gain_range"][1]),
+        )
+
+    paired_role_limits = []
+    for name, cfg in groups.items():
+        channels = tuple(cfg["channels"])
+        if len(channels) != 2:
+            continue
+        if name != "sub" and not name.endswith("_sym"):
+            continue
+        if any(channel not in channel_roles for channel in channels):
+            continue
+        paired_role_limits.append((
+            str(channel_roles[channels[0]]),
+            str(channel_roles[channels[1]]),
+            float(cfg["range"][0]),
+            float(cfg["range"][1]),
+            float(cfg["q_range"][0]),
+            float(cfg["q_range"][1]),
+            float(cfg["gain_range"][0]),
+            float(cfg["gain_range"][1]),
+        ))
+
+    return RehabilitationConfig(
+        role_limits=tuple(limits_by_role.values()),
+        paired_role_limits=tuple(paired_role_limits),
+        **overrides,
+    )
+
 
 if FRONT_LAYOUT == "3way":
     CH_TRACE = {
@@ -1010,67 +1082,295 @@ def _find_edit_target(
 
 def _resolve_group_bands(
     groups: GroupBands,
+    starting_band_sets=None,
+    removed_bands_by_channel=None,
 ) -> Tuple[List[List[Band]], Dict[int, List[Tuple[str, "Band | None", "Band | None"]]]]:
-    """Resolve proposed group bands against the baseline into a final
-    per-channel band list, AND the exact action (append/edit/remove) that
-    produced each change - the single source of truth both scoring
-    (groups_to_band_sets) and AFPX writing (write_candidate) build on, so the
-    written file can never diverge from what was scored.
-
-    A proposed band close in frequency (EDIT_MATCH_TOLERANCE_OCT) to an
-    existing band in that channel edits it in place. A proposed band with
-    gain exactly REMOVE_BAND_GAIN (0.0) removes the existing band it matches.
-    Everything else appends, exactly as before this changed - DEFECT 1 was
-    that only this last case existed: the search could add a new band into a
-    free slot but could never modify or remove one of its own earlier picks,
-    so real fixes that were edits (recentre a mid filter, deepen a sub cut,
-    retire a now-unneeded band) were structurally unreachable. See
-    CHANGELOG.md.
-    """
-    band_sets = [list(bands) for bands in baseline_band_sets()]
+    """Resolve group proposals against evolving, serialization-canonical bands."""
+    source_band_sets = (
+        baseline_band_sets() if starting_band_sets is None else starting_band_sets
+    )
+    band_sets = [list(bands) for bands in source_band_sets]
     while len(band_sets) < 8:
         band_sets.append([])
     actions: Dict[int, List[Tuple[str, "Band | None", "Band | None"]]] = {
-        i: [] for i in range(len(band_sets))
+        channel: [] for channel in range(len(band_sets))
     }
-    # Parallel to band_sets[channel]: True while that entry still has a real
-    # AFPX slot behind it (baseline, or already edited from baseline), False
-    # for a same-pass append. write_candidate/apply_band_actions runs every
-    # edit/remove for a channel FIRST and only materializes appends into the
-    # XML afterwards in one batch, so a later proposal in this same
-    # resolution must never be allowed to "edit" an append from an earlier
-    # one - that slot does not exist in the file yet when the edit would run.
-    # (Bug found against the real v9 baseline: three close guided proposals
-    # in one group chained append->edit->edit on top of each other and the
-    # edit failed to find its target. See CHANGELOG.md.)
+    removed_bands = {
+        channel: [
+            canonical_peq_band(band)
+            for band in (removed_bands_by_channel or {}).get(channel, ())
+        ]
+        for channel in range(len(band_sets))
+    }
+
+    # True entries still have an AFPX slot. Same-pass appends are never eligible
+    # for a later edit because the writer materializes all appends last.
     from_baseline = [[True] * len(bands) for bands in band_sets]
     for group, bands in groups.items():
         if not bands:
             continue
         for channel in GROUPS[group]["channels"]:
-            for f, q, g in bands:
-                index = _find_edit_target(band_sets[channel], f, from_baseline[channel])
+            for proposed in bands:
+                f, q, g = canonical_peq_band(proposed)
+                index = _find_edit_target(
+                    band_sets[channel], f, from_baseline[channel]
+                )
+                if index is None and any(
+                    abs(math.log2(float(f) / float(removed[0])))
+                    <= EDIT_MATCH_TOLERANCE_OCT
+                    for removed in removed_bands[channel]
+                ):
+                    raise ValueError(
+                        "group action targets removed or consumed slot"
+                    )
                 if g == REMOVE_BAND_GAIN:
                     if index is not None:
                         old = band_sets[channel].pop(index)
                         from_baseline[channel].pop(index)
+                        removed_bands[channel].append(old)
                         actions[channel].append(("remove", old, None))
                     continue
                 if index is not None:
                     old = band_sets[channel][index]
-                    band_sets[channel][index] = (f, q, g)
-                    actions[channel].append(("edit", old, (f, q, g)))
+                    new = (f, q, g)
+                    band_sets[channel][index] = new
+                    actions[channel].append(("edit", old, new))
                 else:
-                    band_sets[channel].append((f, q, g))
+                    new = (f, q, g)
+                    band_sets[channel].append(new)
                     from_baseline[channel].append(False)
-                    actions[channel].append(("append", None, (f, q, g)))
+                    actions[channel].append(("append", None, new))
     for channel_bands in band_sets:
-        channel_bands.sort(key=lambda b: b[0])
+        channel_bands.sort(key=lambda band: band[0])
     return band_sets, actions
 
 
+def _slot_edited_band_sets(plan: CandidatePlan):
+    band_sets = [list(bands) for bands in baseline_band_sets()]
+    while len(band_sets) < 8:
+        band_sets.append([])
+
+    seen_slots = set()
+    removed_refs = []
+    canonical_edits = []
+    for edit in plan.slot_edits:
+        slot_key = (edit.ref.channel, edit.ref.slot)
+        if slot_key in seen_slots:
+            raise ValueError(
+                "duplicate rehabilitation slot edit for channel %d slot %d" % slot_key
+            )
+        seen_slots.add(slot_key)
+        if edit.ref.channel < 0 or edit.ref.channel >= len(band_sets):
+            raise ValueError("rehabilitation slot channel is outside baseline band sets")
+
+        channel_bands = band_sets[edit.ref.channel]
+        try:
+            index = channel_bands.index(canonical_peq_band(edit.ref.original))
+        except ValueError:
+            raise ValueError(
+                "rehabilitation slot is absent from supplied measurement baseline"
+            ) from None
+        replacement = (
+            None
+            if edit.replacement is None
+            else canonical_peq_band(edit.replacement)
+        )
+        if replacement is None:
+            channel_bands.pop(index)
+            removed_refs.append(edit.ref)
+        else:
+            channel_bands[index] = replacement
+        canonical_edits.append(SlotEdit(ref=edit.ref, replacement=replacement))
+    return band_sets, tuple(removed_refs), tuple(canonical_edits)
+
+
+def resolve_candidate_plan(plan: CandidatePlan) -> ResolvedPlan:
+    starting_band_sets, removed_refs, canonical_edits = _slot_edited_band_sets(plan)
+    groups = thaw_groups(plan.groups)
+    if not plan.slot_edits and not any(groups.values()):
+        return ResolvedPlan(
+            band_sets=tuple(tuple(bands) for bands in starting_band_sets),
+            slot_edits=(),
+            group_actions=tuple(
+                (channel, ()) for channel in range(len(starting_band_sets))
+            ),
+            signature=candidate_plan_signature(plan),
+        )
+
+    removed_bands_by_channel = {}
+    for ref in removed_refs:
+        removed_bands_by_channel.setdefault(ref.channel, []).append(ref.original)
+    band_sets, actions = _resolve_group_bands(
+        groups, starting_band_sets, removed_bands_by_channel
+    )
+    return ResolvedPlan(
+        band_sets=tuple(tuple(bands) for bands in band_sets),
+        slot_edits=canonical_edits,
+        group_actions=tuple(
+            (channel, tuple(channel_actions))
+            for channel, channel_actions in sorted(actions.items())
+        ),
+        signature=candidate_plan_signature(plan),
+    )
+
+
+def make_candidate_plan_scorer(band_set_scorer):
+    def score_plan(plan: CandidatePlan):
+        return band_set_scorer(resolve_candidate_plan(plan).band_sets)
+
+    return score_plan
+
+
+def candidate_plan_phase_conflicts(
+    freqs: np.ndarray,
+    plan: CandidatePlan,
+    phase_plan: List[Dict[str, object]] | None,
+    threshold_db: float = 0.5,
+) -> List[Dict[str, object]]:
+    groups = thaw_groups(plan.groups)
+    conflicts = phase_peq_conflicts(
+        freqs, groups, phase_plan, threshold_db
+    )
+    if not phase_plan or not plan.slot_edits:
+        return conflicts
+
+    for phase_edit in phase_plan:
+        try:
+            lo, hi = (
+                float(value)
+                for value in phase_edit.get("crossover_band", ())
+            )
+        except (TypeError, ValueError):
+            continue
+        selected = (freqs >= lo) & (freqs <= hi)
+        if not np.any(selected):
+            continue
+        crossover_channels = {
+            int(value)
+            for value in phase_edit.get("crossover_channels", ())
+        }
+        for slot_edit in plan.slot_edits:
+            if slot_edit.ref.channel not in crossover_channels:
+                continue
+            old_f, old_q, old_g = slot_edit.ref.original
+            old_response = peaking_db(
+                freqs, old_f, old_q, old_g
+            )
+            if slot_edit.replacement is None:
+                new_response = np.zeros_like(freqs)
+            else:
+                new_response = peaking_db(
+                    freqs, *slot_edit.replacement
+                )
+            maximum = float(np.max(np.abs(
+                new_response[selected] - old_response[selected]
+            )))
+            if maximum + 1e-12 < float(threshold_db):
+                continue
+            conflicts.append({
+                "source": phase_edit.get("source", "crossover"),
+                "crossover_band": [lo, hi],
+                "group": "existing_slot",
+                "channels": [slot_edit.ref.channel],
+                "slot": int(slot_edit.ref.slot),
+                "filter": {
+                    "F": float(
+                        slot_edit.ref.original[0]
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[0]
+                    ),
+                    "Q": float(
+                        slot_edit.ref.original[1]
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[1]
+                    ),
+                    "G": float(
+                        0.0
+                        if slot_edit.replacement is None
+                        else slot_edit.replacement[2]
+                    ),
+                },
+                "max_change_db": maximum,
+                "threshold_db": float(threshold_db),
+            })
+    return conflicts
+
+
+def make_candidate_plan_component_scorer(
+    band_set_scorer,
+    freqs: np.ndarray,
+    rich: RichTraceMap,
+    phase_plan: List[Dict[str, object]] | None,
+    phase_valid: bool,
+):
+    def score_plan(plan: CandidatePlan) -> Dict[str, float]:
+        resolved = resolve_candidate_plan(plan)
+        components = dict(band_set_scorer(resolved.band_sets))
+        groups = thaw_groups(plan.groups)
+        slot_conflicts = [
+            conflict
+            for conflict in candidate_plan_phase_conflicts(
+                freqs, plan, phase_plan
+            )
+            if conflict.get("group") == "existing_slot"
+        ]
+        if phase_valid and phase_plan:
+            verification = complex_crossover_verification(
+                freqs, rich, groups, phase_plan
+            )
+            components["complex_crossover_pass"] = float(
+                bool(verification["pass"])
+            )
+            components["complex_crossover_worst_deficit_db"] = max(
+                (
+                    -float(row["predicted_worst_deficit_db"])
+                    for row in verification["crossovers"]
+                ),
+                default=0.0,
+            )
+            if not verification["pass"]:
+                components["objective"] = (
+                    1e6 + 1000.0
+                    + components["complex_crossover_worst_deficit_db"]
+                )
+        else:
+            group_conflicts = phase_peq_conflicts(
+                freqs, groups, phase_plan
+            )
+            slot_conflicts.extend(group_conflicts)
+
+        components["phase_peq_conflict_count"] = float(
+            len(slot_conflicts)
+        )
+        components["phase_peq_conflict_max_db"] = max(
+            (
+                float(item["max_change_db"])
+                for item in slot_conflicts
+            ),
+            default=0.0,
+        )
+        if slot_conflicts:
+            components["objective"] = (
+                1e6
+                + 1000.0 * len(slot_conflicts)
+                + components["phase_peq_conflict_max_db"]
+            )
+        return components
+
+    return score_plan
+
 def groups_to_band_sets(groups: GroupBands) -> List[List[Band]]:
     return _resolve_group_bands(groups)[0]
+
+
+def output_trim_for_band_sets(band_sets) -> Dict[int, float]:
+    if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "output_trim_plan"):
+        return {}
+    return {
+        int(channel): float(trim_db)
+        for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(band_sets).items()
+        if abs(float(trim_db)) >= 0.01
+    }
 
 
 def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
@@ -1080,23 +1380,37 @@ def output_trim_for_groups(groups: GroupBands) -> Dict[int, float]:
     )
     if not needs_trim_check or AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "output_trim_plan"):
         return {}
+    return output_trim_for_band_sets(groups_to_band_sets(groups))
+
+
+def candidate_band_sets(candidate) -> List[List[Band]]:
+    if isinstance(candidate, CandidatePlan):
+        return [list(bands) for bands in resolve_candidate_plan(candidate).band_sets]
+    return groups_to_band_sets(candidate)
+
+
+def candidate_plan_headroom(
+    freqs: np.ndarray, plan: CandidatePlan,
+) -> Dict[str, Dict[str, object]]:
+    band_sets = resolve_candidate_plan(plan).band_sets
+    roles = dict(CH_TRACE)
+    roles.update({6: "Left Sub", 7: "Right Sub"})
     return {
-        int(channel): float(trim_db)
-        for channel, trim_db in AFPX_OBJECTIVE.output_trim_plan(groups_to_band_sets(groups)).items()
-        if abs(float(trim_db)) >= 0.01
+        roles.get(channel, f"Channel {channel}"): headroom_report(freqs, bands)
+        for channel, bands in enumerate(band_sets)
     }
 
 
-def fixed_anchor_response_audit(groups: GroupBands) -> Dict[str, object]:
+def fixed_anchor_response_audit(candidate) -> Dict[str, object]:
     if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "response_audit"):
         return {}
-    return dict(AFPX_OBJECTIVE.response_audit(groups_to_band_sets(groups)))
+    return dict(AFPX_OBJECTIVE.response_audit(candidate_band_sets(candidate)))
 
 
-def report_plot_data(groups: GroupBands) -> Dict[str, object]:
+def report_plot_data(candidate) -> Dict[str, object]:
     if AFPX_OBJECTIVE is None or not hasattr(AFPX_OBJECTIVE, "report_plot_data"):
         return {}
-    return dict(AFPX_OBJECTIVE.report_plot_data(groups_to_band_sets(groups)))
+    return dict(AFPX_OBJECTIVE.report_plot_data(candidate_band_sets(candidate)))
 
 
 def suggest_group_bands(trial: optuna.Trial, group: str) -> List[Band]:
@@ -1265,11 +1579,12 @@ def channel_deltas(freqs: np.ndarray, groups: GroupBands) -> Dict[int, np.ndarra
     return deltas
 
 
-def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> TraceMap:
+def _predict_traces_from_channel_deltas(
+    freqs: np.ndarray, traces: TraceMap, deltas: Dict[int, np.ndarray],
+    trim_plan: Dict[int, float] | None = None,
+) -> TraceMap:
     pred: TraceMap = dict(traces)
-
-    deltas = channel_deltas(freqs, groups)
-    trim_plan = output_trim_for_groups(groups)
+    trim_plan = trim_plan or {}
     for channel, trace_name in CH_TRACE.items():
         pred[trace_name] = (
             traces[trace_name]
@@ -1283,24 +1598,54 @@ def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> T
             sub_delta = sub_delta + deltas[channel]
             sub_count += 1
     if sub_count:
-        # The sub trace is a combined branch capture, and we only write shared
-        # sub filters. Average the duplicate channel deltas to model one shared
-        # acoustic change instead of double-counting it.
         sub_delta = sub_delta / sub_count
-    pred["Sub"] = traces["Sub"] + sub_delta + float(trim_plan.get(6, 0.0))
+    pred["Sub"] = (
+        traces["Sub"] + sub_delta + float(trim_plan.get(6, 0.0))
+    )
 
     branch_outputs = []
     for pair in PAIR_DEFS.values():
-        pair_power = power_sum_db([traces[pair["left"]], traces[pair["right"]]])
+        pair_power = power_sum_db([
+            traces[pair["left"]], traces[pair["right"]]
+        ])
         pair_residual = traces[pair["together"]] - pair_power
-        pred[pair["together"]] = power_sum_db([pred[pair["left"]], pred[pair["right"]]]) + pair_residual
+        pred[pair["together"]] = power_sum_db([
+            pred[pair["left"]], pred[pair["right"]]
+        ]) + pair_residual
         branch_outputs.append(pred[pair["together"]])
 
-    branch_power = power_sum_db([traces[pair["together"]] for pair in PAIR_DEFS.values()] + [traces["Sub"]])
+    branch_power = power_sum_db([
+        traces[pair["together"]] for pair in PAIR_DEFS.values()
+    ] + [traces["Sub"]])
     system_residual = traces["System Sum"] - branch_power
-    pred["System Sum"] = power_sum_db(branch_outputs + [pred["Sub"]]) + system_residual
+    pred["System Sum"] = power_sum_db(
+        branch_outputs + [pred["Sub"]]
+    ) + system_residual
     return pred
 
+
+def predict_traces(freqs: np.ndarray, traces: TraceMap, groups: GroupBands) -> TraceMap:
+    return _predict_traces_from_channel_deltas(
+        freqs, traces, channel_deltas(freqs, groups),
+        output_trim_for_groups(groups),
+    )
+
+
+def predict_candidate_plan(
+    freqs: np.ndarray, traces: TraceMap, plan: CandidatePlan,
+) -> TraceMap:
+    resolved = resolve_candidate_plan(plan)
+    baseline = baseline_band_sets()
+    deltas = {}
+    for channel, candidate in enumerate(resolved.band_sets):
+        original = baseline[channel] if channel < len(baseline) else ()
+        delta = cascade_db(freqs, candidate) - cascade_db(freqs, original)
+        if np.any(np.abs(delta) > 1e-12):
+            deltas[channel] = delta
+    return _predict_traces_from_channel_deltas(
+        freqs, traces, deltas,
+        output_trim_for_band_sets(resolved.band_sets),
+    )
 
 def null_masks(freqs: np.ndarray, traces: TraceMap,
                position_traces: Dict[str, np.ndarray] | None = None) -> Dict[str, np.ndarray]:
@@ -2195,6 +2540,93 @@ def trust_meter_lines(row: Dict[str, object], crossover_rows: List[Dict[str, obj
     return notes
 
 
+def _normalise_external_components(comp, band_sets) -> Dict[str, float]:
+    center_tonal = float(comp.get("tonal_masked", 0.0))
+    tonal = float(comp.get("spatial_tonal_db", center_tonal))
+    tonal_anchor = float(comp.get("sum_tonal_anchor_db", tonal))
+    presence = float(comp.get("presence_error_db", tonal))
+    peak = float(comp.get("spatial_peak_db", comp.get("peak_penalty_db", 0.0)))
+    worst = float(comp.get("spatial_worst_db", comp.get("worst_masked", 0.0)))
+    low_bias = float(comp.get(
+        "low_balance",
+        comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0,
+    ))
+    mid_bias = float(comp.get("mid_balance", 0.0))
+    tweeter_bias = float(comp.get("tweeter_balance", 0.0))
+    low_balance = float(comp.get(
+        "low_balance_rms_db",
+        comp.get("mid_balance_rms_db", abs(low_bias))
+        if FRONT_LAYOUT != "3way" else abs(low_bias),
+    ))
+    mid_balance = float(comp.get("mid_balance_rms_db", abs(mid_bias)))
+    tweeter_balance = float(comp.get("tweeter_balance_rms_db", abs(tweeter_bias)))
+    balance_terms = [tweeter_balance]
+    if FRONT_LAYOUT == "3way":
+        balance_terms.extend([low_balance, mid_balance])
+    else:
+        balance_terms.append(low_balance)
+    reported_balance = math.sqrt(
+        sum(value * value for value in balance_terms) / max(len(balance_terms), 1)
+    )
+    balance = float(comp.get("balance_penalty_db", reported_balance))
+    headroom = (
+        float(comp.get("headroom_peak", 0.0))
+        + float(comp.get("null_boost_avg", 0.0))
+    )
+    complete_groups = {
+        str(channel): list(bands) for channel, bands in enumerate(band_sets)
+    }
+    comp.update({
+        "objective": float(comp["objective"]),
+        "tonal_error_db": tonal,
+        "center_tonal_error_db": center_tonal,
+        "sum_tonal_anchor_db": tonal_anchor,
+        "presence_error_db": presence,
+        "target_shape_error_db": float(comp.get("target_shape_error_db", 0.0)),
+        "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
+        "peak_penalty_db": peak,
+        "balance_penalty_db": balance,
+        "worst_presence_dev_db": worst,
+        "positive_gain_penalty_db": headroom,
+        "positive_gain_rms_db": float(comp.get("headroom_peak", 0.0)),
+        "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
+        "filter_count": float(sum(len(bands) for bands in band_sets)),
+        "filter_cost_units": float(filter_cost(complete_groups)),
+        "guardrail_penalty_db": float(comp.get("guardrail_penalty", 0.0)),
+        "shape_penalty_db": float(comp.get("shape_penalty", 0.0)),
+        "unsupported_filter_penalty_db": float(
+            comp.get("unsupported_filter_penalty", 0.0)
+        ),
+        "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
+        "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
+        "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
+        "low_balance_rms_db": low_balance,
+        "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
+        "high_balance_rms_db": tweeter_balance,
+        "low_balance_median_db": low_bias,
+        "mid_balance_median_db": mid_bias if FRONT_LAYOUT == "3way" else 0.0,
+        "high_balance_median_db": tweeter_bias,
+    })
+    return comp
+
+
+def make_band_set_component_scorer(
+    freqs: np.ndarray,
+    traces: TraceMap,
+    target: np.ndarray,
+    filter_cost_scale: float = 0.1,
+    worst_weight: float = 0.10,
+):
+    if AFPX_OBJECTIVE is None:
+        raise RuntimeError("direct band-set scoring requires the external AFPX objective")
+
+    def band_set_score(band_sets) -> Dict[str, float]:
+        comp = dict(AFPX_OBJECTIVE.score_bands(band_sets))
+        return _normalise_external_components(comp, band_sets)
+
+    return band_set_score
+
+
 def make_component_scorer(
     freqs: np.ndarray,
     traces: TraceMap,
@@ -2203,63 +2635,17 @@ def make_component_scorer(
     worst_weight: float = 0.10,
 ):
     if AFPX_OBJECTIVE is not None:
-        def external_score(groups: GroupBands) -> Dict[str, float]:
-            comp = dict(AFPX_OBJECTIVE.score_bands(groups_to_band_sets(groups)))
-            center_tonal = float(comp.get("tonal_masked", 0.0))
-            tonal = float(comp.get("spatial_tonal_db", center_tonal))
-            tonal_anchor = float(comp.get("sum_tonal_anchor_db", tonal))
-            presence = float(comp.get("presence_error_db", tonal))
-            peak = float(comp.get("spatial_peak_db", comp.get("peak_penalty_db", 0.0)))
-            worst = float(comp.get("spatial_worst_db", comp.get("worst_masked", 0.0)))
-            low_bias = float(comp.get("low_balance", comp.get("mid_balance", 0.0) if FRONT_LAYOUT != "3way" else 0.0))
-            mid_bias = float(comp.get("mid_balance", 0.0))
-            tweeter_bias = float(comp.get("tweeter_balance", 0.0))
-            low_balance = float(comp.get(
-                "low_balance_rms_db",
-                comp.get("mid_balance_rms_db", abs(low_bias)) if FRONT_LAYOUT != "3way" else abs(low_bias),
-            ))
-            mid_balance = float(comp.get("mid_balance_rms_db", abs(mid_bias)))
-            tweeter_balance = float(comp.get("tweeter_balance_rms_db", abs(tweeter_bias)))
-            balance_terms = [tweeter_balance]
-            if FRONT_LAYOUT == "3way":
-                balance_terms.extend([low_balance, mid_balance])
-            else:
-                balance_terms.append(low_balance)
-            reported_balance = math.sqrt(sum(x * x for x in balance_terms) / max(len(balance_terms), 1))
-            balance = float(comp.get("balance_penalty_db", reported_balance))
-            headroom = float(comp.get("headroom_peak", 0.0)) + float(comp.get("null_boost_avg", 0.0))
-            comp.update({
-                "objective": float(comp["objective"]),
-                "tonal_error_db": tonal,
-                "center_tonal_error_db": center_tonal,
-                "sum_tonal_anchor_db": tonal_anchor,
-                "presence_error_db": presence,
-                "target_shape_error_db": float(comp.get("target_shape_error_db", 0.0)),
-                "pareto_tonal_db": 0.40 * tonal + 0.35 * tonal_anchor + 0.25 * presence,
-                "peak_penalty_db": peak,
-                "balance_penalty_db": balance,
-                "worst_presence_dev_db": worst,
-                "positive_gain_penalty_db": headroom,
-                "positive_gain_rms_db": float(comp.get("headroom_peak", 0.0)),
-                "positive_gain_peak_db": float(comp.get("headroom_peak", 0.0)),
-                "filter_count": float(comp.get("n_front_bands", 0.0)),
-                "filter_cost_units": float(filter_cost(groups)),
-                "guardrail_penalty_db": float(comp.get("guardrail_penalty", 0.0)),
-                "shape_penalty_db": float(comp.get("shape_penalty", 0.0)),
-                "unsupported_filter_penalty_db": float(comp.get("unsupported_filter_penalty", 0.0)),
-                "wasted_band_penalty_db": float(comp.get("wasted_band_penalty", 0.0)),
-                "asymmetric_eq_penalty_db": float(comp.get("asymmetric_eq_penalty", 0.0)),
-                "n_added_front_bands": float(comp.get("n_added_front_bands", 0.0)),
-                "low_balance_rms_db": low_balance,
-                "mid_balance_rms_db": mid_balance if FRONT_LAYOUT == "3way" else 0.0,
-                "high_balance_rms_db": tweeter_balance,
-                "low_balance_median_db": low_bias,
-                "mid_balance_median_db": mid_bias if FRONT_LAYOUT == "3way" else 0.0,
-                "high_balance_median_db": tweeter_bias,
-            })
-            return comp
+        band_set_score = make_band_set_component_scorer(
+            freqs, traces, target, filter_cost_scale, worst_weight
+        )
 
-        return external_score
+        def group_score(groups: GroupBands) -> Dict[str, float]:
+            components = band_set_score(groups_to_band_sets(groups))
+            components["filter_count"] = float(components.get("n_front_bands", 0.0))
+            components["filter_cost_units"] = float(filter_cost(groups))
+            return components
+
+        return group_score
 
     smooth = make_fast_smoother(freqs)
     masks = null_masks(freqs, traces)
@@ -2392,10 +2778,19 @@ def replace_oc_blocks(xml: str, blocks: List[str]) -> str:
     return out
 
 
-def write_candidate(base_xml: str, path: Path, groups: GroupBands,
-                    phase_plan: List[Dict[str, object]] | None = None) -> Dict[str, object]:
-    conflicts = phase_peq_conflicts(
-        np.geomspace(20.0, 20000.0, 2048), groups, phase_plan, threshold_db=0.5
+def write_candidate_plan(
+    base_xml: str,
+    path: Path,
+    plan: CandidatePlan,
+    phase_plan: List[Dict[str, object]] | None = None,
+    _simplify_appends: bool = False,
+) -> Dict[str, object]:
+    groups = thaw_groups(plan.groups)
+    conflicts = candidate_plan_phase_conflicts(
+        np.geomspace(20.0, 20000.0, 2048),
+        plan,
+        phase_plan,
+        threshold_db=0.5,
     )
     if conflicts:
         first = conflicts[0]
@@ -2403,65 +2798,75 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
             "PEQ/phase crossover conflict: %s %s changes %s by %.2f dB"
             % (first["group"], first["filter"], first["source"], first["max_change_db"])
         )
-    blocks = [m.group() for m in re.finditer(r"<OC\b.*?</OC>", base_xml, re.S)]
-    new_blocks = list(blocks)
-    # _resolve_group_bands is the SAME resolution groups_to_band_sets uses for
-    # scoring, so an edit/removal is written exactly as it was scored - never
-    # a silent extra append alongside an untouched original slot.
-    band_sets, actions_by_channel = _resolve_group_bands(groups)
-    # Repo-review finding: post-quantization filter reduction, applied only
-    # here (write time, a handful of finalists) - never in the hot search
-    # loop above this file's own resolution, which runs for every candidate
-    # the beam search evaluates. Only ever drops a purely-APPENDED band
-    # (never an edit or removal, both already-deliberate actions) whose
-    # removal changes that channel's own cascade by less than
-    # FILTER_SIMPLIFICATION_TOLERANCE_DB everywhere - one fewer filter slot
-    # used for the same audible result.
-    if AFPX_OBJECTIVE is not None and hasattr(AFPX_OBJECTIVE, "simplify_removable_bands"):
-        for channel, channel_actions in actions_by_channel.items():
-            removable = [new for kind, _old, new in channel_actions if kind == "append"]
-            if not removable or channel >= len(band_sets):
-                continue
-            try:
-                _kept, dropped = AFPX_OBJECTIVE.simplify_removable_bands(band_sets[channel], removable)
-            except Exception:
-                # Degrades gracefully to "no simplification" - e.g. a test
-                # or tool scoring synthetic bands with no real measurement
-                # session behind them. Never blocks the write itself.
-                continue
-            if not dropped:
-                continue
-            dropped_set = set(dropped)
-            actions_by_channel[channel] = [
-                action for action in channel_actions
-                if not (action[0] == "append" and action[2] in dropped_set)
-            ]
+
+    resolved = resolve_candidate_plan(plan)
     protected_channels = {
         channel
         for group, bands in groups.items() if bands
         for channel in GROUPS[group]["channels"]
         if GROUPS[group].get("system_transfer")
     }
+    edited_xml = apply_slot_edits(
+        base_xml,
+        resolved.slot_edits,
+        protected_channels=protected_channels,
+    )
+    blocks = [
+        match.group() for match in re.finditer(r"<OC\b.*?</OC>", edited_xml, re.S)
+    ]
+    new_blocks = list(blocks)
+    actions_by_channel = {
+        channel: list(channel_actions)
+        for channel, channel_actions in resolved.group_actions
+    }
+    if (
+        _simplify_appends
+        and AFPX_OBJECTIVE is not None
+        and hasattr(AFPX_OBJECTIVE, "simplify_removable_bands")
+    ):
+        for channel, channel_actions in actions_by_channel.items():
+            removable = [new for kind, _old, new in channel_actions if kind == "append"]
+            if not removable or channel >= len(resolved.band_sets):
+                continue
+            try:
+                _kept, dropped = AFPX_OBJECTIVE.simplify_removable_bands(
+                    resolved.band_sets[channel], removable
+                )
+            except Exception:
+                continue
+            dropped_set = set(dropped)
+            actions_by_channel[channel] = [
+                action for action in channel_actions
+                if not (action[0] == "append" and action[2] in dropped_set)
+            ]
     for channel, channel_actions in actions_by_channel.items():
         if not channel_actions or channel >= len(new_blocks):
             continue
         new_blocks[channel] = apply_band_actions(
-            new_blocks[channel], channel_actions,
+            new_blocks[channel],
+            list(channel_actions),
             protected_boost=channel in protected_channels,
         )
 
-    trim_plan = output_trim_for_groups(groups)
+    trim_plan = (
+        output_trim_for_groups(groups) if _simplify_appends
+        else output_trim_for_band_sets(resolved.band_sets)
+    )
     for channel, trim_db in trim_plan.items():
         if channel >= len(new_blocks):
             raise ValueError(f"Protective output trim targets missing channel {channel}")
         new_blocks[channel] = apply_output_trim(new_blocks[channel], trim_db)
 
-    new_xml = replace_oc_blocks(base_xml, new_blocks)
+    new_xml = replace_oc_blocks(edited_xml, new_blocks)
     new_xml = apply_phase_writes(new_xml, phase_plan)
     encode_afpx(new_xml, path)
     written = decode_afpx(path)
-    allow_delay = any(int(edit.get("delay_samples", 0)) != 0 for edit in (phase_plan or []))
-    allow_polarity = any(bool(edit.get("polarity_channels")) for edit in (phase_plan or []))
+    allow_delay = any(
+        int(edit.get("delay_samples", 0)) != 0 for edit in (phase_plan or [])
+    )
+    allow_polarity = any(
+        bool(edit.get("polarity_channels")) for edit in (phase_plan or [])
+    )
     allow_apf = any(bool(edit.get("apf_channels")) for edit in (phase_plan or []))
     lint = afpx_roundtrip_lint(
         base_xml,
@@ -2470,10 +2875,29 @@ def write_candidate(base_xml: str, path: Path, groups: GroupBands,
         allow_polarity_changes=allow_polarity,
         allowed_added_types=("17", "20") if allow_apf else ("17",),
         allowed_volume_trims=trim_plan,
+        allowed_filter_slot_changes=tuple(
+            (edit.ref.channel, edit.ref.slot) for edit in resolved.slot_edits
+        ),
     )
     if not lint["pass"]:
         raise AssertionError("AFPX lint failed: " + "; ".join(lint["errors"]))
+    lint["operation_signature"] = resolved.signature
     return lint
+
+
+def write_candidate(
+    base_xml: str,
+    path: Path,
+    groups: GroupBands,
+    phase_plan: List[Dict[str, object]] | None = None,
+) -> Dict[str, object]:
+    return write_candidate_plan(
+        base_xml,
+        path,
+        CandidatePlan(groups=freeze_groups(groups)),
+        _simplify_appends=True,
+        phase_plan=phase_plan,
+    )
 
 
 def mask_ranges(freqs: np.ndarray, mask: np.ndarray, band: Tuple[float, float]) -> List[Tuple[float, float]]:
@@ -2721,7 +3145,17 @@ def write_family_aliases(out_dir: Path, rows: List[Dict[str, object]], base_xml:
         old.unlink()
     for role, row in picks.items():
         file_name = f"family_{role}.afpx"
-        write_candidate(base_xml, out_dir / file_name, row["groups"], phase_plan=phase_plan)
+        plan = row.get("plan")
+        if isinstance(plan, CandidatePlan):
+            write_candidate_plan(
+                base_xml, out_dir / file_name, plan,
+                phase_plan=phase_plan,
+            )
+        else:
+            write_candidate(
+                base_xml, out_dir / file_name, row["groups"],
+                phase_plan=phase_plan,
+            )
         aliases[role] = file_name
     return aliases
 
@@ -2765,6 +3199,156 @@ def file_fingerprint(path: Path) -> Dict[str, object]:
     }
 
 
+
+def rehabilitation_report_payload(
+    *,
+    rehabilitation_plan: CandidatePlan,
+    final_plan: CandidatePlan,
+    baseline_components: Dict[str, object],
+    rehabilitated_components: Dict[str, object],
+    final_components: Dict[str, object],
+    state: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+    """Build the compact, auditable existing-tune rehabilitation report."""
+    state = dict(state or {})
+
+    def numeric_components(values):
+        return {
+            str(key): float(value)
+            for key, value in dict(values or {}).items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+            and not isinstance(value, bool)
+        }
+
+    def deltas(before, after):
+        first = numeric_components(before)
+        second = numeric_components(after)
+        return {
+            key: second[key] - first[key]
+            for key in sorted(first.keys() & second.keys())
+        }
+
+    accepted = []
+    counts = {"modify": 0, "remove": 0, "merge": 0, "append": 0}
+    for edit in rehabilitation_plan.slot_edits:
+        operation = "remove" if edit.replacement is None else "modify"
+        counts[operation] += 1
+        old_f, old_q, old_g = edit.ref.original
+        row = {
+            "operation": operation,
+            "channel": int(edit.ref.channel),
+            "channel_role": str(edit.ref.role),
+            "slot": int(edit.ref.slot),
+            "old": {"frequency_hz": old_f, "q": old_q, "gain_db": old_g},
+            "new": None,
+            "reason": (
+                "Removed because the existing band did not earn its keep under the "
+                "same fixed-baseline objective and guardrails."
+                if edit.replacement is None else
+                "Re-centred or reshaped because the revised existing band improved "
+                "the fixed-baseline objective while retaining every hard gate."
+            ),
+        }
+        if edit.replacement is not None:
+            new_f, new_q, new_g = edit.replacement
+            row["new"] = {
+                "frequency_hz": new_f, "q": new_q, "gain_db": new_g,
+            }
+        accepted.append(row)
+
+    rehabilitation_signature = candidate_plan_signature(rehabilitation_plan)
+    rehabilitation_groups = dict(rehabilitation_plan.groups)
+    for group, bands in final_plan.groups:
+        prior = list(rehabilitation_groups.get(group, ()))
+        for band in bands:
+            if band in prior:
+                prior.remove(band)
+                continue
+            counts["append"] += 1
+            accepted.append({
+                "operation": "append",
+                "group": str(group),
+                "old": None,
+                "new": {
+                    "frequency_hz": float(band[0]),
+                    "q": float(band[1]),
+                    "gain_db": float(band[2]),
+                },
+                "reason": (
+                    "Added after existing-filter rehabilitation because a supported "
+                    "residual remained and cleared the same objective and guardrails."
+                ),
+            })
+
+    consolidation = dict(state.get("consolidation") or {})
+    if consolidation.get("accepted"):
+        counts["merge"] = int(consolidation.get("accepted_count", 1))
+        accepted.append({
+            "operation": "merge",
+            "reason": (
+                "Overlapping existing bands were replaced by one equivalent cascade "
+                "after the response mismatch and hard gates passed."
+            ),
+            "max_cascade_error_db": consolidation.get("max_cascade_error_db"),
+        })
+
+    meaningful = bool(state.get("meaningful_improvement", False))
+    stages = [{
+        "key": "supplied",
+        "label": "Supplied",
+        "objective": numeric_components(baseline_components).get("objective"),
+    }]
+    if (
+        rehabilitation_signature != candidate_plan_signature(CandidatePlan())
+        and rehabilitation_signature != candidate_plan_signature(final_plan)
+    ):
+        stages.append({
+            "key": "rehabilitated",
+            "label": "Existing tune improved",
+            "objective": numeric_components(rehabilitated_components).get("objective"),
+        })
+    final_signature = candidate_plan_signature(final_plan)
+    if final_signature != candidate_plan_signature(CandidatePlan()):
+        stages.append({
+            "key": "final",
+            "label": "Final",
+            "objective": numeric_components(final_components).get("objective"),
+        })
+    return {
+        "verdict": (
+            "meaningful_improvement"
+            if meaningful else "no_meaningful_improvement"
+        ),
+        "operation_counts": counts,
+        "accepted_operations": accepted,
+        "rejected_operations": list(state.get("gate_rejections") or []),
+        "component_deltas": {
+            "baseline_to_rehabilitated": deltas(
+                baseline_components, rehabilitated_components
+            ),
+            "rehabilitated_to_final": deltas(
+                rehabilitated_components, final_components
+            ),
+            "baseline_to_final": deltas(baseline_components, final_components),
+        },
+        "components": {
+            "supplied": numeric_components(baseline_components),
+            "rehabilitated": numeric_components(rehabilitated_components),
+            "final": numeric_components(final_components),
+        },
+        "comparison_stages": stages,
+        "evaluation_count": int(state.get("evaluations", 0)),
+        "cache_source": str(state.get("cache_path") or ""),
+        "consolidation": consolidation,
+        "headroom": {
+            "supplied": dict(baseline_components.get("headroom_margin_db") or {}),
+            "rehabilitated": dict(
+                rehabilitated_components.get("headroom_margin_db") or {}
+            ),
+            "final": dict(final_components.get("headroom_margin_db") or {}),
+        },
+    }
+
 def write_report(
     out_dir: Path,
     rows: List[Dict[str, object]],
@@ -2785,9 +3369,71 @@ def write_report(
     phase_plan = phase_plan or []
     best_row = rows[0] if rows else None
     fixed_anchor_audit = (
-        fixed_anchor_response_audit(best_row.get("groups", {})) if best_row else {}
+        fixed_anchor_response_audit(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
     )
-    response_plot = report_plot_data(best_row.get("groups", {})) if best_row else {}
+    response_plot = report_plot_data(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
+    final_plan = (
+        best_row.get("plan")
+        if best_row and isinstance(best_row.get("plan"), CandidatePlan)
+        else CandidatePlan(groups=freeze_groups(
+            (best_row or {}).get("groups", {})
+        ))
+    )
+    rehabilitation_state = dict(
+        getattr(args, "rehabilitation", {}) or {}
+    )
+    rehabilitation_plan = getattr(
+        args, "rehabilitation_plan", CandidatePlan()
+    )
+    if not isinstance(rehabilitation_plan, CandidatePlan):
+        rehabilitation_plan = CandidatePlan()
+    rehabilitation_components = dict(
+        getattr(args, "rehabilitation_components", {})
+        or rehabilitation_state.get("best_components", {})
+        or baseline_score.get("components", {})
+    )
+    rehabilitation_report = (
+        rehabilitation_report_payload(
+            rehabilitation_plan=rehabilitation_plan,
+            final_plan=final_plan,
+            baseline_components=dict(baseline_score.get("components", {})),
+            rehabilitated_components=rehabilitation_components,
+            final_components=dict((best_row or {}).get("components", {})),
+            state=rehabilitation_state,
+        )
+        if rehabilitation_state
+        and str(getattr(args, "mode", "peq")) == "peq"
+        else {}
+    )
+    if rehabilitation_report:
+        rehabilitation_report["file"] = str(
+            rehabilitation_state.get("file") or ""
+        )
+        rehabilitation_report["objective"] = rehabilitation_components.get(
+            "objective"
+        )
+    response_comparisons = {}
+    if best_row:
+        supplied_plot = report_plot_data(CandidatePlan())
+        supplied_plot["candidate_label"] = "Supplied"
+        response_comparisons["supplied"] = supplied_plot
+        if any(
+            stage.get("key") == "rehabilitated"
+            for stage in rehabilitation_report.get("comparison_stages", [])
+        ):
+            rehabilitated_plot = report_plot_data(rehabilitation_plan)
+            rehabilitated_plot["candidate_label"] = "Existing tune improved"
+            response_comparisons["rehabilitated"] = rehabilitated_plot
+        if (
+            not rehabilitation_report
+            or any(
+                stage.get("key") == "final"
+                for stage in rehabilitation_report.get("comparison_stages", [])
+            )
+        ):
+            final_plot = dict(response_plot)
+            final_plot["candidate_label"] = "Final"
+            response_comparisons["final"] = final_plot
     comparison_integrity = {
         "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
         "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
@@ -2908,6 +3554,8 @@ def write_report(
         "comparison_integrity": comparison_integrity,
         "best_fixed_anchor_response": fixed_anchor_audit,
         "response_plot": response_plot,
+        "response_comparisons": response_comparisons,
+        "rehabilitation": rehabilitation_report,
         "top_candidates": summary_rows,
         "family_picks": {
             role: {
@@ -3078,6 +3726,7 @@ def write_report(
             "convergence": getattr(args, "convergence", {}),
         },
         "phase_actions": compact_phase_actions,
+        "rehabilitation": rehabilitation_report,
         "complex_crossover_verification": (
             complex_crossover_verification(
                 np.asarray(getattr(args, "freqs")), getattr(args, "rich_traces", {}),

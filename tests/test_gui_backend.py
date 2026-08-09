@@ -23,6 +23,7 @@ from optimizer_gui.backend import (
     start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
 )
 from optimizer_gui import __version__
+import optimizer_gui.reporting as reporting
 from optimizer_gui.reporting import (
     build_report_html, improvement_verdict, line_chart_data_uri,
     load_response_plot, metric_card_data, response_chart_series,
@@ -389,6 +390,7 @@ class GuiJobTests(unittest.TestCase):
         verdict = improvement_verdict(baseline, best)
         self.assertFalse(verdict["meaningful"])
         self.assertIn("Not meaningfully better", verdict["heading"])
+        self.assertNotIn("%", verdict["detail"])
         best["tonal_error_db"] = 1.5
         cards = metric_card_data(baseline, best)
         self.assertEqual(cards[0]["state"], "good")
@@ -396,6 +398,8 @@ class GuiJobTests(unittest.TestCase):
     def test_progress_and_candidates_read_compact_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / ".phase_preparing").touch()
+            self.assertEqual(collect_progress(root)["phase"], "preparing")
             worker = root / "worker_01"
             worker.mkdir()
             (worker / "stream_state.json").write_text(json.dumps({
@@ -407,6 +411,7 @@ class GuiJobTests(unittest.TestCase):
                     "events": [{"elapsed_seconds": 4.0, "objective": 3.25}],
                 },
             }), encoding="utf-8")
+            (root / ".phase_searching").touch()
             progress = collect_progress(root)
             self.assertEqual(progress["trials"], 42)
             self.assertEqual(progress["best_objective"], 3.25)
@@ -499,6 +504,85 @@ class GuiJobTests(unittest.TestCase):
         self.assertIn("destructive, not EQ-able", report)
         self.assertIn("Re-measure using REW acoustic timing reference", report)
 
+    def test_peq_report_explains_existing_filter_operations(self) -> None:
+        summary = {
+            "search": {"mode": "peq"},
+            "baseline": {"objective": 10.0},
+            "best": {
+                "file": "candidate.afpx",
+                "objective": 7.0,
+                "components": {"objective": 7.0},
+            },
+            "rehabilitation": {
+                "verdict": "meaningful_improvement",
+                "evaluation_count": 321,
+                "cache_source": "rehabilitation_cache.json",
+                "operation_counts": {
+                    "modify": 1, "remove": 1, "merge": 0, "append": 0,
+                },
+                "accepted_operations": [{
+                    "operation": "modify",
+                    "channel_role": "FL Low",
+                    "slot": 7,
+                    "old": {
+                        "frequency_hz": 97.0, "q": 3.0, "gain_db": -1.5,
+                    },
+                    "new": {
+                        "frequency_hz": 100.0, "q": 1.2, "gain_db": -1.5,
+                    },
+                    "reason": "Re-centred because the revised band cleared every hard gate.",
+                }],
+                "component_deltas": {
+                    "baseline_to_rehabilitated": {"tonal_error_db": -0.8},
+                },
+                "headroom": {
+                    "supplied": {"2": 2.0},
+                    "rehabilitated": {"2": 2.5},
+                    "final": {"2": 2.5},
+                },
+            },
+            "gates": {"measurement_session": {}},
+        }
+
+        report = build_report_html(summary, {}, Path("assistant_summary.json"))
+
+        self.assertIn("Existing Tune Rehabilitation", report)
+        self.assertIn("97.0 Hz", report)
+        self.assertIn("100.0 Hz", report)
+        self.assertIn("Re-centred because", report)
+        self.assertIn("321", report)
+    def test_tie_report_uses_repeatability_language_without_percentage(self) -> None:
+        summary = {
+            "search": {"mode": "peq"},
+            "baseline": {
+                "objective": 10.0,
+                "tonal_error_db": 2.0,
+                "presence_error_db": 2.0,
+                "narrow_peak_penalty_db": 1.0,
+                "balance_penalty_db": 1.0,
+            },
+            "best": {
+                "file": "candidate.afpx",
+                "objective": 9.99,
+                "components": {
+                    "objective": 9.99,
+                    "tonal_error_db": 1.99,
+                    "presence_error_db": 2.0,
+                    "narrow_peak_penalty_db": 1.0,
+                    "balance_penalty_db": 1.0,
+                },
+            },
+            "rehabilitation": {
+                "verdict": "no_meaningful_improvement",
+                "comparison_stages": [{"key": "supplied", "label": "Supplied"}],
+            },
+        }
+
+        report = build_report_html(summary, {}, Path("assistant_summary.json"))
+
+        self.assertIn("No meaningful improvement", report)
+        self.assertNotIn("0% better", report)
+        self.assertNotIn("Objective improvement</td><td><b>0.1%", report)
     def test_peq_report_leads_with_plain_language_and_fixed_anchor_graph(self) -> None:
         summary = {
             "search": {"mode": "peq"},
@@ -531,5 +615,191 @@ class GuiJobTests(unittest.TestCase):
         self.assertIn("Tonal accuracy", report)
 
 
+
+
+class RehabilitationCacheLaunchTests(unittest.TestCase):
+    def test_peq_runner_receives_one_shared_rehabilitation_cache_path(self):
+        config = RunConfig(
+            "C:\\Measurements", "C:\\baseline.afpx", "C:\\target.txt",
+            "C:\\run", mode="peq",
+        )
+
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+
+        self.assertEqual(args.count("-RehabilitationCache"), 1)
+        self.assertEqual(
+            args[args.index("-RehabilitationCache") + 1],
+            str(Path(config.run_root) / "rehabilitation_cache.json"),
+        )
+
+    def test_phase_runner_receives_no_rehabilitation_cache(self):
+        config = RunConfig(
+            "C:\\Measurements", "C:\\baseline.afpx", "C:\\target.txt",
+            "C:\\run", mode="phase",
+        )
+
+        _program, args = powershell_command(config, executable="C:\\python.exe")
+
+        self.assertNotIn("-RehabilitationCache", args)
+
+    def test_launcher_passes_shared_stop_file_to_cache_preparation(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "run_guided_stream_workers.ps1"
+        ).read_text(encoding="utf-8-sig")
+        preparation = script.split("scripts\\build_rehabilitation_cache.py", 1)[1]
+        preparation = preparation.split("& $pythonExe @rehabilitationArgs", 1)[0]
+
+        self.assertIn('"--stop-file", $stopFilePath', preparation)
+    def test_windows_paths_with_spaces_remain_single_runner_arguments(self):
+        config = RunConfig(
+            "C:\\Fresh Measurements\\RTA session",
+            "C:\\Fresh Measurements\\baseline tune.afpx",
+            "C:\\Target Curves\\target curve.txt",
+            "C:\\Optimizer Runs\\run one",
+            mode="peq",
+        )
+
+        _program, args = powershell_command(
+            config, executable="C:\\Python Runtime\\python.exe"
+        )
+
+        self.assertEqual(args[args.index("-DataRoot") + 1], config.data_root)
+        self.assertEqual(args[args.index("-Baseline") + 1], config.baseline)
+        self.assertEqual(args[args.index("-Root") + 1], config.run_root)
+
+
+class RehabilitationResultsTests(unittest.TestCase):
+    def test_candidate_rows_include_distinct_rehabilitated_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rehabilitated_baseline.afpx").write_bytes(b"rehabilitated")
+            (root / "candidate.afpx").write_bytes(b"final")
+            summary_path = root / "assistant_summary.json"
+            summary = {
+                "baseline": {"objective": 10.0},
+                "inputs": {"baseline": {"file": "baseline.afpx"}},
+                "rehabilitation": {
+                    "verdict": "meaningful_improvement",
+                    "file": "rehabilitated_baseline.afpx",
+                    "objective": 8.0,
+                    "comparison_stages": [
+                        {"key": "supplied", "label": "Supplied"},
+                        {"key": "rehabilitated", "label": "Existing tune improved"},
+                        {"key": "final", "label": "Final"},
+                    ],
+                },
+                "best": {"file": "candidate.afpx", "objective": 7.0},
+            }
+            rows = candidate_files(summary, summary_path)
+
+        self.assertEqual(
+            [row["role"] for row in rows[:3]],
+            ["Supplied", "Existing tune improved", "Final"],
+        )
+        self.assertEqual(
+            [row["comparison_stage"] for row in rows[:3]],
+            ["supplied", "rehabilitated", "final"],
+        )
+
+    def test_candidate_rows_omit_unchanged_final_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "candidate.afpx").write_bytes(b"unchanged")
+            summary_path = root / "assistant_summary.json"
+            summary = {
+                "baseline": {"objective": 10.0},
+                "inputs": {"baseline": {"file": "baseline.afpx"}},
+                "rehabilitation": {
+                    "verdict": "no_meaningful_improvement",
+                    "comparison_stages": [
+                        {"key": "supplied", "label": "Supplied"},
+                    ],
+                },
+                "best": {"file": "candidate.afpx", "objective": 9.99},
+            }
+            rows = candidate_files(summary, summary_path)
+
+        self.assertEqual([row["role"] for row in rows], ["Supplied"])
+    def test_results_window_loads_operation_markers_for_staged_run(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "candidate.afpx").write_bytes(b"final")
+            (root / "rehabilitated.afpx").write_bytes(b"rehabilitated")
+            summary_path = root / "assistant_summary.json"
+            summary_path.write_text(json.dumps({
+                "baseline": {"objective": 10.0},
+                "best": {
+                    "file": "candidate.afpx",
+                    "objective": 7.0,
+                    "components": {"objective": 7.0},
+                },
+                "rehabilitation": {
+                    "verdict": "meaningful_improvement",
+                    "file": "rehabilitated.afpx",
+                    "objective": 8.0,
+                    "comparison_stages": [
+                        {"key": "supplied", "label": "Supplied"},
+                        {"key": "rehabilitated", "label": "Existing tune improved"},
+                        {"key": "final", "label": "Final"},
+                    ],
+                    "accepted_operations": [{
+                        "operation": "append",
+                        "group": "low_sym",
+                        "old": None,
+                        "new": {"frequency_hz": 180.0, "q": 0.8, "gain_db": -1.0},
+                        "reason": "Supported residual correction.",
+                    }],
+                },
+                "details": {"optimizer_summary": "optimizer_summary.json"},
+                "search": {"mode": "peq"},
+            }), encoding="utf-8")
+            (root / "optimizer_summary.json").write_text(json.dumps({
+                "response_comparisons": {
+                    key: {
+                        "frequency_hz": [100.0, 1000.0],
+                        "baseline_error_db": [3.0, -2.0],
+                        "candidate_error_db": [2.0, -1.0],
+                        "raw_system_delta_db": [-1.0, 1.0],
+                    }
+                    for key in ("supplied", "rehabilitated", "final")
+                },
+            }), encoding="utf-8")
+            window = OptimizerWindow()
+            window._start_report_generation = lambda _path: None
+            try:
+                window.load_results(summary_path)
+                app.processEvents()
+                self.assertEqual(window.result_table.rowCount(), 3)
+                window.result_table.selectRow(2)
+                app.processEvents()
+                self.assertEqual(window.result_filters[0][1], 180.0)
+            finally:
+                window.close()
+    def test_stage_selection_returns_supplied_rehabilitated_and_final_curves(self):
+        full = {
+            "response_comparisons": {
+                "supplied": {
+                    "frequency_hz": [100.0, 1000.0],
+                    "candidate_error_db": [3.0, -2.0],
+                },
+                "rehabilitated": {
+                    "frequency_hz": [100.0, 1000.0],
+                    "candidate_error_db": [1.5, -1.5],
+                },
+                "final": {
+                    "frequency_hz": [100.0, 1000.0],
+                    "candidate_error_db": [1.0, -1.0],
+                },
+            },
+        }
+
+        plots = reporting.result_comparison_plots({}, full)
+
+        self.assertEqual(set(plots), {"supplied", "rehabilitated", "final"})
+        self.assertEqual(plots["rehabilitated"]["candidate_error_db"], [1.5, -1.5])
+        self.assertEqual(
+            response_chart_series(plots["final"])[1]["label"], "Final",
+        )
 if __name__ == "__main__":
     unittest.main()

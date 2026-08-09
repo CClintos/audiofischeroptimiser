@@ -26,6 +26,7 @@ import json
 import zlib
 import math
 from collections import Counter
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -922,6 +923,88 @@ def _casc(bands):
 # removing an existing filter is a deliberate, already-justified action,
 # not redundant filter-count bloat), so it can only ever reduce filter
 # count, never change what an edit or removal already decided.
+@dataclass(frozen=True)
+class ConsolidatedPeqFit:
+    replacement: tuple[float, float, float]
+    max_cascade_error_db: float
+    passband_mask: np.ndarray
+    overlap: bool
+
+
+def _peq_passband_mask(freqs, band):
+    magnitude = np.abs(peaking_db(freqs, *band))
+    threshold = max(0.01, min(3.0, abs(float(band[2])) * 0.5))
+    return magnitude >= threshold
+
+
+def fit_consolidated_peq_pair(first, second, *, freqs=None):
+    """Fit one canonical PEQ to an overlapping two-PEQ complex cascade."""
+    from scipy.optimize import least_squares
+
+    first = tuple(float(value) for value in first)
+    second = tuple(float(value) for value in second)
+    if freqs is None:
+        low = max(20.0, min(first[0], second[0]) / 4.0)
+        high = min(20000.0, max(first[0], second[0]) * 4.0)
+        freqs = np.geomspace(low, high, 2048)
+    else:
+        freqs = np.asarray(freqs, dtype=float)
+    first_mask = _peq_passband_mask(freqs, first)
+    second_mask = _peq_passband_mask(freqs, second)
+    passband = first_mask | second_mask
+    overlap = bool(np.any(first_mask & second_mask))
+    target = cascade_complex(freqs, (first, second))
+    selected = passband if np.any(passband) else np.ones_like(freqs, dtype=bool)
+
+    weights = np.asarray([abs(first[2]), abs(second[2])], dtype=float)
+    if float(np.sum(weights)) <= 1e-12:
+        weights[:] = 1.0
+    initial_frequency = float(np.exp(np.average(
+        np.log([first[0], second[0]]), weights=weights
+    )))
+    initial_q = float(np.average([first[1], second[1]], weights=weights))
+    initial_gain = float(np.clip(first[2] + second[2], -15.0, 6.0))
+
+    def residual(values):
+        frequency = math.exp(float(values[0]))
+        predicted = cascade_complex(
+            freqs, ((frequency, float(values[1]), float(values[2])),)
+        )
+        ratio = target / np.where(np.abs(predicted) > 1e-15, predicted, 1.0)
+        magnitude_db = 20.0 * np.log10(np.maximum(np.abs(ratio), 1e-15))
+        phase_db = 8.685889638 * np.unwrap(np.angle(ratio))
+        return np.concatenate((magnitude_db[selected], 0.2 * phase_db[selected]))
+
+    fitted = least_squares(
+        residual,
+        (math.log(initial_frequency), np.clip(initial_q, 0.5, 15.0), initial_gain),
+        bounds=(
+            (math.log(float(freqs[0])), 0.5, -15.0),
+            (math.log(float(freqs[-1])), 15.0, 6.0),
+        ),
+        max_nfev=400,
+        xtol=1e-12,
+        ftol=1e-12,
+        gtol=1e-12,
+    )
+    replacement = (
+        float(f"{math.exp(float(fitted.x[0])):.2f}"),
+        float(fitted.x[1]),
+        float(fitted.x[2]),
+    )
+    fitted_response = cascade_complex(freqs, (replacement,))
+    mismatch = 20.0 * np.log10(np.maximum(
+        np.abs(target / np.where(np.abs(fitted_response) > 1e-15, fitted_response, 1.0)),
+        1e-15,
+    ))
+    return ConsolidatedPeqFit(
+        replacement=replacement,
+        max_cascade_error_db=float(np.max(np.abs(mismatch[selected]))),
+        passband_mask=selected,
+        overlap=overlap,
+    )
+
+
 FILTER_SIMPLIFICATION_TOLERANCE_DB = 0.1
 
 

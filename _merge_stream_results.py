@@ -7,30 +7,62 @@ import json
 from pathlib import Path
 
 import _optimizer as opt
-from _optimizer_stream import build_rows, groups_from_json, interference_notes
+import baseline_rehabilitation as rehab
+from _optimizer_stream import (
+    beam_entry_from_json, build_rows, candidate_plan_from_json, configure_profile, interference_notes,
+    stream_input_fingerprint,
+)
 
 
-def load_worker_best(worker_dir: Path):
+def load_worker_payload(
+    worker_dir: Path, expected_fingerprint: str | None = None,
+):
     state = worker_dir / "stream_state.json"
     if not state.exists():
-        return []
-    payload = json.loads(state.read_text(encoding="utf-8"))
+        raise ValueError(f"{worker_dir.name} is missing stream_state.json")
+    try:
+        payload = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"{worker_dir.name} has an unreadable stream_state.json"
+        ) from exc
+    if expected_fingerprint is not None:
+        actual = payload.get("input_fingerprint")
+        if not actual:
+            raise ValueError(
+                f"{worker_dir.name} is missing input fingerprint"
+            )
+        if actual != expected_fingerprint:
+            raise ValueError(
+                f"{worker_dir.name} fingerprint does not match current inputs"
+            )
+    return payload
+
+
+def load_worker_best(
+    worker_dir: Path, expected_fingerprint: str | None = None,
+):
+    payload = load_worker_payload(worker_dir, expected_fingerprint)
     out = []
     for bucket in ("best", "archive"):
         for item in payload.get(bucket, []):
-            groups = groups_from_json(item.get("groups", {}))
-            out.append((float(item["objective"]), opt.bands_signature(groups), groups, worker_dir.name))
+            entry = beam_entry_from_json(item)
+            out.append((
+                float(entry.objective),
+                entry.signature,
+                entry.plan,
+                worker_dir.name,
+            ))
     return out
-
 
 def unique_best(items, keep):
     out = []
     seen = set()
-    for value, sig, groups, source in sorted(items, key=lambda x: x[0]):
+    for value, sig, plan, source in sorted(items, key=lambda x: x[0]):
         if sig in seen:
             continue
         seen.add(sig)
-        out.append((value, sig, groups, source))
+        out.append((value, sig, plan, source))
         if len(out) >= keep:
             break
     return out
@@ -55,7 +87,14 @@ def apply_census_gate(items, gate_active: bool):
     of what any individual worker's search still explored."""
     if not gate_active:
         return items
-    return [item for item in items if item[3] == "baseline"]
+    return [
+        item for item in items
+        if item[3] == "baseline"
+        or (
+            isinstance(item[2], rehab.CandidatePlan)
+            and bool(item[2].slot_edits)
+        )
+    ]
 
 
 def main():
@@ -67,6 +106,8 @@ def main():
     parser.add_argument("--target", type=Path, default=opt.DEFAULT_TARGET)
     parser.add_argument("--filter-cost-scale", type=float, default=0.1)
     parser.add_argument("--worst-weight", type=float, default=0.10)
+    parser.add_argument("--min-total-bands", type=int, default=0)
+    parser.add_argument("--profile", choices=("safe", "explore"), default="explore")
     parser.add_argument("--validation-threshold", type=float, default=2.5)
     parser.add_argument("--gate-ms", type=float, default=None,
                         help="Optional impulse/window gate length in milliseconds for confidence warnings.")
@@ -95,15 +136,24 @@ def main():
         args.repeatability_folder, level_calibration
     )
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
+    configure_profile(args.profile)
+    args.measurement_session = measurement_session
+    channel_roles = dict(opt.CH_TRACE)
+    channel_roles.update({6: "Left Sub", 7: "Right Sub"})
+    rehabilitation_config = opt.rehabilitation_config(
+        channel_roles, explore=args.profile == "explore"
+    )
+    expected_fingerprint = stream_input_fingerprint(
+        args, rehabilitation_config
+    )
     worker_dirs = sorted(p for p in args.root.glob("worker_*") if p.is_dir())
-    worker_state_payloads = []
-    for worker in worker_dirs:
-        state_path = worker / "stream_state.json"
-        if state_path.is_file():
-            try:
-                worker_state_payloads.append(json.loads(state_path.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
+    try:
+        worker_state_payloads = [
+            load_worker_payload(worker, expected_fingerprint)
+            for worker in worker_dirs
+        ]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     proposal_audits = [
         dict(payload.get("proposal_audit", {}))
         for payload in worker_state_payloads if payload.get("proposal_audit")
@@ -130,9 +180,17 @@ def main():
         }
     else:
         args.convergence = {}
+    rehabilitation_rows = [
+        dict(payload.get("rehabilitation", {}))
+        for payload in worker_state_payloads
+        if payload.get("rehabilitation")
+    ]
+    args.rehabilitation = (
+        rehabilitation_rows[0] if rehabilitation_rows else {}
+    )
     items = []
     for worker in worker_dirs:
-        items.extend(load_worker_best(worker))
+        items.extend(load_worker_best(worker, expected_fingerprint))
     if not items:
         raise SystemExit("No stream_state.json best candidates found under " + str(args.root))
 
@@ -165,27 +223,87 @@ def main():
         phase_plan,
         phase_valid,
     )
-    baseline_groups = {group: [] for group in opt.GROUPS}
+    baseline_plan = rehab.CandidatePlan()
+    score_plan = opt.make_candidate_plan_component_scorer(
+        opt.make_band_set_component_scorer(
+            freqs,
+            traces,
+            target,
+            args.filter_cost_scale,
+            args.worst_weight,
+        ),
+        freqs,
+        rich_traces,
+        phase_plan,
+        phase_valid,
+    )
+    try:
+        rehabilitation_plan = candidate_plan_from_json(
+            dict(args.rehabilitation).get("best_plan", {})
+        )
+    except (TypeError, ValueError, KeyError):
+        rehabilitation_plan = rehab.CandidatePlan()
+    rehabilitation_components = dict(score_plan(rehabilitation_plan))
+    args.rehabilitation_plan = rehabilitation_plan
+    args.rehabilitation_components = rehabilitation_components
+    if args.rehabilitation:
+        baseline_candidate = rehab.ScoredCandidate(
+            baseline_plan, dict(score_plan(baseline_plan))
+        )
+        rehabilitation_candidate = rehab.ScoredCandidate(
+            rehabilitation_plan, rehabilitation_components
+        )
+        args.rehabilitation["baseline_components"] = dict(
+            baseline_candidate.components
+        )
+        args.rehabilitation["best_components"] = dict(
+            rehabilitation_candidate.components
+        )
+        args.rehabilitation["meaningful_improvement"] = rehab.meaningfully_better(
+            rehabilitation_candidate, baseline_candidate
+        )
+    baseline_components = dict(score_plan(baseline_plan))
     items.append((
-        float(component_score(baseline_groups)["objective"]),
-        opt.bands_signature(baseline_groups),
-        baseline_groups,
+        float(baseline_components["objective"]),
+        rehab.candidate_plan_signature(baseline_plan),
+        baseline_plan,
         "baseline",
     ))
-    items = apply_census_gate(items, args.census_found_nothing_eligible)
+    items = apply_census_gate(
+        items, args.census_found_nothing_eligible
+    )
 
     rescored_items = []
     phase_peq_rejections = []
-    for _stored_value, sig, groups, source in items:
+    for _stored_value, _sig, plan, source in items:
+        groups = {group: [] for group in opt.GROUPS}
+        groups.update(rehab.thaw_groups(plan.groups))
         if phase_valid and phase_plan:
-            if not opt.complex_crossover_verification(freqs, rich_traces, groups, phase_plan)["pass"]:
+            if not opt.complex_crossover_verification(
+                freqs, rich_traces, groups, phase_plan
+            )["pass"]:
                 continue
         else:
-            conflicts = opt.phase_peq_conflicts(freqs, groups, phase_plan)
+            conflicts = opt.phase_peq_conflicts(
+                freqs, groups, phase_plan
+            )
             if conflicts:
                 phase_peq_rejections.extend(conflicts)
                 continue
-        rescored_items.append((component_score(groups)["objective"], sig, groups, source))
+        components = dict(score_plan(plan))
+        if components.get("phase_peq_conflict_count", 0.0) > 0.0:
+            phase_peq_rejections.extend(
+                opt.candidate_plan_phase_conflicts(
+                    freqs, plan, phase_plan
+                )
+            )
+            continue
+        rescored_items.append((
+            float(components["objective"]),
+            rehab.candidate_plan_signature(plan),
+            plan,
+            source,
+        ))
     if not rescored_items:
         raise SystemExit("Every stored candidate conflicts with an attached crossover phase write")
     family_pool = unique_best(rescored_items, max(args.top * 10, 200))
@@ -196,13 +314,19 @@ def main():
         old.unlink()
 
     rows = []
-    for rank, (value, sig, groups, source) in enumerate(best, start=1):
-        pred = opt.predict_traces(freqs, traces, groups)
+    for rank, (value, sig, plan, source) in enumerate(best, start=1):
+        groups = {group: [] for group in opt.GROUPS}
+        groups.update(rehab.thaw_groups(plan.groups))
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
-        components = component_score(groups)
-        file_name = f"candidate_{rank:02d}_objective_{value:.4f}_{source}.afpx"
+        components = dict(score_plan(plan))
+        file_name = (
+            f"candidate_{rank:02d}_objective_{value:.4f}_{source}.afpx"
+        )
         path = out_dir / file_name
-        lint = opt.write_candidate(base_xml, path, groups, phase_plan=phase_plan)
+        lint = opt.write_candidate_plan(
+            base_xml, path, plan, phase_plan=phase_plan
+        )
         rows.append({
             "rank": rank,
             "file": file_name,
@@ -210,41 +334,84 @@ def main():
             "score": score,
             "components": components,
             "groups": groups,
+            "plan": plan,
             "signature": sig,
             "lint": lint,
-            "headroom": {g: opt.headroom_report(freqs, b) for g, b in groups.items()},
+            "headroom": opt.candidate_plan_headroom(freqs, plan),
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
     family_rows = []
-    for rank, (value, sig, groups, source) in enumerate(family_pool, start=1):
-        pred = opt.predict_traces(freqs, traces, groups)
+    for rank, (value, sig, plan, source) in enumerate(
+        family_pool, start=1
+    ):
+        groups = {group: [] for group in opt.GROUPS}
+        groups.update(rehab.thaw_groups(plan.groups))
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
-        components = component_score(groups)
+        components = dict(score_plan(plan))
         family_rows.append({
             "rank": rank,
-            "file": f"candidate_{rank:02d}_objective_{value:.4f}_{source}.afpx",
+            "file": (
+                f"candidate_{rank:02d}_objective_"
+                f"{value:.4f}_{source}.afpx"
+            ),
             "objective": value,
             "score": score,
             "components": components,
             "groups": groups,
+            "plan": plan,
             "signature": sig,
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
+    rehabilitation_file = ""
+    if rows:
+        final_plan = rows[0]["plan"]
+        empty_signature = rehab.candidate_plan_signature(rehab.CandidatePlan())
+        rehabilitation_signature = rehab.candidate_plan_signature(
+            rehabilitation_plan
+        )
+        final_signature = rehab.candidate_plan_signature(final_plan)
+        if (
+            rehabilitation_signature != empty_signature
+            and rehabilitation_signature != final_signature
+        ):
+            rehabilitation_file = "rehabilitated_baseline.afpx"
+            opt.write_candidate_plan(
+                base_xml,
+                out_dir / rehabilitation_file,
+                rehabilitation_plan,
+                phase_plan=phase_plan,
+            )
+    if args.rehabilitation:
+        args.rehabilitation["file"] = rehabilitation_file
+        args.rehabilitation["objective"] = float(
+            rehabilitation_components["objective"]
+        )
     opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
     voicing_variants = []
     if args.voicing_variants == "audition" and best:
-        voicing_variants = opt.write_voicing_variants(out_dir, base_xml, best[0][2], phase_plan)
+        best_plan = best[0][2]
+        variant_base = rehab.apply_slot_edits(
+            base_xml, best_plan.slot_edits
+        )
+        voicing_variants = opt.write_voicing_variants(
+            out_dir,
+            variant_base,
+            rehab.thaw_groups(best_plan.groups),
+            phase_plan,
+        )
     sub_blend = None
     if args.sub_blend == "recommend":
         sub_blend = opt.same_level_sub_blend_recommendation(
             freqs, traces, target, measurement_session, args.headroom_db
         )
 
+    baseline_groups = {group: [] for group in opt.GROUPS}
     baseline_pred = opt.predict_traces(freqs, traces, baseline_groups)
     baseline_score = opt.tune_scorecard(freqs, baseline_pred, target)
-    baseline_score["components"] = component_score(baseline_groups)
+    baseline_score["components"] = baseline_components
     ns = argparse.Namespace(
         baseline=args.baseline,
         target=args.target,
@@ -271,6 +438,7 @@ def main():
         # the DEFECT 4b hard gate above; see CHANGELOG.md.
         proposal_audit=args.proposal_audit,
         census_found_nothing_eligible=args.census_found_nothing_eligible,
+        rehabilitation=args.rehabilitation,
     )
     opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns,
                      family_rows=family_rows, crossover_rows=crossover_rows, phase_plan=phase_plan)

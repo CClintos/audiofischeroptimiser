@@ -7,12 +7,14 @@ so RAM stays flat: each worker keeps only the best candidates it has seen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
 import os
 import time
 from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import Dict, List, Tuple
 
 for _var in (
@@ -28,6 +30,7 @@ for _var in (
 import numpy as np
 
 import _optimizer as opt
+import baseline_rehabilitation as rehab
 
 try:
     from cmaes import CMA
@@ -37,6 +40,631 @@ except ImportError:  # Keep random/guided modes usable if the optional backend i
 
 GroupBands = Dict[str, List[Tuple[float, float, float]]]
 LAST_PROPOSAL_AUDIT: Dict[str, object] = {}
+
+
+@dataclass(frozen=True)
+class BeamEntry:
+    objective: float
+    signature: tuple
+    plan: rehab.CandidatePlan
+    components: dict[str, object]
+
+    @property
+    def groups(self) -> GroupBands:
+        groups = {group: [] for group in opt.GROUPS}
+        groups.update(rehab.thaw_groups(self.plan.groups))
+        return groups
+
+    def __iter__(self):
+        yield self.objective
+        yield self.signature
+        yield self.groups
+
+    def __getitem__(self, index):
+        return (self.objective, self.signature, self.groups)[index]
+
+
+@dataclass(frozen=True)
+class RehabilitationBudget:
+    seconds: float
+    max_evaluations: int
+
+
+def rehabilitation_budget(total_seconds: float | None) -> RehabilitationBudget:
+    total = max(0.0, float(total_seconds or 0.0))
+    if total <= 0.0:
+        return RehabilitationBudget(180.0, 2500)
+    seconds = min(max(total * 0.25, 5.0), 180.0)
+    if total < 20.0:
+        seconds = min(seconds, total * 0.5)
+        evaluations = max(16, int(max(total, 1.0) * 20))
+    else:
+        evaluations = 2500
+    return RehabilitationBudget(float(seconds), int(evaluations))
+
+
+def _band_to_json(band):
+    return [float(value) for value in band]
+
+
+def _filter_ref_to_json(ref):
+    return {
+        "channel": int(ref.channel),
+        "slot": int(ref.slot),
+        "role": str(ref.role),
+        "filter_type": str(ref.filter_type),
+        "original": _band_to_json(ref.original),
+        "pair_key": ref.pair_key,
+    }
+
+
+def _filter_ref_from_json(payload):
+    return rehab.FilterRef(
+        channel=int(payload["channel"]),
+        slot=int(payload["slot"]),
+        role=str(payload["role"]),
+        filter_type=str(payload["filter_type"]),
+        original=tuple(float(value) for value in payload["original"]),
+        pair_key=payload.get("pair_key"),
+    )
+
+
+def candidate_plan_to_json(plan):
+    return {
+        "slot_edits": [
+            {
+                "ref": _filter_ref_to_json(edit.ref),
+                "replacement": (
+                    None if edit.replacement is None
+                    else _band_to_json(edit.replacement)
+                ),
+            }
+            for edit in plan.slot_edits
+        ],
+        "groups": {
+            group: [_band_to_json(band) for band in bands]
+            for group, bands in plan.groups
+        },
+    }
+
+
+def candidate_plan_from_json(payload):
+    payload = dict(payload or {})
+    edits = []
+    for row in payload.get("slot_edits", []):
+        replacement = row.get("replacement")
+        edits.append(rehab.SlotEdit(
+            ref=_filter_ref_from_json(row["ref"]),
+            replacement=(
+                None if replacement is None
+                else tuple(float(value) for value in replacement)
+            ),
+        ))
+    raw_groups = dict(payload.get("groups", {}))
+    groups = {
+        str(group): [
+            tuple(float(value) for value in band)
+            for band in bands
+        ]
+        for group, bands in raw_groups.items()
+    }
+    return rehab.CandidatePlan(
+        slot_edits=tuple(edits),
+        groups=rehab.freeze_groups(groups),
+    )
+
+
+def beam_entry_to_json(entry):
+    if not isinstance(entry, BeamEntry):
+        value, _signature, groups = entry
+        plan = rehab.CandidatePlan(groups=rehab.freeze_groups(groups))
+        entry = BeamEntry(
+            float(value), rehab.candidate_plan_signature(plan), plan,
+            {"objective": float(value)},
+        )
+    return {
+        "objective": float(entry.objective),
+        "plan": candidate_plan_to_json(entry.plan),
+        "groups": serializable_groups(entry.groups),
+        "components": _json_safe(entry.components),
+    }
+
+
+def beam_entry_from_json(payload, score_plan=None, component_score=None):
+    if "plan" in payload:
+        plan = candidate_plan_from_json(payload.get("plan"))
+    else:
+        groups = groups_from_json(payload.get("groups", {}))
+        plan = rehab.CandidatePlan(groups=rehab.freeze_groups(groups))
+    if score_plan is not None:
+        components = dict(score_plan(plan))
+    elif component_score is not None:
+        components = dict(component_score(rehab.thaw_groups(plan.groups)))
+    else:
+        components = dict(payload.get("components", {}))
+        components.setdefault("objective", float(payload["objective"]))
+    return BeamEntry(
+        objective=float(components["objective"]),
+        signature=rehab.candidate_plan_signature(plan),
+        plan=plan,
+        components=components,
+    )
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _input_path_fingerprint(path):
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    if path.is_file():
+        return {
+            "path": str(path),
+            "kind": "file",
+            "content": opt.file_fingerprint(path),
+        }
+    if path.is_dir():
+        return {
+            "path": str(path),
+            "kind": "folder",
+            "files": [
+                {
+                    "relative_path": item.relative_to(path).as_posix(),
+                    "content": opt.file_fingerprint(item),
+                }
+                for item in sorted(
+                    (candidate for candidate in path.rglob("*") if candidate.is_file()),
+                    key=lambda candidate: candidate.relative_to(path).as_posix().lower(),
+                )
+            ],
+        }
+    return {"path": str(path), "kind": "missing"}
+
+def stream_input_fingerprint_payload(args, rehabilitation_config):
+    manifest = dict(
+        getattr(args, "measurement_session", {}).get("manifest", {})
+    )
+    return {
+        "baseline": opt.file_fingerprint(args.baseline),
+        "target": opt.file_fingerprint(args.target),
+        "role_map": manifest.get("resolved_roles", {}),
+        "measurement_manifest": manifest,
+        "measurement_files": {
+            str(role): opt.file_fingerprint(Path(str(path)))
+            for role, path in dict(
+                manifest.get("resolved_roles", {})
+            ).items()
+        },
+        "objective": {
+            "filter_cost_scale": float(args.filter_cost_scale),
+            "worst_weight": float(args.worst_weight),
+            "min_total_bands": int(args.min_total_bands),
+        },
+        "rehabilitation_config": _json_safe(
+            rehabilitation_config.__dict__
+        ),
+        "measurement_session_audit": dict(
+            getattr(args, "measurement_session", {}).get("audit", {})
+        ),
+        "level_calibration": {
+            "source": _input_path_fingerprint(
+                getattr(args, "level_calibration", None)
+            ),
+            "loaded_values": _json_safe(
+                getattr(args, "loaded_level_calibration", {})
+            ),
+        },
+        "repeatability": {
+            "source": _input_path_fingerprint(
+                getattr(args, "repeatability_folder", None)
+            ),
+            "model": _json_safe(
+                getattr(args, "measurement_noise_guard", {})
+            ),
+        },
+        "phase_context": {
+            "writes": str(getattr(args, "phase_writes", "off")),
+            "sample_rate": float(getattr(args, "sample_rate", 96000.0)),
+            "cache": (
+                opt.file_fingerprint(Path(args.phase_cache))
+                if getattr(args, "phase_cache", None)
+                else None
+            ),
+        },
+        "mode": str(args.mode),
+        "profile": str(args.profile),
+    }
+
+
+def stream_input_fingerprint(args, rehabilitation_config):
+    payload = stream_input_fingerprint_payload(
+        args, rehabilitation_config
+    )
+    encoded = json.dumps(
+        _json_safe(payload), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def rehabilitation_state_payload(stage, config):
+    result = stage.get("result")
+    census = tuple(stage.get("census", ()))
+    operation_candidates = [
+        candidate
+        for row in census
+        for candidate in row.candidates
+    ]
+    candidates = () if result is None else result.candidates
+    baseline_components = (
+        {} if result is None else dict(result.baseline.components)
+    )
+    best_components = (
+        dict(baseline_components) if result is None else dict(result.best.components)
+    )
+    meaningful_improvement = bool(
+        result is not None
+        and rehab.meaningfully_better(result.best, result.baseline)
+    )
+    gate_rejections = [
+        {
+            "channel": int(row.ref.channel),
+            "channel_role": str(row.ref.role),
+            "slot": int(row.ref.slot),
+            "reason": str(row.probe_skip_reason),
+        }
+        for row in census
+        if row.probe_skip_reason
+    ]
+    return {
+        "status": str(stage.get("status", "unknown")),
+        "completion_status": str(stage.get("status", "unknown")),
+        "evaluations": int(stage.get("evaluations", 0)),
+        "meaningful_improvement": meaningful_improvement,
+        "baseline_components": _json_safe(baseline_components),
+        "best_components": _json_safe(best_components),
+        "gate_rejections": gate_rejections,
+        "config": _json_safe(config.__dict__),
+        "census": [
+            {
+                "ref": _filter_ref_to_json(row.ref),
+                "paired_ref": (
+                    None
+                    if row.paired_ref is None
+                    else _filter_ref_to_json(row.paired_ref)
+                ),
+                "retained_candidates": len(row.candidates),
+            }
+            for row in census
+        ],
+        "retained_operation_candidates": [
+            {
+                "plan": candidate_plan_to_json(candidate.plan),
+                "components": _json_safe(candidate.components),
+            }
+            for candidate in operation_candidates
+        ],
+        "candidate_plans": [
+            candidate_plan_to_json(candidate.plan)
+            for candidate in candidates
+        ],
+        "best_plan": candidate_plan_to_json(stage["best_plan"]),
+    }
+
+
+
+REHABILITATION_CACHE_SCHEMA = "audiofischer-rehabilitation-cache-v1"
+
+
+def rehabilitation_cache_payload(
+    stage, config, fingerprint, fingerprint_inputs
+):
+    state = rehabilitation_state_payload(stage, config)
+    result = stage.get("result")
+    state["census_detail"] = [
+        {
+            "ref": _filter_ref_to_json(row.ref),
+            "paired_ref": (
+                None
+                if row.paired_ref is None
+                else _filter_ref_to_json(row.paired_ref)
+            ),
+            "baseline_components": _json_safe(row.baseline_components),
+            "removal_components": _json_safe(row.removal_components),
+            "probe_band": (
+                None if row.probe_band is None else _band_to_json(row.probe_band)
+            ),
+            "probe_components": _json_safe(row.probe_components),
+            "probe_skip_reason": row.probe_skip_reason,
+            "system_delta": row.system_delta,
+            "balance_delta": row.balance_delta,
+            "headroom_delta": row.headroom_delta,
+            "retained_candidates": [
+                {
+                    "plan": candidate_plan_to_json(candidate.plan),
+                    "components": _json_safe(candidate.components),
+                }
+                for candidate in row.candidates
+            ],
+        }
+        for row in stage.get("census", ())
+    ]
+    state["scored_candidates"] = [
+        {
+            "plan": candidate_plan_to_json(candidate.plan),
+            "components": _json_safe(candidate.components),
+            "depth": int(candidate.depth),
+            "export_eligible": bool(candidate.export_eligible),
+        }
+        for candidate in (() if result is None else result.candidates)
+    ]
+    return {
+        "schema": REHABILITATION_CACHE_SCHEMA,
+        "fingerprint": str(fingerprint),
+        "fingerprint_inputs": _json_safe(fingerprint_inputs),
+        "config": _json_safe(config.__dict__),
+        "rehabilitation": state,
+    }
+
+
+def load_rehabilitation_cache(path, expected_fingerprint):
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"rehabilitation cache is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"rehabilitation cache is malformed: {path}")
+    if payload.get("schema") != REHABILITATION_CACHE_SCHEMA:
+        raise RuntimeError(
+            f"rehabilitation cache schema is unsupported: {path}"
+        )
+    actual = str(payload.get("fingerprint", ""))
+    if actual != str(expected_fingerprint):
+        raise RuntimeError(
+            "rehabilitation cache fingerprint mismatch: "
+            f"expected {expected_fingerprint}, found {actual or 'missing'}"
+        )
+    state = payload.get("rehabilitation")
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: missing rehabilitation state: {path}"
+        )
+    if state.get("completion_status") not in (
+        "complete", "no_eligible_filters"
+    ):
+        raise RuntimeError(
+            "rehabilitation cache is incomplete: "
+            f"{state.get('completion_status', 'missing')}"
+        )
+    try:
+        best_plan = candidate_plan_from_json(state["best_plan"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"rehabilitation cache is malformed: invalid best plan: {path}"
+        ) from exc
+    return {
+        "fingerprint": actual,
+        "fingerprint_inputs": payload.get("fingerprint_inputs", {}),
+        "best_plan": best_plan,
+        "rehabilitation": state,
+        "payload": payload,
+    }
+
+
+def compact_rehabilitation_cache_state(loaded, path):
+    state = dict(loaded["rehabilitation"])
+    for key in (
+        "census_detail",
+        "scored_candidates",
+        "retained_operation_candidates",
+        "candidate_plans",
+    ):
+        state.pop(key, None)
+    state["cache_path"] = str(Path(path).resolve())
+    state["cache_fingerprint"] = str(loaded["fingerprint"])
+    return state
+
+
+def build_or_load_rehabilitation_cache(
+    path,
+    *,
+    expected_fingerprint,
+    fingerprint_inputs,
+    config,
+    build_stage,
+    stop_requested=None,
+    lock_timeout_seconds=7200.0,
+):
+    path = Path(path)
+    stop_requested = stop_requested or (lambda: False)
+
+    def check_cancelled():
+        if stop_requested():
+            raise RuntimeError("rehabilitation cache preparation cancelled")
+
+    check_cancelled()
+    if path.exists():
+        return load_rehabilitation_cache(path, expected_fingerprint)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    temporary = None
+    owns_lock = False
+    wait_deadline = time.monotonic() + max(0.1, float(lock_timeout_seconds))
+    while not owns_lock:
+        check_cancelled()
+        if path.exists():
+            return load_rehabilitation_cache(path, expected_fingerprint)
+        try:
+            descriptor = os.open(
+                lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+        except FileExistsError:
+            try:
+                owner_pid = int(lock_path.read_text(encoding="ascii").strip())
+                owner_alive = owner_pid == os.getpid()
+                if not owner_alive:
+                    try:
+                        os.kill(owner_pid, 0)
+                        owner_alive = True
+                    except (OSError, OverflowError):
+                        owner_alive = False
+                if not owner_alive:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except (OSError, ValueError):
+                pass
+            if time.monotonic() >= wait_deadline:
+                raise RuntimeError(
+                    f"timed out waiting for rehabilitation cache preparation: {path}"
+                )
+            time.sleep(0.025)
+            continue
+        try:
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(descriptor)
+        owns_lock = True
+
+    try:
+        check_cancelled()
+        if path.exists():
+            return load_rehabilitation_cache(path, expected_fingerprint)
+        for orphan in path.parent.glob(f"{path.name}.*.tmp"):
+            orphan.unlink(missing_ok=True)
+        stage = build_stage()
+        check_cancelled()
+        payload = rehabilitation_cache_payload(
+            stage, config, expected_fingerprint, fingerprint_inputs
+        )
+        temporary = path.with_name(
+            f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        check_cancelled()
+        temporary.replace(path)
+        temporary = None
+        return load_rehabilitation_cache(path, expected_fingerprint)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if owns_lock:
+            lock_path.unlink(missing_ok=True)
+
+
+def saved_rehabilitation_plan(path, expected_fingerprint):
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        payload.get("version") != 7
+        or payload.get("input_fingerprint") != expected_fingerprint
+    ):
+        return None
+    state = dict(payload.get("rehabilitation", {}))
+    if state.get("status") not in (
+        "complete", "no_eligible_filters", "not_applicable"
+    ):
+        return None
+    try:
+        return candidate_plan_from_json(state.get("best_plan", {})), state
+    except (KeyError, TypeError, ValueError):
+        return None
+
+def run_rehabilitation_stage(
+    *, mode, refs, score_plan, total_seconds, config=None,
+    asymmetry_eligible=None, stop_requested=None,
+):
+    if mode != "peq":
+        return {
+            "status": "not_applicable",
+            "evaluations": 0,
+            "best_plan": rehab.CandidatePlan(),
+            "result": None,
+            "census": (),
+        }
+    refs = tuple(refs)
+    if not refs:
+        return {
+            "status": "no_eligible_filters",
+            "evaluations": 1,
+            "best_plan": rehab.CandidatePlan(),
+            "result": None,
+            "census": (),
+        }
+    budget = rehabilitation_budget(total_seconds)
+    cfg = config or rehab.RehabilitationConfig()
+    cfg = replace(
+        cfg,
+        max_evaluations_per_slot=min(
+            int(cfg.max_evaluations_per_slot), budget.max_evaluations
+        ),
+    )
+    deadline = time.monotonic() + budget.seconds
+    evaluations = 0
+    stop_requested = stop_requested or (lambda: False)
+
+    def check_cancelled():
+        if stop_requested():
+            raise RuntimeError("rehabilitation cache preparation cancelled")
+
+    def counted_score_plan(plan):
+        nonlocal evaluations
+        check_cancelled()
+        evaluations += 1
+        return score_plan(plan)
+
+    census = rehab.build_filter_census(
+        refs,
+        counted_score_plan,
+        cfg,
+        asymmetry_eligible=asymmetry_eligible,
+        deadline=deadline,
+    )
+    operations = tuple(
+        candidate
+        for row in census
+        for candidate in row.candidates
+    )
+    check_cancelled()
+
+    result = rehab.rehabilitation_beam(
+        rehab.CandidatePlan(),
+        operations,
+        counted_score_plan,
+        beam_width=16,
+        max_depth=4,
+        deadline=deadline,
+    )
+    return {
+        "status": "complete",
+        "evaluations": int(evaluations),
+        "best_plan": result.best.plan,
+        "result": result,
+        "census": census,
+    }
 
 
 def configure_profile(profile: str) -> None:
@@ -721,63 +1349,138 @@ def search_budgets(pools, pool_limit: int, beam_width: int) -> dict[str, dict[st
     return budgets
 
 
-def deterministic_beam_combinations(pools, component_score, beam_width: int = 24,
-                                    pool_limit: int | dict[str, int] = 6,
-                                    beam_budgets: dict[str, dict[str, int]] | None = None,
-                                    deadline: float | None = None,
-                                    order_seed: int | None = None, stop_requested=None):
-    """Build exact guided-band combinations while retaining best partial tunes."""
-    empty = {group: [] for group in opt.GROUPS}
-    beam = [(float(component_score(empty)["objective"]), opt.bands_signature(empty), empty)]
-    evaluations = 1
-    score_cache = {beam[0][1]: beam[0][0]}
+def deterministic_beam_combinations(
+    pools,
+    component_score=None,
+    beam_width: int = 24,
+    pool_limit: int | dict[str, int] = 6,
+    beam_budgets: dict[str, dict[str, int]] | None = None,
+    deadline: float | None = None,
+    order_seed: int | None = None,
+    stop_requested=None,
+    *,
+    score_plan=None,
+    seed_plans=None,
+):
+    """Build exact guided combinations without losing baseline slot edits."""
+    if score_plan is None:
+        if component_score is None:
+            raise TypeError("component_score or score_plan is required")
+
+        def score_plan(plan):
+            return component_score(rehab.thaw_groups(plan.groups))
+
+    seeds = tuple(seed_plans or (rehab.CandidatePlan(),))
+    beam = []
+    score_cache = {}
+    evaluations = 0
+
+    def evaluate(plan):
+        nonlocal evaluations
+        signature = rehab.candidate_plan_signature(plan)
+        components = score_cache.get(signature)
+        if components is None:
+            components = dict(score_plan(plan))
+            score_cache[signature] = components
+            evaluations += 1
+        return BeamEntry(
+            float(components["objective"]), signature, plan, dict(components)
+        )
+
+    for plan in seeds:
+        entry = evaluate(plan)
+        if all(entry.signature != existing.signature for existing in beam):
+            beam.append(entry)
+    beam.sort(key=lambda entry: (entry.objective, entry.signature))
+    beam = beam[:max(1, int(beam_width))]
+
     group_names = list(opt.GROUPS)
     if order_seed is not None and len(group_names) > 1:
         order_rng = np.random.default_rng(int(order_seed))
-        group_names = [group_names[index] for index in order_rng.permutation(len(group_names))]
+        group_names = [
+            group_names[index]
+            for index in order_rng.permutation(len(group_names))
+        ]
     for group in group_names:
         cfg = opt.GROUPS[group]
         group_pool_limit = (
-            int(pool_limit.get(group, 0)) if isinstance(pool_limit, dict)
-            else int((beam_budgets or {}).get(group, {}).get("pool_limit", pool_limit))
+            int(pool_limit.get(group, 0))
+            if isinstance(pool_limit, dict)
+            else int(
+                (beam_budgets or {}).get(group, {}).get(
+                    "pool_limit", pool_limit
+                )
+            )
         )
         group_beam_width = int(
-            (beam_budgets or {}).get(group, {}).get("beam_width", beam_width)
+            (beam_budgets or {}).get(group, {}).get(
+                "beam_width", beam_width
+            )
         )
-        candidates = sorted(pools.get(group, []), key=lambda item: -item["strength"])[:max(0, group_pool_limit)]
-        bands = [opt.rounded_band(item["F"], item["Q"], item["G"]) for item in candidates]
+        candidates = sorted(
+            pools.get(group, []), key=lambda item: -item["strength"]
+        )[:max(0, group_pool_limit)]
+        bands = [
+            opt.rounded_band(item["F"], item["Q"], item["G"])
+            for item in candidates
+        ]
         bands = [band for band in bands if band is not None]
         options = [()]
         max_active = min(int(cfg["max_bands"]), len(bands), 2)
         for count in range(1, max_active + 1):
             options.extend(itertools.combinations(bands, count))
+
         expanded = []
-        for _value, _signature, partial in beam:
+        for partial in beam:
             for option in options:
-                if stop_requested is not None and stop_requested():
+                if (
+                    stop_requested is not None and stop_requested()
+                ) or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
                     candidates_now = beam + expanded
-                    return sorted(candidates_now, key=lambda item: (item[0], item[1]))[:max(1, int(beam_width))], evaluations
-                if deadline is not None and time.monotonic() >= deadline:
-                    candidates_now = beam + expanded
-                    unique_now = {}
-                    for entry in sorted(candidates_now, key=lambda item: (item[0], item[1])):
-                        unique_now.setdefault(entry[1], entry)
-                    return list(unique_now.values())[:max(1, int(beam_width))], evaluations
-                groups = _copy_groups(partial)
+                    unique = {
+                        entry.signature: entry
+                        for entry in sorted(
+                            candidates_now,
+                            key=lambda item: (
+                                item.objective, item.signature
+                            ),
+                        )
+                    }
+                    return list(unique.values())[
+                        :max(1, int(beam_width))
+                    ], evaluations
+                groups = partial.groups
                 groups[group] = sorted(option, key=lambda band: band[0])
-                signature = opt.bands_signature(groups)
-                value = score_cache.get(signature)
-                if value is None:
-                    value = float(component_score(groups)["objective"])
-                    score_cache[signature] = value
-                    evaluations += 1
-                expanded.append((value, signature, groups))
+                plan = rehab.CandidatePlan(
+                    slot_edits=partial.plan.slot_edits,
+                    groups=rehab.freeze_groups(groups),
+                )
+                expanded.append(evaluate(plan))
+
         unique = {}
-        for entry in sorted(expanded, key=lambda item: (item[0], item[1])):
-            unique.setdefault(entry[1], entry)
+        for entry in sorted(
+            expanded,
+            key=lambda item: (item.objective, item.signature),
+        ):
+            unique.setdefault(entry.signature, entry)
         beam = list(unique.values())[:max(1, group_beam_width)]
     return beam, evaluations
 
+def guided_continuation_plans(groups, lineages):
+    frozen_groups = rehab.freeze_groups(groups)
+    plans = []
+    seen = set()
+    for lineage in lineages:
+        plan = rehab.CandidatePlan(
+            slot_edits=lineage.slot_edits, groups=frozen_groups
+        )
+        signature = rehab.candidate_plan_signature(plan)
+        if signature not in seen:
+            seen.add(signature)
+            plans.append(plan)
+    return tuple(plans)
 
 def beam_uses_timed_guided_continuation(proposal: str, mode: str) -> bool:
     """Whether a normal PEQ Beam pass should use the remaining run budget.
@@ -1006,19 +1709,46 @@ def coordinate_refine(groups: GroupBands, component_score, passes: int = 2):
     return current, current_components, evaluations
 
 
-def refine_entries(entries, component_score, top: int, passes: int):
+def refine_entries(entries, score_plan, top: int, passes: int):
     refined = []
     improved = 0
     evaluations = 0
     best_before = float(entries[0][0]) if entries else None
-    for value, _signature, groups in entries[:max(0, int(top))]:
-        new_groups, components, used = coordinate_refine(groups, component_score, passes=passes)
+    for entry in entries[:max(0, int(top))]:
+        value, _signature, groups = entry
+        base_plan = (
+            entry.plan
+            if isinstance(entry, BeamEntry)
+            else rehab.CandidatePlan(groups=rehab.freeze_groups(groups))
+        )
+
+        def score_groups(candidate_groups):
+            plan = rehab.CandidatePlan(
+                slot_edits=base_plan.slot_edits,
+                groups=rehab.freeze_groups(candidate_groups),
+            )
+            return score_plan(plan)
+
+        new_groups, components, used = coordinate_refine(
+            groups, score_groups, passes=passes
+        )
         evaluations += used
         new_value = float(components["objective"])
         if new_value + 1e-12 < float(value):
             improved += 1
-        refined.append((new_value, opt.bands_signature(new_groups), new_groups))
-    best_after = min((float(item[0]) for item in refined), default=best_before)
+        new_plan = rehab.CandidatePlan(
+            slot_edits=base_plan.slot_edits,
+            groups=rehab.freeze_groups(new_groups),
+        )
+        refined.append(BeamEntry(
+            new_value,
+            rehab.candidate_plan_signature(new_plan),
+            new_plan,
+            dict(components),
+        ))
+    best_after = min(
+        (float(item[0]) for item in refined), default=best_before
+    )
     report = {
         "enabled": bool(top > 0 and passes > 0),
         "seed_candidates": min(len(entries), max(0, int(top))),
@@ -1029,7 +1759,6 @@ def refine_entries(entries, component_score, top: int, passes: int):
         "best_after": best_after,
     }
     return refined, report
-
 
 ARCHIVE_KEYS = (
     "pareto_tonal_db",
@@ -1114,14 +1843,36 @@ def insert_archive(archive, score_map, item, components, archive_size):
     return archive, score_map
 
 
-def build_rows(freqs, traces, target, best, component_score=None):
+def build_rows(
+    freqs,
+    traces,
+    target,
+    best,
+    component_score=None,
+    *,
+    score_plan=None,
+):
     if component_score is None:
         component_score = opt.make_component_scorer(freqs, traces, target)
     rows = []
-    for rank, (value, signature, groups) in enumerate(best, start=1):
-        pred = opt.predict_traces(freqs, traces, groups)
+    for rank, entry in enumerate(best, start=1):
+        value, signature, groups = entry
+        plan = (
+            entry.plan
+            if isinstance(entry, BeamEntry)
+            else rehab.CandidatePlan(groups=rehab.freeze_groups(groups))
+        )
+        pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
-        components = component_score(groups)
+        components = (
+            dict(entry.components)
+            if isinstance(entry, BeamEntry)
+            else dict(
+                score_plan(plan)
+                if score_plan is not None
+                else component_score(groups)
+            )
+        )
         rows.append({
             "rank": rank,
             "file": f"candidate_{rank:02d}_objective_{value:.4f}.afpx",
@@ -1129,13 +1880,13 @@ def build_rows(freqs, traces, target, best, component_score=None):
             "score": score,
             "components": components,
             "groups": groups,
+            "plan": plan,
             "signature": signature,
             "lint": None,
-            "headroom": {g: opt.headroom_report(freqs, b) for g, b in groups.items()},
+            "headroom": opt.candidate_plan_headroom(freqs, plan),
             "left_alone": opt.left_alone_note(freqs, traces),
         })
     return rows
-
 
 def serializable_groups(groups: GroupBands):
     return {
@@ -1172,8 +1923,9 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
     path.parent.mkdir(parents=True, exist_ok=True)
     archive = archive or []
     payload = {
-        "version": 6,
-        "objective": "spatial_objective_beam_cached_phase_v6",
+        "schema": "audiofischer-stream-state-v2",
+        "version": 7,
+        "objective": "spatial_objective_candidate_plan_v7",
         "completed_trials": int(completed_trials),
         "elapsed_seconds": float(elapsed_seconds),
         "seed": int(args.seed),
@@ -1185,14 +1937,10 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
         "min_total_bands": int(args.min_total_bands),
         "archive_size": int(getattr(args, "archive_size", 0)),
         "rng_state": rng.bit_generator.state,
-        "best": [
-            {"objective": float(value), "groups": serializable_groups(groups)}
-            for value, _signature, groups in best
-        ],
-        "archive": [
-            {"objective": float(value), "groups": serializable_groups(groups)}
-            for value, _signature, groups in archive
-        ],
+        "best": [beam_entry_to_json(entry) for entry in best],
+        "archive": [beam_entry_to_json(entry) for entry in archive],
+        "rehabilitation": _json_safe(dict(getattr(args, "rehabilitation", {}) or {})),
+        "input_fingerprint": getattr(args, "input_fingerprint", None),
         "proposal_audit": getattr(args, "proposal_audit", {}),
         "convergence": getattr(args, "convergence", {}),
     }
@@ -1200,7 +1948,9 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
         f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     )
     try:
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
         replace_checkpoint_with_retry(tmp, path)
     finally:
         try:
@@ -1209,43 +1959,56 @@ def save_state(path: Path, best, rng: np.random.Generator, completed_trials: int
             pass
 
 
-def load_state(path: Path, rng: np.random.Generator, component_score=None, archive_size: int = 0):
+def load_state(
+    path: Path,
+    rng: np.random.Generator,
+    component_score=None,
+    archive_size: int = 0,
+    *,
+    score_plan=None,
+    expected_fingerprint=None,
+):
     if not path.exists():
         return [], [], {}, 0, 0.0
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("version") not in (4, 5, 6):
+    if payload.get("version") not in (4, 5, 6, 7):
+        return [], [], {}, 0, 0.0
+    if (
+        expected_fingerprint is not None
+        and payload.get("input_fingerprint") != expected_fingerprint
+    ):
         return [], [], {}, 0, 0.0
     if "rng_state" in payload:
         rng.bit_generator.state = payload["rng_state"]
-    best = []
-    for item in payload.get("best", []):
-        groups = groups_from_json(item.get("groups", {}))
-        signature = opt.bands_signature(groups)
-        value = (
-            float(component_score(groups)["objective"])
-            if component_score is not None else float(item["objective"])
+
+    def load_entry(item):
+        return beam_entry_from_json(
+            item,
+            score_plan=score_plan,
+            component_score=component_score,
         )
-        best.append((value, signature, groups))
-    best.sort(key=lambda x: x[0])
-    archive = []
+
+    best = [load_entry(item) for item in payload.get("best", [])]
+    best.sort(key=lambda entry: (entry.objective, entry.signature))
+    archive = [load_entry(item) for item in payload.get("archive", [])]
     score_map = {}
-    for item in payload.get("archive", []):
-        groups = groups_from_json(item.get("groups", {}))
-        signature = opt.bands_signature(groups)
-        value = (
-            float(component_score(groups)["objective"])
-            if component_score is not None else float(item["objective"])
+    if score_plan is not None or component_score is not None:
+        score_map = {
+            entry.signature: dict(entry.components)
+            for entry in archive
+        }
+        archive, score_map = prune_archive(
+            archive, score_map, archive_size
         )
-        entry = (value, signature, groups)
-        archive.append(entry)
-        if component_score is not None:
-            score_map[signature] = component_score(groups)
-    if component_score is not None:
-        archive, score_map = prune_archive(archive, score_map, archive_size)
     else:
         archive = []
-    return best, archive, score_map, int(payload.get("completed_trials", 0)), float(payload.get("elapsed_seconds", 0.0))
-
+    return (
+        best,
+        archive,
+        score_map,
+        int(payload.get("completed_trials", 0)),
+        float(payload.get("elapsed_seconds", 0.0)),
+    )
 
 def interference_notes(freqs, traces):
     notes = []
@@ -1277,12 +2040,33 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     def safe_entries(entries):
         kept = []
         for entry in entries or []:
+            plan = (
+                entry.plan
+                if isinstance(entry, BeamEntry)
+                else rehab.CandidatePlan(
+                    groups=rehab.freeze_groups(entry[2])
+                )
+            )
+            slot_conflicts = [
+                item
+                for item in opt.candidate_plan_phase_conflicts(
+                    freqs, plan, phase_plan
+                )
+                if item.get("group") == "existing_slot"
+            ]
+            if slot_conflicts:
+                args.phase_peq_rejections.extend(slot_conflicts)
+                continue
             if phase_valid and phase_plan:
-                verification = opt.complex_crossover_verification(freqs, rich_traces, entry[2], phase_plan)
+                verification = opt.complex_crossover_verification(
+                    freqs, rich_traces, entry[2], phase_plan
+                )
                 if verification["pass"]:
                     kept.append(entry)
             else:
-                conflicts = opt.phase_peq_conflicts(freqs, entry[2], phase_plan)
+                conflicts = opt.phase_peq_conflicts(
+                    freqs, entry[2], phase_plan
+                )
                 if conflicts:
                     args.phase_peq_rejections.extend(conflicts)
                     continue
@@ -1299,8 +2083,30 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
         phase_plan,
         phase_valid,
     )
-    rows = build_rows(freqs, traces, target, best, component_score)
-    family_rows = build_rows(freqs, traces, target, family_entries, component_score) if family_entries else rows
+    score_plan = opt.make_candidate_plan_component_scorer(
+        opt.make_band_set_component_scorer(
+            freqs,
+            traces,
+            target,
+            args.filter_cost_scale,
+            args.worst_weight,
+        ),
+        freqs,
+        rich_traces,
+        phase_plan,
+        phase_valid,
+    )
+    rows = build_rows(
+        freqs, traces, target, best, component_score,
+        score_plan=score_plan,
+    )
+    family_rows = (
+        build_rows(
+            freqs, traces, target, family_entries, component_score,
+            score_plan=score_plan,
+        )
+        if family_entries else rows
+    )
     unique_rejections = {}
     for item in args.phase_peq_rejections:
         key = (
@@ -1313,7 +2119,7 @@ def write_outputs(out_dir, base_xml, freqs, traces, rich_traces, target, best, b
     args.phase_peq_rejections = list(unique_rejections.values())[:20]
     for row in rows:
         path = out_dir / row["file"]
-        row["lint"] = opt.write_candidate(base_xml, path, row["groups"], phase_plan=phase_plan)
+        row["lint"] = opt.write_candidate_plan(base_xml, path, row["plan"], phase_plan=phase_plan)
         row["path"] = str(path)
     opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
     args.trials = args._completed_trials
@@ -1376,6 +2182,8 @@ def main():
                         help="Optional folder containing companion WAV/text impulse exports.")
     parser.add_argument("--phase-cache", type=Path, default=None,
                         help="Shared fingerprinted crossover diagnostic cache.")
+    parser.add_argument("--rehabilitation-cache", type=Path, default=None,
+                        help="Shared fingerprinted existing-PEQ rehabilitation cache.")
     parser.add_argument("--level-calibration", type=Path, default=None,
                         help="JSON role/file -> dB offsets for mixed-level measurement sessions.")
     parser.add_argument("--repeatability-folder", type=Path, default=None,
@@ -1404,6 +2212,7 @@ def main():
     args.measurement_noise_guard = opt.configure_repeatability_floor(
         args.repeatability_folder, level_calibration
     )
+    args.loaded_level_calibration = dict(level_calibration or {})
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     configure_profile(args.profile)
     rng = np.random.default_rng(args.seed)
@@ -1475,34 +2284,153 @@ def main():
         args.min_total_bands,
     )
 
+    score_plan = opt.make_candidate_plan_component_scorer(
+        opt.make_band_set_component_scorer(
+            freqs,
+            traces,
+            target,
+            args.filter_cost_scale,
+            args.worst_weight,
+        ),
+        freqs,
+        rich_traces,
+        args.phase_plan,
+        bool(args.measurement_session["audit"].get("phase_valid")),
+    )
+    channel_roles = dict(opt.CH_TRACE)
+    channel_roles.update({6: "Left Sub", 7: "Right Sub"})
+    rehabilitation_config = opt.rehabilitation_config(
+        channel_roles, explore=args.profile == "explore"
+    )
+    args.input_fingerprint = stream_input_fingerprint(
+        args, rehabilitation_config
+    )
     state_path = args.out / "stream_state.json"
+    start = time.monotonic()
     if args.resume:
         best, archive, archive_scores, completed_before, elapsed_before = load_state(
-            state_path, rng, component_score, args.archive_size
+            state_path,
+            rng,
+            archive_size=args.archive_size,
+            score_plan=score_plan,
+            expected_fingerprint=args.input_fingerprint,
         )
     else:
-        best, archive, archive_scores, completed_before, elapsed_before = [], [], {}, 0, 0.0
-    baseline_item = (
-        float(baseline_score["components"]["objective"]),
-        opt.bands_signature(baseline_groups),
-        baseline_groups,
+        best, archive, archive_scores, completed_before, elapsed_before = (
+            [], [], {}, 0, 0.0
+        )
+
+    if args.mode == "phase" and args.rehabilitation_cache is not None:
+        raise SystemExit(
+            "Phase workers must not receive a PEQ rehabilitation cache."
+        )
+    cached_rehabilitation = None
+    if args.rehabilitation_cache is not None:
+        try:
+            cached_rehabilitation = load_rehabilitation_cache(
+                args.rehabilitation_cache, args.input_fingerprint
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    saved_rehabilitation = (
+        saved_rehabilitation_plan(state_path, args.input_fingerprint)
+        if args.resume else None
+    )
+    if cached_rehabilitation is not None:
+        rehabilitation_plan = cached_rehabilitation["best_plan"]
+        args.rehabilitation = compact_rehabilitation_cache_state(
+            cached_rehabilitation, args.rehabilitation_cache
+        )
+        cached_rehabilitation = None
+        rehabilitation_trials = 0
+        rehabilitation_status = "cached"
+    elif saved_rehabilitation is not None:
+        rehabilitation_plan, args.rehabilitation = saved_rehabilitation
+        rehabilitation_trials = 0
+        rehabilitation_status = "resumed"
+    else:
+        refs = rehab.active_peq_slot_refs(base_xml, channel_roles)
+        stage = run_rehabilitation_stage(
+            mode=args.mode,
+            refs=refs,
+            score_plan=score_plan,
+            total_seconds=args.seconds,
+            config=rehabilitation_config,
+        )
+        rehabilitation_plan = stage["best_plan"]
+        args.rehabilitation = rehabilitation_state_payload(
+            stage, rehabilitation_config
+        )
+        rehabilitation_trials = int(stage["evaluations"])
+        rehabilitation_status = str(stage["status"])
+    baseline_plan = rehab.CandidatePlan()
+    baseline_components = dict(score_plan(baseline_plan))
+    baseline_item = BeamEntry(
+        float(baseline_components["objective"]),
+        rehab.candidate_plan_signature(baseline_plan),
+        baseline_plan,
+        baseline_components,
     )
     best = insert_best(best, baseline_item, args.keep)
     archive, archive_scores = insert_archive(
-        archive, archive_scores, baseline_item, baseline_score["components"], args.archive_size
+        archive,
+        archive_scores,
+        baseline_item,
+        baseline_components,
+        args.archive_size,
+    )
+    rehabilitation_components = dict(score_plan(rehabilitation_plan))
+    args.rehabilitation_plan = rehabilitation_plan
+    args.rehabilitation_components = rehabilitation_components
+    if args.rehabilitation:
+        baseline_candidate = rehab.ScoredCandidate(
+            baseline_plan, dict(score_plan(baseline_plan))
+        )
+        rehabilitation_candidate = rehab.ScoredCandidate(
+            rehabilitation_plan, rehabilitation_components
+        )
+        args.rehabilitation["baseline_components"] = dict(
+            baseline_candidate.components
+        )
+        args.rehabilitation["best_components"] = dict(
+            rehabilitation_candidate.components
+        )
+        args.rehabilitation["meaningful_improvement"] = rehab.meaningfully_better(
+            rehabilitation_candidate, baseline_candidate
+        )
+    rehabilitation_item = BeamEntry(
+        float(rehabilitation_components["objective"]),
+        rehab.candidate_plan_signature(rehabilitation_plan),
+        rehabilitation_plan,
+        rehabilitation_components,
+    )
+    best = insert_best(best, rehabilitation_item, args.keep)
+    archive, archive_scores = insert_archive(
+        archive,
+        archive_scores,
+        rehabilitation_item,
+        rehabilitation_components,
+        args.archive_size,
     )
 
-    start = time.monotonic()
     next_checkpoint = start + max(10, args.checkpoint_seconds)
-    trials = 0
+    trials = rehabilitation_trials
     args.beam = None
-    baseline_value = float(baseline_score["components"]["objective"])
+    baseline_value = float(baseline_components["objective"])
     convergence_events = [{
         "elapsed_seconds": 0.0,
         "objective": baseline_value,
         "phase": "baseline",
+    }, {
+        "elapsed_seconds": float(time.monotonic() - start),
+        "objective": float(rehabilitation_components["objective"]),
+        "phase": "baseline_rehabilitation_complete",
+        "status": rehabilitation_status,
     }]
-    best_value_seen = min((item[0] for item in best), default=baseline_value)
+    best_value_seen = min(
+        (item[0] for item in best), default=baseline_value
+    )
     last_improvement_time = start
     if args.proposal == "beam":
         beam_order_seed = args.seed + completed_before
@@ -1511,7 +2439,8 @@ def main():
         )
         beam_entries, beam_evaluations = deterministic_beam_combinations(
             guided_pools,
-            component_score,
+            score_plan=score_plan,
+            seed_plans=(baseline_plan, rehabilitation_plan),
             beam_width=args.beam_width,
             pool_limit=args.beam_pool_limit,
             beam_budgets=adaptive_budgets,
@@ -1520,7 +2449,7 @@ def main():
             stop_requested=stop_requested,
         )
         for item in beam_entries:
-            components = component_score(item[2])
+            components = item.components
             best = insert_best(best, item, args.keep)
             archive, archive_scores = insert_archive(
                 archive, archive_scores, item, components, args.archive_size
@@ -1565,6 +2494,8 @@ def main():
             args.proposal, args.mode
         ):
             break
+        if args.proposal == "beam" and not any(guided_pools.values()):
+            break
         cma_x = None
         if args.proposal == "cmaes":
             cma_x, groups = cma_proposal.ask()
@@ -1574,27 +2505,60 @@ def main():
             groups = random_groups(rng, args.profile)
         else:
             groups = guided_groups(rng, args.profile, guided_pools)
-        components = component_score(groups)
-        if components.get("phase_peq_conflict_count", 0.0) > 0.0:
-            args.phase_peq_rejections.extend(opt.phase_peq_conflicts(freqs, groups, args.phase_plan))
-        value = float(components["objective"])
-        if args.max_positive_gain_penalty > 0 and components["positive_gain_penalty_db"] > args.max_positive_gain_penalty:
-            value = 1e6 + float(components["positive_gain_penalty_db"])
-        signature = opt.bands_signature(groups)
-        item = (value, signature, groups)
-        if value + 1e-12 < best_value_seen:
-            best_value_seen = value
-            last_improvement_time = now
-            convergence_events.append({
-                "elapsed_seconds": float(now - start),
-                "objective": float(value),
-                "phase": "guided_improvement",
-            })
-        best = insert_best(best, item, args.keep)
-        archive, archive_scores = insert_archive(archive, archive_scores, item, components, args.archive_size)
-        if cma_x is not None:
-            cma_proposal.tell(cma_x, value)
-        trials += 1
+        continuation_lineages = (
+            (baseline_plan, rehabilitation_plan)
+            if args.proposal == "beam"
+            else (rehabilitation_plan,)
+        )
+        cma_value = None
+        for plan in guided_continuation_plans(
+            groups, continuation_lineages
+        ):
+            now = time.monotonic()
+            if stop_requested():
+                break
+            if args.seconds and now - start >= args.seconds:
+                break
+            if args.max_trials and trials >= args.max_trials:
+                break
+            components = dict(score_plan(plan))
+            if components.get("phase_peq_conflict_count", 0.0) > 0.0:
+                args.phase_peq_rejections.extend(
+                    opt.candidate_plan_phase_conflicts(
+                        freqs, plan, args.phase_plan
+                    )
+                )
+            value = float(components["objective"])
+            if (
+                args.max_positive_gain_penalty > 0
+                and components["positive_gain_penalty_db"]
+                > args.max_positive_gain_penalty
+            ):
+                value = 1e6 + float(
+                    components["positive_gain_penalty_db"]
+                )
+                components["objective"] = value
+            signature = rehab.candidate_plan_signature(plan)
+            item = BeamEntry(value, signature, plan, components)
+            if value + 1e-12 < best_value_seen:
+                best_value_seen = value
+                last_improvement_time = now
+                convergence_events.append({
+                    "elapsed_seconds": float(now - start),
+                    "objective": float(value),
+                    "phase": "guided_improvement",
+                })
+            best = insert_best(best, item, args.keep)
+            archive, archive_scores = insert_archive(
+                archive, archive_scores, item, components,
+                args.archive_size,
+            )
+            cma_value = (
+                value if cma_value is None else min(cma_value, value)
+            )
+            trials += 1
+        if cma_x is not None and cma_value is not None:
+            cma_proposal.tell(cma_x, cma_value)
 
         if best and args.checkpoint_seconds and now >= next_checkpoint:
             args._completed_trials = completed_before + trials
@@ -1658,7 +2622,7 @@ def main():
     else:
         refined_entries, args.refinement = refine_entries(
             final_entries,
-            component_score,
+            score_plan,
             top=args.refine_top,
             passes=args.refine_passes,
         )

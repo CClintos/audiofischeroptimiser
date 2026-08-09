@@ -63,6 +63,16 @@ def set_attr(text, key, value):
     return text[:-2] + ' %s="%s"/>' % (key, value) if text.endswith('/>') else text
 
 
+def canonical_peq_band(band):
+    """Return the numeric values produced by the AFPX PEQ serializers."""
+    frequency, q, gain = band
+    return (
+        float('%.2f' % float(frequency)),
+        float(str(float(q))),
+        float(str(float(gain))),
+    )
+
+
 def apply_output_trim(oc, trim_db):
     """Apply attenuation to one output's linear Vol value."""
     trim_db = float(trim_db)
@@ -80,6 +90,19 @@ def apply_output_trim(oc, trim_db):
 
 def active_filter_tags(xml):
     return re.findall(r'<Fil\b[^>]*/?>', xml)
+
+
+def active_peq_slots(xml, channels=None):
+    """Return active PEQ tags keyed by output-channel and ordinal slot."""
+    included = None if channels is None else set(channels)
+    slots = []
+    for channel, oc in enumerate(re.findall(r'<OC\b.*?</OC>', xml, re.S)):
+        if included is not None and channel not in included:
+            continue
+        for slot, tag in enumerate(re.findall(r'<Fil\b[^>]*/?>', oc)):
+            if at(tag, 'T') == '17':
+                slots.append((channel, slot, tag))
+    return slots
 
 
 def semantic_tag_key(tag_text):
@@ -173,7 +196,8 @@ def multiset_delta(old_items, new_items):
 
 def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
                         allow_crossover_changes=False, allow_polarity_changes=False,
-                        allowed_added_types=('17', '20'), allowed_volume_trims=None):
+                        allowed_added_types=('17', '20'), allowed_volume_trims=None,
+                        allowed_filter_slot_changes=()):
     old_inv = channel_filter_inventory(old_xml)
     new_inv = channel_filter_inventory(new_xml)
     channel_diffs = []
@@ -188,6 +212,28 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
     old_all = [semantic_filter_key(f) for f in active_filter_tags(old_xml)]
     new_all = [semantic_filter_key(f) for f in active_filter_tags(new_xml)]
     added_all, _ = multiset_delta(old_all, new_all)
+    permitted_slot_changes = []
+    old_channels = re.findall(r'<OC\b.*?</OC>', old_xml, re.S)
+    new_channels = re.findall(r'<OC\b.*?</OC>', new_xml, re.S)
+    for channel, slot in allowed_filter_slot_changes:
+        if channel >= len(old_channels) or channel >= len(new_channels):
+            continue
+        old_filters = re.findall(r'<Fil\b[^>]*/?>', old_channels[channel])
+        new_filters = re.findall(r'<Fil\b[^>]*/?>', new_channels[channel])
+        if slot >= len(old_filters) or slot >= len(new_filters):
+            continue
+        old_key = semantic_filter_key(old_filters[slot])
+        new_key = semantic_filter_key(new_filters[slot])
+        if old_key == new_key:
+            continue
+        permitted_slot_changes.append({
+            'channel_index': channel,
+            'slot_index': slot,
+            'old': old_key,
+            'new': new_key,
+        })
+        if new_key in added_all:
+            added_all.remove(new_key)
     for item in added_all:
         t = dict(item).get('T')
         if t not in allowed_added_types:
@@ -246,7 +292,8 @@ def afpx_roundtrip_lint(old_xml, new_xml, allow_delay_changes=False,
             'output_volume_changes_valid': volume_changes_valid,
             'delay_attributes_changed': delay_attributes_changed,
             'forbidden_added_filters': forbidden,
-            'channel_diffs': channel_diffs}
+            'channel_diffs': channel_diffs,
+            'permitted_filter_slot_changes': permitted_slot_changes}
 
 
 def validate_peq_band(F, Q, G, protected_boost=False, device=DEFAULT_DEVICE_PROFILE):
@@ -287,6 +334,7 @@ def add_bands(oc, bands, protected_boost=False):
     # bands: list of (F, Q, G). Convert safe free slots (T="1") into active PEQs.
     slots = choose_free_slots(oc, len(bands))
     for (F, Q, G), slot in zip(bands, slots):
+        F, Q, G = canonical_peq_band((F, Q, G))
         validate_peq_band(F, Q, G, protected_boost=protected_boost)
         new = slot
         new = set_attr(new, 'T', '17')
@@ -323,11 +371,50 @@ def _find_active_slot(oc, old_band):
     return matches[0]
 
 
+def edit_filter_slot(xml, channel, slot, expected_type, expected_band,
+                     replacement, protected_boost=False):
+    """Edit one ordinal filter slot after verifying its census identity."""
+    outputs = list(re.finditer(r'<OC\b.*?</OC>', xml, re.S))
+    if channel < 0 or channel >= len(outputs):
+        raise ValueError('AFPX slot changed since rehabilitation census')
+
+    oc_match = outputs[channel]
+    oc = oc_match.group()
+    filters = list(re.finditer(r'<Fil\b[^>]*/?>', oc))
+    if slot < 0 or slot >= len(filters):
+        raise ValueError('AFPX slot changed since rehabilitation census')
+
+    tag_match = filters[slot]
+    old_tag = tag_match.group()
+    try:
+        actual_band = tuple(float(at(old_tag, key)) for key in ('F', 'Q', 'G'))
+        expected = tuple(float(value) for value in expected_band)
+    except (TypeError, ValueError):
+        raise ValueError('AFPX slot changed since rehabilitation census') from None
+    if at(old_tag, 'T') != expected_type or actual_band != expected:
+        raise ValueError('AFPX slot changed since rehabilitation census')
+
+    if replacement is None:
+        new_tag = set_attr(old_tag, 'T', '1')
+        new_tag = set_attr(new_tag, 'G', '0')
+    else:
+        replacement = canonical_peq_band(replacement)
+        new_f, new_q, new_g = replacement
+        validate_peq_band(new_f, new_q, new_g, protected_boost=protected_boost)
+        new_tag = set_attr(old_tag, 'F', '%.2f' % float(new_f))
+        new_tag = set_attr(new_tag, 'Q', new_q)
+        new_tag = set_attr(new_tag, 'G', new_g)
+
+    new_oc = oc[:tag_match.start()] + new_tag + oc[tag_match.end():]
+    return xml[:oc_match.start()] + new_oc + xml[oc_match.end():]
+
+
 def edit_band(oc, old_band, new_band, protected_boost=False):
     """Rewrite an existing active PEQ slot's F/Q/G in place. T, dF, FN and I
     are untouched - only the values change, matching the verified
     edit_tweeter() pattern above, generalised to any band."""
     new_f, new_q, new_g = new_band
+    new_f, new_q, new_g = canonical_peq_band((new_f, new_q, new_g))
     validate_peq_band(new_f, new_q, new_g, protected_boost=protected_boost)
     old_tag = _find_active_slot(oc, old_band)
     new_tag = set_attr(old_tag, 'Q', new_q)

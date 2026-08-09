@@ -22,6 +22,7 @@ param(
     [double]$HeadroomDb = -1,
     [ValidateSet("off", "audition")]
     [string]$VoicingVariants = "off",
+    [string]$RehabilitationCache = "",
     [string]$PythonExe = ""
 )
 
@@ -56,7 +57,7 @@ trap {
     [Console]::Error.WriteLine($failureText)
     exit 1
 }
-$runPhases = @("searching", "merging", "verifying", "reporting", "complete")
+$runPhases = @("preparing", "searching", "merging", "verifying", "reporting", "complete")
 function Set-RunPhase([string]$Phase) {
     foreach ($name in $runPhases) {
         $marker = Join-Path $Root (".phase_" + $name)
@@ -87,11 +88,13 @@ if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
 if ($RepeatabilityFolder) { $launch.RepeatabilityFolder = $RepeatabilityFolder }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
-Set-RunPhase "searching"
+if ($RehabilitationCache) { $launch.RehabilitationCache = $RehabilitationCache }
+Set-RunPhase "preparing"
 & (Join-Path $here "run_guided_stream_workers.ps1") @launch
 if ($LASTEXITCODE -ne 0) {
     throw "Optimizer worker launch failed. See the run log above for the detailed error."
 }
+Set-RunPhase "searching"
 
 $processFile = Join-Path $Root "worker_processes.json"
 if (-not (Test-Path -LiteralPath $processFile)) { throw "Worker process manifest was not created." }
@@ -113,6 +116,7 @@ foreach ($row in $workerRows) {
 if ($failed.Count) { throw ($failed -join [Environment]::NewLine) }
 
 Set-RunPhase "merging"
+Write-Host "Merging candidates"
 $phaseCache = Join-Path $Root "phase_diagnostics.json"
 $mergeArgs = @(
     "_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"),

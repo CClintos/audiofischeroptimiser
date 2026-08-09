@@ -1067,5 +1067,35 @@ class BandEditAndRemovalTests(unittest.TestCase):
             self.assertEqual(active, [])
 
 
+class DirectBandSetScorerTests(unittest.TestCase):
+    def test_direct_scorer_preserves_complete_band_sets_and_full_precision(self) -> None:
+        precise_objective = 1.2345678901234567
+
+        class FakeObjective:
+            def __init__(self):
+                self.calls = []
+
+            def score_bands(self, band_sets):
+                self.calls.append(band_sets)
+                return {
+                    "objective": precise_objective,
+                    "tonal_masked": 2.0,
+                    "n_front_bands": 1.0,
+                }
+
+        fake = FakeObjective()
+        band_sets = (
+            ((100.0, 1.2, -1.5),), (), (), (), (), (), ((40.0, 1.0, -2.0),), ()
+        )
+        with patch.object(optimizer, "AFPX_OBJECTIVE", fake):
+            scorer = optimizer.make_band_set_component_scorer(
+                np.array([100.0]), {}, np.array([0.0])
+            )
+            result = scorer(band_sets)
+
+        self.assertEqual(fake.calls, [band_sets])
+        self.assertEqual(result["objective"], precise_objective)
+        self.assertEqual(result["filter_count"], 2.0)
+
 if __name__ == "__main__":
     unittest.main()
