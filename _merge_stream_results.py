@@ -9,7 +9,7 @@ from pathlib import Path
 import _optimizer as opt
 import baseline_rehabilitation as rehab
 from _optimizer_stream import (
-    beam_entry_from_json, build_rows, configure_profile, interference_notes,
+    beam_entry_from_json, build_rows, candidate_plan_from_json, configure_profile, interference_notes,
     stream_input_fingerprint,
 )
 
@@ -237,6 +237,31 @@ def main():
         phase_plan,
         phase_valid,
     )
+    try:
+        rehabilitation_plan = candidate_plan_from_json(
+            dict(args.rehabilitation).get("best_plan", {})
+        )
+    except (TypeError, ValueError, KeyError):
+        rehabilitation_plan = rehab.CandidatePlan()
+    rehabilitation_components = dict(score_plan(rehabilitation_plan))
+    args.rehabilitation_plan = rehabilitation_plan
+    args.rehabilitation_components = rehabilitation_components
+    if args.rehabilitation:
+        baseline_candidate = rehab.ScoredCandidate(
+            baseline_plan, dict(score_plan(baseline_plan))
+        )
+        rehabilitation_candidate = rehab.ScoredCandidate(
+            rehabilitation_plan, rehabilitation_components
+        )
+        args.rehabilitation["baseline_components"] = dict(
+            baseline_candidate.components
+        )
+        args.rehabilitation["best_components"] = dict(
+            rehabilitation_candidate.components
+        )
+        args.rehabilitation["meaningful_improvement"] = rehab.meaningfully_better(
+            rehabilitation_candidate, baseline_candidate
+        )
     baseline_components = dict(score_plan(baseline_plan))
     items.append((
         float(baseline_components["objective"]),
@@ -340,6 +365,30 @@ def main():
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
+    rehabilitation_file = ""
+    if rows:
+        final_plan = rows[0]["plan"]
+        empty_signature = rehab.candidate_plan_signature(rehab.CandidatePlan())
+        rehabilitation_signature = rehab.candidate_plan_signature(
+            rehabilitation_plan
+        )
+        final_signature = rehab.candidate_plan_signature(final_plan)
+        if (
+            rehabilitation_signature != empty_signature
+            and rehabilitation_signature != final_signature
+        ):
+            rehabilitation_file = "rehabilitated_baseline.afpx"
+            opt.write_candidate_plan(
+                base_xml,
+                out_dir / rehabilitation_file,
+                rehabilitation_plan,
+                phase_plan=phase_plan,
+            )
+    if args.rehabilitation:
+        args.rehabilitation["file"] = rehabilitation_file
+        args.rehabilitation["objective"] = float(
+            rehabilitation_components["objective"]
+        )
     opt.write_family_aliases(out_dir, family_rows, base_xml, phase_plan=phase_plan)
     voicing_variants = []
     if args.voicing_variants == "audition" and best:

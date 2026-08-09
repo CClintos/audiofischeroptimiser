@@ -356,6 +356,49 @@ def load_response_plot(summary_path: Path) -> dict[str, Any]:
     return _response_plot(summary, _read_json(full_path))
 
 
+
+def result_comparison_plots(
+    summary: dict[str, Any], full: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return fixed-anchor response plots for each auditable result stage."""
+    comparisons = full.get("response_comparisons") or {}
+    if comparisons:
+        labels = {
+            "supplied": "Supplied",
+            "rehabilitated": "Existing tune improved",
+            "final": "Final",
+        }
+        result = {}
+        for key, value in comparisons.items():
+            if not isinstance(value, dict) or not value.get("frequency_hz"):
+                continue
+            plot = dict(value)
+            plot.setdefault("candidate_label", labels.get(str(key), str(key).title()))
+            result[str(key)] = plot
+        return result
+    final = _response_plot(summary, full)
+    if not final:
+        return {}
+    supplied = dict(final)
+    supplied["candidate_error_db"] = list(
+        final.get("baseline_error_db") or final.get("candidate_error_db") or []
+    )
+    supplied["candidate_label"] = "Supplied"
+    final = dict(final)
+    final["candidate_label"] = "Final"
+    return {"supplied": supplied, "final": final}
+
+
+def load_response_comparisons(summary_path: Path) -> dict[str, dict[str, Any]]:
+    """Load every fixed-anchor result stage for selectable GUI comparison."""
+    summary_path = Path(summary_path)
+    summary = _read_json(summary_path)
+    details = summary.get("details") or {}
+    full_path = summary_path.parent / str(
+        details.get("optimizer_summary", "optimizer_summary.json")
+    )
+    return result_comparison_plots(summary, _read_json(full_path))
+
 def response_chart_series(plot: dict[str, Any]) -> list[dict[str, Any]]:
     """Build native-GUI series, including opt-in per-driver predicted changes."""
     frequencies = plot.get("frequency_hz") or []
@@ -370,7 +413,7 @@ def response_chart_series(plot: dict[str, Any]) -> list[dict[str, Any]]:
             "visible": True,
         },
         {
-            "label": "Candidate",
+            "label": str(plot.get("candidate_label") or "Candidate"),
             "x": frequencies,
             "y": plot.get("candidate_error_db"),
             "color": theme.SERIES_CANDIDATE,
@@ -461,13 +504,16 @@ def improvement_verdict(
         "delta": delta,
         "heading": "Not meaningfully better than your current tune",
         "detail": (
-            f"Modelled improvement is {percent:.1f}%—below the 1% recommendation threshold. "
-            "Keep the baseline unless listening and re-measurement prove a worthwhile advantage."
+            "The modelled change is within the repeatability threshold. "
+            "Treat it as a tie and keep the baseline unless listening and "
+            "re-measurement prove a worthwhile advantage."
         ),
     }
 
 
-def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
+def _metric_cards(
+    baseline: dict[str, Any], best: dict[str, Any], *, suppress_percent: bool = False,
+) -> str:
     cells = []
     for card in metric_card_data(baseline, best):
         label = card["label"]
@@ -476,6 +522,10 @@ def _metric_cards(baseline: dict[str, Any], best: dict[str, Any]) -> str:
         if delta is None:
             value = "Not available"
             detail = ""
+            css = "neutral"
+        elif suppress_percent:
+            value = "No meaningful change"
+            detail = f"{abs(delta):.2f} dB modelled difference; within repeatability"
             css = "neutral"
         else:
             value = f"{abs(percent):.0f}% {'better' if delta >= 0 else 'worse'}"
@@ -550,6 +600,98 @@ def _plain_findings(summary: dict[str, Any], phase_mode: bool) -> list[str]:
     return findings[:4]
 
 
+def _format_rehabilitation_band(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return (
+        f"{float(value.get('frequency_hz', 0.0)):.1f} Hz / "
+        f"Q {float(value.get('q', 0.0)):.2f} / "
+        f"{float(value.get('gain_db', 0.0)):+.2f} dB"
+    )
+
+
+def _rehabilitation_report_html(rehabilitation: dict[str, Any]) -> str:
+    if not rehabilitation:
+        return ""
+    verdict = str(rehabilitation.get("verdict") or "unknown")
+    verdict_text = (
+        "Meaningful improvement beyond the repeatability threshold."
+        if verdict == "meaningful_improvement" else
+        "No meaningful improvement: the numerical difference is within measurement repeatability."
+        if verdict == "no_meaningful_improvement" else
+        verdict.replace("_", " ").title()
+    )
+    accepted_rows = []
+    for row in rehabilitation.get("accepted_operations") or []:
+        role = str(row.get("channel_role") or GROUP_LABELS.get(
+            str(row.get("group") or ""), str(row.get("group") or "DSP")
+        ))
+        channel = row.get("channel")
+        if channel is not None:
+            role += f" (channel {int(channel)})"
+        slot = "-" if row.get("slot") is None else str(int(row["slot"]))
+        accepted_rows.append(
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (
+                html.escape(str(row.get("operation") or "change").title()),
+                html.escape(role), html.escape(slot),
+                html.escape(_format_rehabilitation_band(row.get("old"))),
+                html.escape(_format_rehabilitation_band(row.get("new"))),
+                html.escape(str(row.get("reason") or "")),
+            )
+        )
+    accepted_html = (
+        "<table><tr><th>Action</th><th>Driver / channel</th><th>Slot</th>"
+        "<th>Previous F / Q / G</th><th>New F / Q / G</th><th>Why</th></tr>"
+        + "".join(accepted_rows) + "</table>"
+        if accepted_rows else
+        '<div class="empty">No existing-filter edit cleared the repeatability and safety gates.</div>'
+    )
+    rejected_rows = [
+        (
+            "%s, slot %s" % (
+                str(row.get("channel_role") or f"Channel {row.get('channel', '-') }"),
+                row.get("slot", "-"),
+            ),
+            str(row.get("reason") or "Rejected by a hard gate"),
+        )
+        for row in rehabilitation.get("rejected_operations") or []
+    ]
+    rejected_html = _table(rejected_rows) if rejected_rows else "<p>No operation was rejected after entering the retained decision set.</p>"
+    delta_rows = []
+    for stage, values in (rehabilitation.get("component_deltas") or {}).items():
+        for component, value in (values or {}).items():
+            if isinstance(value, (int, float)):
+                delta_rows.append((
+                    f"{str(stage).replace('_', ' ')} / {str(component).replace('_', ' ')}",
+                    f"{float(value):+.4f}",
+                ))
+    delta_html = _table(delta_rows) if delta_rows else "<p>No comparable component deltas were available.</p>"
+    headroom_rows = []
+    for stage, values in (rehabilitation.get("headroom") or {}).items():
+        numeric = [float(value) for value in (values or {}).values() if isinstance(value, (int, float))]
+        headroom_rows.append((str(stage).title(), f"{min(numeric):.2f} dB minimum" if numeric else "Not available"))
+    headroom_html = _table(headroom_rows) if headroom_rows else "<p>Headroom details were not available.</p>"
+    consolidation = rehabilitation.get("consolidation") or {}
+    mismatch = consolidation.get("max_cascade_error_db")
+    audit_rows = [
+        ("Repeatability verdict", verdict_text),
+        ("Candidate evaluations", str(rehabilitation.get("evaluation_count", 0))),
+        ("Cache source", str(rehabilitation.get("cache_source") or "Built in this run")),
+        ("Rejected operations", str(len(rehabilitation.get("rejected_operations") or []))),
+        ("Consolidation", "Accepted" if consolidation.get("accepted") else "Not used"),
+        ("Consolidation mismatch", f"{float(mismatch):.3f} dB" if isinstance(mismatch, (int, float)) else "Not available"),
+    ]
+    return (
+        '<h2>Existing Tune Rehabilitation</h2>'
+        f'<div class="callout"><b>{html.escape(verdict_text)}</b></div>'
+        '<h3>Accepted DSP operations</h3>' + accepted_html
+        + '<h3>Rejected by evidence or safety gates</h3>' + rejected_html
+        + '<h3>Objective component deltas</h3>' + delta_html
+        + '<h3>Available headroom</h3>' + headroom_html
+        + '<h3>Decision audit</h3>' + _table(audit_rows)
+    )
+
 def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_path: Path) -> str:
     mode = str((summary.get("search") or {}).get("mode") or (full.get("run_config") or {}).get("mode") or "peq")
     phase_mode = mode == "phase"
@@ -571,12 +713,18 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     filters = _best_filters(summary, summary_path.parent / "optimizer_report.md")
     actions = summary.get("phase_actions") or []
     families = summary.get("families") or {}
-
+    rehabilitation = summary.get("rehabilitation") or {}
+    rehabilitation_tie = (
+        rehabilitation.get("verdict") == "no_meaningful_improvement"
+    )
+    rehabilitation_html = _rehabilitation_report_html(rehabilitation)
     verdict = (
         "A phase candidate was produced. Re-measure every changed crossover before calling it final."
         if phase_mode and actions else
         "No phase write cleared the evidence gates; the baseline remains the recommended result."
         if phase_mode else
+        "No PEQ change cleared the measurement-repeatability threshold; keep the supplied tune."
+        if rehabilitation_tie else
         "A PEQ candidate was produced from the supplied magnitude measurements and conservative guardrails."
     )
     overview = _table([
@@ -594,7 +742,11 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         ("Candidates retained", str(summary.get("candidate_count", 0))),
         ("Baseline objective", _fmt(baseline.get("objective"), 4)),
         ("Best objective", _fmt(best.get("objective"), 4)),
-        ("Objective improvement", _objective_improvement(baseline.get("objective"), best.get("objective"))),
+        ("Objective improvement", (
+            "No meaningful improvement (within repeatability)"
+            if rehabilitation_tie else
+            _objective_improvement(baseline.get("objective"), best.get("objective"))
+        )),
         ("Phase-valid session", "Yes" if sessions.get("phase_valid") else "No / not required"),
     ])
     warning_html = "".join(
@@ -830,7 +982,7 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     )
     changes_visual = (
         actions_html if phase_mode else
-        filters_html + (f'<h2>Predicted system change</h2><img class="chart" src="{delta_chart}">' if delta_chart else "")
+        rehabilitation_html + filters_html + (f'<h2>Predicted system change</h2><img class="chart" src="{delta_chart}">' if delta_chart else "")
     )
 
     return f"""
@@ -856,7 +1008,7 @@ img.chart {{ width:100%; margin:7px 0 4px; }} .hero-chart {{ margin-top:10px; }}
 <h1>{html.escape(title)}</h1>
 <div class="muted">Generated {datetime.now().strftime('%d %B %Y, %I:%M %p')} | Source: {html.escape(source)} | Candidate: {html.escape(candidate)}</div>
 <div class="callout {'warn' if phase_mode else ''}"><b>{html.escape(verdict)}</b></div>
-{confidence_matrix if phase_mode else _metric_cards(baseline, best_components)}
+{confidence_matrix if phase_mode else _metric_cards(baseline, best_components, suppress_percent=rehabilitation_tie)}
 {chart_or_message}
 <h2>What You Should Notice</h2><ul>{findings_html}</ul>
 <h3>Worth checking</h3><ul>{warning_html}</ul>

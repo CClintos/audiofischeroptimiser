@@ -3199,6 +3199,156 @@ def file_fingerprint(path: Path) -> Dict[str, object]:
     }
 
 
+
+def rehabilitation_report_payload(
+    *,
+    rehabilitation_plan: CandidatePlan,
+    final_plan: CandidatePlan,
+    baseline_components: Dict[str, object],
+    rehabilitated_components: Dict[str, object],
+    final_components: Dict[str, object],
+    state: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+    """Build the compact, auditable existing-tune rehabilitation report."""
+    state = dict(state or {})
+
+    def numeric_components(values):
+        return {
+            str(key): float(value)
+            for key, value in dict(values or {}).items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+            and not isinstance(value, bool)
+        }
+
+    def deltas(before, after):
+        first = numeric_components(before)
+        second = numeric_components(after)
+        return {
+            key: second[key] - first[key]
+            for key in sorted(first.keys() & second.keys())
+        }
+
+    accepted = []
+    counts = {"modify": 0, "remove": 0, "merge": 0, "append": 0}
+    for edit in rehabilitation_plan.slot_edits:
+        operation = "remove" if edit.replacement is None else "modify"
+        counts[operation] += 1
+        old_f, old_q, old_g = edit.ref.original
+        row = {
+            "operation": operation,
+            "channel": int(edit.ref.channel),
+            "channel_role": str(edit.ref.role),
+            "slot": int(edit.ref.slot),
+            "old": {"frequency_hz": old_f, "q": old_q, "gain_db": old_g},
+            "new": None,
+            "reason": (
+                "Removed because the existing band did not earn its keep under the "
+                "same fixed-baseline objective and guardrails."
+                if edit.replacement is None else
+                "Re-centred or reshaped because the revised existing band improved "
+                "the fixed-baseline objective while retaining every hard gate."
+            ),
+        }
+        if edit.replacement is not None:
+            new_f, new_q, new_g = edit.replacement
+            row["new"] = {
+                "frequency_hz": new_f, "q": new_q, "gain_db": new_g,
+            }
+        accepted.append(row)
+
+    rehabilitation_signature = candidate_plan_signature(rehabilitation_plan)
+    rehabilitation_groups = dict(rehabilitation_plan.groups)
+    for group, bands in final_plan.groups:
+        prior = list(rehabilitation_groups.get(group, ()))
+        for band in bands:
+            if band in prior:
+                prior.remove(band)
+                continue
+            counts["append"] += 1
+            accepted.append({
+                "operation": "append",
+                "group": str(group),
+                "old": None,
+                "new": {
+                    "frequency_hz": float(band[0]),
+                    "q": float(band[1]),
+                    "gain_db": float(band[2]),
+                },
+                "reason": (
+                    "Added after existing-filter rehabilitation because a supported "
+                    "residual remained and cleared the same objective and guardrails."
+                ),
+            })
+
+    consolidation = dict(state.get("consolidation") or {})
+    if consolidation.get("accepted"):
+        counts["merge"] = int(consolidation.get("accepted_count", 1))
+        accepted.append({
+            "operation": "merge",
+            "reason": (
+                "Overlapping existing bands were replaced by one equivalent cascade "
+                "after the response mismatch and hard gates passed."
+            ),
+            "max_cascade_error_db": consolidation.get("max_cascade_error_db"),
+        })
+
+    meaningful = bool(state.get("meaningful_improvement", False))
+    stages = [{
+        "key": "supplied",
+        "label": "Supplied",
+        "objective": numeric_components(baseline_components).get("objective"),
+    }]
+    if (
+        rehabilitation_signature != candidate_plan_signature(CandidatePlan())
+        and rehabilitation_signature != candidate_plan_signature(final_plan)
+    ):
+        stages.append({
+            "key": "rehabilitated",
+            "label": "Existing tune improved",
+            "objective": numeric_components(rehabilitated_components).get("objective"),
+        })
+    final_signature = candidate_plan_signature(final_plan)
+    if final_signature != candidate_plan_signature(CandidatePlan()):
+        stages.append({
+            "key": "final",
+            "label": "Final",
+            "objective": numeric_components(final_components).get("objective"),
+        })
+    return {
+        "verdict": (
+            "meaningful_improvement"
+            if meaningful else "no_meaningful_improvement"
+        ),
+        "operation_counts": counts,
+        "accepted_operations": accepted,
+        "rejected_operations": list(state.get("gate_rejections") or []),
+        "component_deltas": {
+            "baseline_to_rehabilitated": deltas(
+                baseline_components, rehabilitated_components
+            ),
+            "rehabilitated_to_final": deltas(
+                rehabilitated_components, final_components
+            ),
+            "baseline_to_final": deltas(baseline_components, final_components),
+        },
+        "components": {
+            "supplied": numeric_components(baseline_components),
+            "rehabilitated": numeric_components(rehabilitated_components),
+            "final": numeric_components(final_components),
+        },
+        "comparison_stages": stages,
+        "evaluation_count": int(state.get("evaluations", 0)),
+        "cache_source": str(state.get("cache_path") or ""),
+        "consolidation": consolidation,
+        "headroom": {
+            "supplied": dict(baseline_components.get("headroom_margin_db") or {}),
+            "rehabilitated": dict(
+                rehabilitated_components.get("headroom_margin_db") or {}
+            ),
+            "final": dict(final_components.get("headroom_margin_db") or {}),
+        },
+    }
+
 def write_report(
     out_dir: Path,
     rows: List[Dict[str, object]],
@@ -3222,6 +3372,68 @@ def write_report(
         fixed_anchor_response_audit(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
     )
     response_plot = report_plot_data(best_row.get("plan", best_row.get("groups", {}))) if best_row else {}
+    final_plan = (
+        best_row.get("plan")
+        if best_row and isinstance(best_row.get("plan"), CandidatePlan)
+        else CandidatePlan(groups=freeze_groups(
+            (best_row or {}).get("groups", {})
+        ))
+    )
+    rehabilitation_state = dict(
+        getattr(args, "rehabilitation", {}) or {}
+    )
+    rehabilitation_plan = getattr(
+        args, "rehabilitation_plan", CandidatePlan()
+    )
+    if not isinstance(rehabilitation_plan, CandidatePlan):
+        rehabilitation_plan = CandidatePlan()
+    rehabilitation_components = dict(
+        getattr(args, "rehabilitation_components", {})
+        or rehabilitation_state.get("best_components", {})
+        or baseline_score.get("components", {})
+    )
+    rehabilitation_report = (
+        rehabilitation_report_payload(
+            rehabilitation_plan=rehabilitation_plan,
+            final_plan=final_plan,
+            baseline_components=dict(baseline_score.get("components", {})),
+            rehabilitated_components=rehabilitation_components,
+            final_components=dict((best_row or {}).get("components", {})),
+            state=rehabilitation_state,
+        )
+        if rehabilitation_state
+        and str(getattr(args, "mode", "peq")) == "peq"
+        else {}
+    )
+    if rehabilitation_report:
+        rehabilitation_report["file"] = str(
+            rehabilitation_state.get("file") or ""
+        )
+        rehabilitation_report["objective"] = rehabilitation_components.get(
+            "objective"
+        )
+    response_comparisons = {}
+    if best_row:
+        supplied_plot = report_plot_data(CandidatePlan())
+        supplied_plot["candidate_label"] = "Supplied"
+        response_comparisons["supplied"] = supplied_plot
+        if any(
+            stage.get("key") == "rehabilitated"
+            for stage in rehabilitation_report.get("comparison_stages", [])
+        ):
+            rehabilitated_plot = report_plot_data(rehabilitation_plan)
+            rehabilitated_plot["candidate_label"] = "Existing tune improved"
+            response_comparisons["rehabilitated"] = rehabilitated_plot
+        if (
+            not rehabilitation_report
+            or any(
+                stage.get("key") == "final"
+                for stage in rehabilitation_report.get("comparison_stages", [])
+            )
+        ):
+            final_plot = dict(response_plot)
+            final_plot["candidate_label"] = "Final"
+            response_comparisons["final"] = final_plot
     comparison_integrity = {
         "target_anchor": "computed_once_from_baseline_system_sum_and_reused",
         "candidate_delta": "candidate_prediction_minus_baseline_prediction_no_reanchoring",
@@ -3342,6 +3554,8 @@ def write_report(
         "comparison_integrity": comparison_integrity,
         "best_fixed_anchor_response": fixed_anchor_audit,
         "response_plot": response_plot,
+        "response_comparisons": response_comparisons,
+        "rehabilitation": rehabilitation_report,
         "top_candidates": summary_rows,
         "family_picks": {
             role: {
@@ -3512,6 +3726,7 @@ def write_report(
             "convergence": getattr(args, "convergence", {}),
         },
         "phase_actions": compact_phase_actions,
+        "rehabilitation": rehabilitation_report,
         "complex_crossover_verification": (
             complex_crossover_verification(
                 np.asarray(getattr(args, "freqs")), getattr(args, "rich_traces", {}),

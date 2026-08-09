@@ -1767,5 +1767,110 @@ class CacheTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "malformed"):
                 stream.load_rehabilitation_cache(path, "same-session")
 
+
+class ReportingTests(unittest.TestCase):
+    @staticmethod
+    def _components(objective, tonal, presence, balance, filters):
+        return {
+            "objective": objective,
+            "tonal_error_db": tonal,
+            "presence_error_db": presence,
+            "balance_penalty_db": balance,
+            "filter_count": filters,
+            "headroom_margin_db": {"2": 3.0, "3": 3.2},
+        }
+
+    def test_summary_reports_operations_stages_and_component_deltas(self):
+        left = rehab.FilterRef(2, 7, "FL Low", "17", (97.0, 3.0, -1.5))
+        right = rehab.FilterRef(3, 9, "FR Low", "17", (412.0, 2.0, -2.0))
+        rehabilitation_plan = rehab.CandidatePlan((
+            rehab.SlotEdit.modify(left, (100.0, 1.2, -1.5)),
+            rehab.SlotEdit.remove(right),
+        ))
+        final_plan = rehab.CandidatePlan(
+            rehabilitation_plan.slot_edits,
+            (("low_sym", ((180.0, 0.8, -1.0),)),),
+        )
+        payload = optimizer.rehabilitation_report_payload(
+            rehabilitation_plan=rehabilitation_plan,
+            final_plan=final_plan,
+            baseline_components=self._components(10.0, 3.0, 2.5, 2.0, 8),
+            rehabilitated_components=self._components(8.0, 2.2, 2.0, 1.5, 7),
+            final_components=self._components(7.0, 1.8, 1.7, 1.3, 8),
+            state={
+                "evaluations": 321,
+                "cache_path": "rehabilitation_cache.json",
+                "meaningful_improvement": True,
+                "consolidation": {
+                    "accepted": True,
+                    "max_cascade_error_db": 0.08,
+                },
+            },
+        )
+
+        self.assertEqual(payload["operation_counts"], {
+            "modify": 1, "remove": 1, "merge": 1, "append": 1,
+        })
+        self.assertEqual(payload["verdict"], "meaningful_improvement")
+        self.assertIn("baseline_to_rehabilitated", payload["component_deltas"])
+        self.assertIn("rehabilitated_to_final", payload["component_deltas"])
+        self.assertEqual(
+            [row["label"] for row in payload["comparison_stages"]],
+            ["Supplied", "Existing tune improved", "Final"],
+        )
+        self.assertTrue(all(row.get("reason") for row in payload["accepted_operations"]))
+        self.assertEqual(payload["evaluation_count"], 321)
+        self.assertEqual(payload["cache_source"], "rehabilitation_cache.json")
+        self.assertEqual(payload["consolidation"]["max_cascade_error_db"], 0.08)
+
+    def test_rehabilitation_state_keeps_compact_report_decision_core(self):
+        ref = rehab.FilterRef(2, 7, "FL Low", "17", (97.0, 3.0, -1.5))
+        plan = rehab.CandidatePlan((
+            rehab.SlotEdit.modify(ref, (100.0, 1.2, -1.5)),
+        ))
+        baseline = rehab.ScoredCandidate(
+            rehab.CandidatePlan(), self._components(10.0, 3.0, 2.5, 2.0, 8),
+        )
+        best = rehab.ScoredCandidate(
+            plan, self._components(8.0, 2.2, 2.0, 1.5, 8),
+        )
+        result = rehab.RehabilitationResult(
+            baseline=baseline,
+            best=best,
+            candidates=(baseline, best),
+            generations=((baseline, best),),
+            score_count=2,
+        )
+        state = stream.rehabilitation_state_payload(
+            {
+                "status": "complete",
+                "evaluations": 20,
+                "best_plan": plan,
+                "result": result,
+                "census": (),
+            },
+            rehab.RehabilitationConfig(),
+        )
+
+        self.assertEqual(state["baseline_components"]["objective"], 10.0)
+        self.assertEqual(state["best_components"]["objective"], 8.0)
+        self.assertTrue(state["meaningful_improvement"])
+        self.assertEqual(state["gate_rejections"], [])
+    def test_repeatability_tie_uses_no_meaningful_improvement_without_percent(self):
+        payload = optimizer.rehabilitation_report_payload(
+            rehabilitation_plan=rehab.CandidatePlan(),
+            final_plan=rehab.CandidatePlan(),
+            baseline_components=self._components(10.0, 2.0, 2.0, 1.0, 8),
+            rehabilitated_components=self._components(9.99, 1.99, 2.0, 1.0, 8),
+            final_components=self._components(9.99, 1.99, 2.0, 1.0, 8),
+            state={"meaningful_improvement": False},
+        )
+
+        self.assertEqual(payload["verdict"], "no_meaningful_improvement")
+        self.assertNotIn("percent_improvement", payload)
+        self.assertEqual(
+            [row["label"] for row in payload["comparison_stages"]],
+            ["Supplied"],
+        )
 if __name__ == "__main__":
     unittest.main()

@@ -307,10 +307,34 @@ def rehabilitation_state_payload(stage, config):
         for candidate in row.candidates
     ]
     candidates = () if result is None else result.candidates
+    baseline_components = (
+        {} if result is None else dict(result.baseline.components)
+    )
+    best_components = (
+        dict(baseline_components) if result is None else dict(result.best.components)
+    )
+    meaningful_improvement = bool(
+        result is not None
+        and rehab.meaningfully_better(result.best, result.baseline)
+    )
+    gate_rejections = [
+        {
+            "channel": int(row.ref.channel),
+            "channel_role": str(row.ref.role),
+            "slot": int(row.ref.slot),
+            "reason": str(row.probe_skip_reason),
+        }
+        for row in census
+        if row.probe_skip_reason
+    ]
     return {
         "status": str(stage.get("status", "unknown")),
         "completion_status": str(stage.get("status", "unknown")),
         "evaluations": int(stage.get("evaluations", 0)),
+        "meaningful_improvement": meaningful_improvement,
+        "baseline_components": _json_safe(baseline_components),
+        "best_components": _json_safe(best_components),
+        "gate_rejections": gate_rejections,
         "config": _json_safe(config.__dict__),
         "census": [
             {
@@ -2357,6 +2381,24 @@ def main():
         args.archive_size,
     )
     rehabilitation_components = dict(score_plan(rehabilitation_plan))
+    args.rehabilitation_plan = rehabilitation_plan
+    args.rehabilitation_components = rehabilitation_components
+    if args.rehabilitation:
+        baseline_candidate = rehab.ScoredCandidate(
+            baseline_plan, dict(score_plan(baseline_plan))
+        )
+        rehabilitation_candidate = rehab.ScoredCandidate(
+            rehabilitation_plan, rehabilitation_components
+        )
+        args.rehabilitation["baseline_components"] = dict(
+            baseline_candidate.components
+        )
+        args.rehabilitation["best_components"] = dict(
+            rehabilitation_candidate.components
+        )
+        args.rehabilitation["meaningful_improvement"] = rehab.meaningfully_better(
+            rehabilitation_candidate, baseline_candidate
+        )
     rehabilitation_item = BeamEntry(
         float(rehabilitation_components["objective"]),
         rehab.candidate_plan_signature(rehabilitation_plan),

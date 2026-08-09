@@ -964,6 +964,11 @@ def _meaningfully_better(candidate, reference, repeatability_db=None):
     )
 
 
+
+def meaningfully_better(candidate, reference, repeatability_db=None):
+    """Public report-facing form of the acoustic repeatability decision."""
+    return _meaningfully_better(candidate, reference, repeatability_db)
+
 def select_best_candidate(
     candidates, repeatability_db=None, *, acoustic_reference=None
 ):
