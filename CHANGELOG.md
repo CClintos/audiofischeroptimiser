@@ -4,6 +4,16 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-11 - v0.9.3 out-of-passband baseline hotfix
+
+- Fixed existing-tune preparation crashing when a matched baseline filter sat
+  outside the configured driver passband. Such filters remain eligible for
+  removal but are no longer modified or allowed to abort the run.
+- Hardened correction attribution so an ineligible paired owner is reported as
+  outside its limits instead of raising an exception. Verified with the exact
+  August 10 measurements and baseline that failed in v0.9.2: preparation
+  completed 12,579 evaluations.
+
 ## 2026-08-10 - v0.9.2 two-way role-map hotfix
 
 - Fixed PEQ runs misclassifying a declared two-way system as three-way when

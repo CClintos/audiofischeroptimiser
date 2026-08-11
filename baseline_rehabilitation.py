@@ -282,9 +282,11 @@ def _score_operation(refs, replacement, score_plan, baseline_components):
 
 def _bounded_band(refs, band, config):
     refs = tuple(refs)
-    f_min, f_max, q_min, q_max, gain_min, gain_max = (
-        config.limits_for_refs(refs)
-    )
+    try:
+        limits = config.limits_for_refs(refs)
+    except ValueError:
+        return None
+    f_min, f_max, q_min, q_max, gain_min, gain_max = limits
     frequency, q, gain = canonical_peq_band((
         round(band[0], 1),
         round(band[1], 2),
@@ -709,25 +711,37 @@ def build_filter_census(
         removal = _score_operation(
             operation_refs, None, score_plan, baseline_components
         )
-        probe_band, probe_skip_reason = _probe_band(operation_refs, config)
-        probe = (
-            None
-            if probe_band is None
-            else _score_operation(
-                operation_refs,
-                probe_band,
-                score_plan,
-                baseline_components,
+        try:
+            config.limits_for_refs(operation_refs)
+        except ValueError:
+            if paired_ref is None:
+                raise
+            probe_band = None
+            probe_skip_reason = (
+                "paired filter outside configured symmetric limits"
             )
-        )
-        candidates = search_filter_operations(
-            ref,
-            score_plan,
-            config,
-            paired_ref=paired_ref,
-            asymmetry_eligible=asymmetry_eligible,
-            deadline=deadline,
-        )
+            probe = None
+            candidates = (removal,)
+        else:
+            probe_band, probe_skip_reason = _probe_band(operation_refs, config)
+            probe = (
+                None
+                if probe_band is None
+                else _score_operation(
+                    operation_refs,
+                    probe_band,
+                    score_plan,
+                    baseline_components,
+                )
+            )
+            candidates = search_filter_operations(
+                ref,
+                score_plan,
+                config,
+                paired_ref=paired_ref,
+                asymmetry_eligible=asymmetry_eligible,
+                deadline=deadline,
+            )
         probe_components = (
             None if probe is None else dict(probe.components)
         )

@@ -559,6 +559,51 @@ class FilterSearchTests(unittest.TestCase):
         self.assertIsNone(row.probe_band)
         self.assertEqual(row.probe_skip_reason, "no valid bounded perturbation")
 
+    def test_attribution_skips_out_of_passband_pair_instead_of_crashing(self):
+        left = rehab.FilterRef(6, 8, "Left Sub", "17", (100.0, 4.0, -1.5))
+        right = rehab.FilterRef(7, 8, "Right Sub", "17", (100.0, 4.0, -1.5))
+        config = rehab.RehabilitationConfig(
+            paired_role_limits=((
+                "Left Sub", "Right Sub", 30.0, 90.0, 0.5, 6.0, -8.0, 1.5,
+            ),),
+        )
+
+        ranked = rehab.attribute_correction_region(
+            rehab.CorrectionRegion(100.0, 1.0, -0.25),
+            ((left, right),),
+            self.score_plan,
+            config,
+        )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertIsNone(ranked[0].probe_band)
+        self.assertEqual(
+            ranked[0].skip_reason, "correction region outside owner limits",
+        )
+
+    def test_census_keeps_out_of_passband_pair_nonfatal_and_removal_only(self):
+        left = rehab.FilterRef(6, 8, "Left Sub", "17", (100.0, 4.0, -1.5))
+        right = rehab.FilterRef(7, 8, "Right Sub", "17", (100.0, 4.0, -1.5))
+        config = rehab.RehabilitationConfig(
+            paired_role_limits=((
+                "Left Sub", "Right Sub", 30.0, 90.0, 0.5, 6.0, -8.0, 1.5,
+            ),),
+        )
+
+        rows = rehab.build_filter_census((left, right), self.score_plan, config)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row.probe_skip_reason for row in rows},
+            {"paired filter outside configured symmetric limits"},
+        )
+        self.assertTrue(all(row.probe_band is None for row in rows))
+        self.assertTrue(all(len(row.candidates) == 1 for row in rows))
+        self.assertTrue(all(
+            candidate.edit.replacement is None
+            for row in rows for candidate in row.candidates
+        ))
+
     def test_optimizer_plan_scorer_resolves_before_direct_scoring(self):
         captured = []
         baseline = ((), (), ((97.0, 3.0, -1.5),),) + ((),) * 5
