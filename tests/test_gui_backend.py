@@ -19,7 +19,8 @@ from PySide6.QtWidgets import QApplication
 from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
-    export_candidate, load_target_curve, measurement_checklist, powershell_command, release_run_claim,
+    export_candidate, load_target_curve, measurement_checklist, merge_progress_fraction,
+    powershell_command, release_run_claim,
     locate_summary, record_run_decision, runner_completed_successfully, runner_failure_reason, save_role_map,
     start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
     _communicate_cancellable,
@@ -45,6 +46,23 @@ class GuiJobTests(unittest.TestCase):
         self.assertFalse(cancelled)
         self.assertEqual(len(stdout), 200000)
         self.assertEqual(stderr, "")
+    def test_run_presets_include_five_minutes_and_progress_can_freeze(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = OptimizerWindow()
+        try:
+            presets = [
+                window.preset_combo.itemData(index)
+                for index in range(window.preset_combo.count())
+            ]
+            self.assertIn(300, presets)
+            window._set_run_progress(432)
+            window.progress.setRange(0, 0)
+            window._freeze_run_progress()
+            self.assertEqual(window.progress.minimum(), 0)
+            self.assertEqual(window.progress.maximum(), 1000)
+            self.assertEqual(window.progress.value(), 432)
+        finally:
+            window.close()
     def test_run_tab_uses_scrollable_high_dpi_safe_layout(self) -> None:
         app = QApplication.instance() or QApplication([])
         window = OptimizerWindow()
@@ -66,7 +84,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.9.4")
+        self.assertEqual(__version__, "0.9.5")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -434,6 +452,17 @@ class GuiJobTests(unittest.TestCase):
         cards = metric_card_data(baseline, best)
         self.assertEqual(cards[0]["state"], "good")
 
+    def test_merge_progress_is_monotonic_across_stages(self) -> None:
+        values = [
+            merge_progress_fraction({"stage": "loading_inputs", "completed": 1, "total": 1}),
+            merge_progress_fraction({"stage": "rescoring_finalists", "completed": 200, "total": 200}),
+            merge_progress_fraction({"stage": "writing_candidates", "completed": 0, "total": 20}),
+            merge_progress_fraction({"stage": "building_families", "completed": 100, "total": 200}),
+            merge_progress_fraction({"stage": "complete", "completed": 1, "total": 1}),
+        ]
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(values[-1], 1.0)
+
     def test_progress_and_candidates_read_compact_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -459,7 +488,16 @@ class GuiJobTests(unittest.TestCase):
             self.assertEqual(progress["convergence"]["events"][0]["objective"], 3.25)
 
             (root / ".phase_merging").touch()
-            self.assertEqual(collect_progress(root)["phase"], "merging")
+            (root / "merge_progress.json").write_text(json.dumps({
+                "stage": "rescoring_finalists",
+                "completed": 50,
+                "total": 200,
+            }), encoding="utf-8")
+            progress = collect_progress(root)
+            self.assertEqual(progress["phase"], "merging")
+            self.assertEqual(progress["merge_progress"]["stage"], "rescoring_finalists")
+            self.assertEqual(progress["merge_progress"]["completed"], 50)
+            self.assertEqual(progress["merge_progress"]["total"], 200)
 
             merged = root / "_merged_top"
             merged.mkdir()

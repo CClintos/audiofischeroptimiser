@@ -31,7 +31,7 @@ from .backend import (
     claim_run_root, collect_progress, create_measurement_template, default_export_name,
     default_target, discover_baseline, export_candidate, load_summary,
     load_target_curve, locate_summary, measurement_checklist,
-    memory_guard_status, powershell_command, process_is_running,
+    memory_guard_status, merge_progress_fraction, powershell_command, process_is_running,
     process_tree_memory, record_run_decision, release_run_claim, save_role_map, stop_process_tree,
     start_detached_process, suggest_measurement_role, timestamped_run_root,
     runner_completed_successfully, runner_failure_reason, update_run_claim,
@@ -445,6 +445,7 @@ class OptimizerWindow(QMainWindow):
         self.verify_task: BackgroundTask | None = None
         self.close_after_stop = False
         self.current_run_phase = ""
+        self.last_progress_value = 0
         self.pending_role_dialog: tuple[str, QTextEdit, RunConfig, dict] | None = None
         self.role_mapping_attempted: set[str] = set()
         self.thread_pool = QThreadPool.globalInstance()
@@ -911,10 +912,11 @@ class OptimizerWindow(QMainWindow):
         grid.setColumnMinimumWidth(2, 210)
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("Quick check - 2 minutes", 120)
+        self.preset_combo.addItem("Short run - 5 minutes", 300)
         self.preset_combo.addItem("Normal - 20 minutes", 1200)
         self.preset_combo.addItem("Thorough - 40 minutes", 2400)
         self.preset_combo.addItem("Custom", 0)
-        self.preset_combo.setCurrentIndex(1)
+        self.preset_combo.setCurrentIndex(2)
         self.preset_combo.currentIndexChanged.connect(self._preset_changed)
         self.seconds_spin = QSpinBox()
         self.seconds_spin.setRange(30, 14400)
@@ -1065,7 +1067,7 @@ class OptimizerWindow(QMainWindow):
 
         progress_line = QHBoxLayout()
         self.phase_label = QLabel("Ready")
-        self.phase_label.setMinimumWidth(105)
+        self.phase_label.setFixedWidth(220)
         self.phase_label.setObjectName("workflowTitle")
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -2120,6 +2122,15 @@ class OptimizerWindow(QMainWindow):
         if seconds:
             self.seconds_spin.setValue(seconds)
 
+    def _set_run_progress(self, value: int) -> None:
+        self.last_progress_value = max(0, min(1000, int(value)))
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(self.last_progress_value)
+
+    def _freeze_run_progress(self) -> None:
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(self.last_progress_value)
+
     def _start_clicked(self, _checked: bool = False):
         self.start_run()
 
@@ -2205,8 +2216,8 @@ class OptimizerWindow(QMainWindow):
             "Preparing phase diagnostics"
             if config.mode == "phase" else "Preparing existing tune"
         )
-        self.progress.setRange(0, 1000)
-        self.progress.setValue(0)
+        self.last_progress_value = 0
+        self._set_run_progress(0)
         self.poll_timer.start(1000)
         self.tabs.setCurrentIndex(self.TAB_RUN)
 
@@ -2245,6 +2256,9 @@ class OptimizerWindow(QMainWindow):
             return
         elapsed = max(0.0, time.monotonic() - self.started_monotonic)
         self.elapsed_value.setText(time.strftime("%H:%M:%S", time.gmtime(elapsed)))
+        if self.stop_requested_reason:
+            self._freeze_run_progress()
+            return
         progress = collect_progress(Path(self.config.run_root))
         phase = progress["phase"]
         phase_names = {
@@ -2263,29 +2277,32 @@ class OptimizerWindow(QMainWindow):
             self.run_log.append(f"Phase: {phase_names.get(phase, phase.title())}")
         if phase == "preparing":
             self.phase_label.setText(phase_names["preparing"])
-            self.progress.setRange(0, 0)
+            self._set_run_progress(0)
         elif phase == "searching":
             self.phase_label.setText("Searching")
-            self.progress.setRange(0, 1000)
-            self.progress.setValue(min(800, round(800 * elapsed / max(self.config.seconds, 1))))
+            worker_elapsed = float(progress.get("elapsed_worker_seconds", 0.0))
+            self._set_run_progress(
+                min(800, round(800 * worker_elapsed / max(self.config.seconds, 1)))
+            )
         elif phase == "merging":
-            self.phase_label.setText("Merging")
-            self.progress.setRange(0, 0)
+            merge = progress.get("merge_progress") or {}
+            fraction = merge_progress_fraction(merge)
+            stage = str(merge.get("stage") or "").replace("_", " ").strip()
+            self.phase_label.setText("Merging" + (f" - {stage}" if stage else ""))
+            self._set_run_progress(round(800 + 100 * fraction))
         elif phase == "verifying":
             verified = progress["verified_candidates"]
             candidates = progress["verification_candidates"]
             suffix = f" {verified}/{candidates}" if candidates else ""
             self.phase_label.setText(f"Verifying{suffix}")
-            self.progress.setRange(0, 1000)
             fraction = verified / candidates if candidates else 0.0
-            self.progress.setValue(round(850 + 140 * min(1.0, fraction)))
+            self._set_run_progress(round(900 + 80 * min(1.0, fraction)))
         elif phase == "reporting":
             self.phase_label.setText("Writing report")
-            self.progress.setRange(0, 0)
+            self._set_run_progress(990)
         else:
             self.phase_label.setText("Finalizing")
-            self.progress.setRange(0, 1000)
-            self.progress.setValue(990)
+            self._set_run_progress(995)
         self.worker_value.setText(str(progress["workers_reporting"]))
         self.trial_value.setText(f"{progress['trials']:,}")
         objective = progress["best_objective"]
@@ -2341,6 +2358,7 @@ class OptimizerWindow(QMainWindow):
         stop_file = Path(self.config.run_root) / "stop_requested" if self.config else None
         if stop_file:
             stop_file.write_text(self.stop_requested_reason, encoding="ascii")
+        self._freeze_run_progress()
         self._set_badge("STOPPING SAFELY")
         self.phase_label.setText("Stopping safely")
         self.cancel_button.setEnabled(False)
@@ -2408,6 +2426,7 @@ class OptimizerWindow(QMainWindow):
             self.config.save()
             self._remember_run(self.config)
             self._set_badge("FAILED")
+            self._freeze_run_progress()
             self.phase_label.setText("Failed")
             self.run_log.append(self.config.error)
         self.start_button.setEnabled(True)
@@ -2646,7 +2665,7 @@ class OptimizerWindow(QMainWindow):
         self.report_path = None
         self.open_report_button.setEnabled(False)
         self.phase_label.setText("Writing report")
-        self.progress.setRange(0, 0)
+        self._set_run_progress(990)
         self._set_badge("WRITING REPORT")
         self._show_busy("Writing tuning report")
         task = BackgroundTask(lambda _cancelled: generate_tuning_report(summary_path))

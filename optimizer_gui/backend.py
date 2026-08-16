@@ -489,6 +489,24 @@ def worker_executable() -> str:
     return sys.executable
 
 
+def merge_progress_fraction(progress: dict[str, Any] | None) -> float:
+    progress = dict(progress or {})
+    stage_ranges = {
+        "loading_inputs": (0.00, 0.05),
+        "ranking_candidates": (0.05, 0.10),
+        "rescoring_finalists": (0.10, 0.65),
+        "writing_candidates": (0.65, 0.75),
+        "building_families": (0.75, 0.95),
+        "writing_summary": (0.95, 0.99),
+        "complete": (1.00, 1.00),
+    }
+    start, end = stage_ranges.get(str(progress.get("stage") or ""), (0.0, 0.0))
+    completed = max(0, int(progress.get("completed", 0) or 0))
+    total = max(0, int(progress.get("total", 0) or 0))
+    within_stage = min(1.0, completed / total) if total else 0.0
+    return start + ((end - start) * within_stage)
+
+
 def collect_progress(run_root: Path) -> dict[str, Any]:
     states = []
     for path in sorted(run_root.glob("worker_*/stream_state.json")):
@@ -502,6 +520,15 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
         for row in state.get("best", [])[:1]
         if "objective" in row
     ]
+    merge_progress = {}
+    merge_path = run_root / "merge_progress.json"
+    if merge_path.is_file():
+        try:
+            loaded = json.loads(merge_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                merge_progress = loaded
+        except (OSError, ValueError, TypeError):
+            merge_progress = {}
     verified = len(list((run_root / "_merged_top" / "verification").glob("*.json")))
     candidates = len([
         path for path in (run_root / "_merged_top").glob("*.afpx")
@@ -542,6 +569,7 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
         "verified_candidates": verified,
         "verification_candidates": candidates,
         "convergence": convergence,
+        "merge_progress": merge_progress,
     }
 
 

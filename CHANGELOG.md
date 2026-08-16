@@ -4,6 +4,16 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-16 - v0.9.5 truthful progress and faster merge
+
+- Added a 5-minute PEQ run preset.
+- Replaced indeterminate run animations with real phase progress. Search uses
+  worker elapsed time, merge reports completed stages, and stopping or failure
+  freezes the bar immediately.
+- Merge now trusts fingerprinted worker ranking, re-scores only the finalists,
+  and reuses their objective components. On the 12,801-candidate regression run,
+  merge time fell from about 56 to 21 seconds with byte-identical family AFPX files.
+
 ## 2026-08-16 - v0.9.4 merge and verification hotfix
 
 - Fixed completed worker runs failing at merge because the merger omitted the

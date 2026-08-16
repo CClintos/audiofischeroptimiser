@@ -60,6 +60,18 @@ def attach_fingerprint_context(args, level_calibration, measurement_noise_guard)
     args.loaded_level_calibration = dict(level_calibration or {})
     args.measurement_noise_guard = dict(measurement_noise_guard or {})
 
+def write_merge_progress(path: Path, stage: str, completed: int, total: int):
+    payload = {
+        "stage": str(stage),
+        "completed": max(0, int(completed)),
+        "total": max(0, int(total)),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(path)
+
+
 def unique_best(items, keep):
     out = []
     seen = set()
@@ -132,7 +144,10 @@ def main():
     parser.add_argument("--sub-blend", choices=("off", "recommend"), default="off")
     parser.add_argument("--headroom-db", type=float, default=None)
     parser.add_argument("--voicing-variants", choices=("off", "audition"), default="off")
+    parser.add_argument("--progress-file", type=Path, default=None)
     args = parser.parse_args()
+    progress_path = args.progress_file or (args.root / "merge_progress.json")
+    write_merge_progress(progress_path, "loading_inputs", 0, 1)
 
     measurement_session, level_calibration = opt.prepare_measurement_session(
         args.baseline, args.target, args.level_calibration
@@ -199,6 +214,7 @@ def main():
     items = []
     for worker in worker_dirs:
         items.extend(load_worker_best(worker, expected_fingerprint))
+    write_merge_progress(progress_path, "ranking_candidates", 1, 1)
     if not items:
         raise SystemExit("No stream_state.json best candidates found under " + str(args.root))
 
@@ -281,9 +297,16 @@ def main():
         items, args.census_found_nothing_eligible
     )
 
+    target_family_size = max(args.top * 10, 200)
+    ranked_items = unique_best(items, len(items))
     rescored_items = []
+    rescored_components = {}
     phase_peq_rejections = []
-    for _stored_value, _sig, plan, source in items:
+    write_merge_progress(
+        progress_path, "rescoring_finalists", 0,
+        min(target_family_size, len(ranked_items)),
+    )
+    for _stored_value, _sig, plan, source in ranked_items:
         groups = {group: [] for group in opt.GROUPS}
         groups.update(rehab.thaw_groups(plan.groups))
         if phase_valid and phase_plan:
@@ -306,15 +329,20 @@ def main():
                 )
             )
             continue
+        signature = rehab.candidate_plan_signature(plan)
         rescored_items.append((
-            float(components["objective"]),
-            rehab.candidate_plan_signature(plan),
-            plan,
-            source,
+            float(components["objective"]), signature, plan, source,
         ))
+        rescored_components[signature] = components
+        write_merge_progress(
+            progress_path, "rescoring_finalists", len(rescored_items),
+            min(target_family_size, len(ranked_items)),
+        )
+        if len(rescored_items) >= target_family_size:
+            break
     if not rescored_items:
         raise SystemExit("Every stored candidate conflicts with an attached crossover phase write")
-    family_pool = unique_best(rescored_items, max(args.top * 10, 200))
+    family_pool = unique_best(rescored_items, target_family_size)
     best = family_pool[: args.top]
     out_dir = args.out or (args.root / "_merged_top")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -322,12 +350,13 @@ def main():
         old.unlink()
 
     rows = []
+    write_merge_progress(progress_path, "writing_candidates", 0, max(1, len(best)))
     for rank, (value, sig, plan, source) in enumerate(best, start=1):
         groups = {group: [] for group in opt.GROUPS}
         groups.update(rehab.thaw_groups(plan.groups))
         pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
-        components = dict(score_plan(plan))
+        components = dict(rescored_components[sig])
         file_name = (
             f"candidate_{rank:02d}_objective_{value:.4f}_{source}.afpx"
         )
@@ -349,7 +378,9 @@ def main():
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
+        write_merge_progress(progress_path, "writing_candidates", rank, len(best))
     family_rows = []
+    write_merge_progress(progress_path, "building_families", 0, max(1, len(family_pool)))
     for rank, (value, sig, plan, source) in enumerate(
         family_pool, start=1
     ):
@@ -357,7 +388,7 @@ def main():
         groups.update(rehab.thaw_groups(plan.groups))
         pred = opt.predict_candidate_plan(freqs, traces, plan)
         score = opt.tune_scorecard(freqs, pred, target)
-        components = dict(score_plan(plan))
+        components = dict(rescored_components[sig])
         family_rows.append({
             "rank": rank,
             "file": (
@@ -373,6 +404,7 @@ def main():
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
         })
+        write_merge_progress(progress_path, "building_families", rank, len(family_pool))
     rehabilitation_file = ""
     if rows:
         final_plan = rows[0]["plan"]
@@ -448,8 +480,10 @@ def main():
         census_found_nothing_eligible=args.census_found_nothing_eligible,
         rehabilitation=args.rehabilitation,
     )
+    write_merge_progress(progress_path, "writing_summary", 0, 1)
     opt.write_report(out_dir, rows, baseline_score, interference_notes(freqs, traces), ns,
                      family_rows=family_rows, crossover_rows=crossover_rows, phase_plan=phase_plan)
+    write_merge_progress(progress_path, "complete", 1, 1)
     print("Merged", len(worker_dirs), "workers into", out_dir)
     print("Total worker candidates:", len(items))
     print("Top objective:", rows[0]["objective"])

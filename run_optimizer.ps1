@@ -121,7 +121,8 @@ $phaseCache = Join-Path $Root "phase_diagnostics.json"
 $mergeArgs = @(
     "_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"),
     "--top", "20", "--baseline", $baselinePath, "--target", $targetPath,
-    "--validation-threshold", "$ValidationThreshold", "--phase-writes", $PhaseWrites
+    "--validation-threshold", "$ValidationThreshold", "--phase-writes", $PhaseWrites,
+    "--progress-file", (Join-Path $Root "merge_progress.json")
 )
 $mergeArgs += @("--sub-blend", $SubBlend, "--voicing-variants", $VoicingVariants)
 $mergeArgs += @("--mode", $Mode)
