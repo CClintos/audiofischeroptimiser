@@ -948,14 +948,19 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
         if isinstance(before, (int, float)) and isinstance(after, (int, float)):
             phase_rows.append((str(item.get("label", item.get("name", "Crossover"))), float(before), float(after)))
         decision = "WRITE" if ladder.get("write_eligible") else "LEAVE ALONE"
+        robustness = "%s snapshots x %s drift cases" % (
+            ladder.get("phase_snapshot_count", item.get("phase_snapshot_count", 0)),
+            ladder.get("robust_perturbation_count", 0),
+        )
         confidence_table_rows.append(
-            "<tr><td>%s<br><small>%s</small></td><td>%s</td><td>%s</td><td>%s</td><td><b>%s</b><br><small>%s</small></td></tr>"
+            "<tr><td>%s<br><small>%s</small></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><b>%s</b><br><small>%s</small></td></tr>"
             % (
                 html.escape(str(item.get("label", item.get("name", "Crossover")))),
                 html.escape(str(item.get("band", ""))),
                 html.escape(str(item.get("phase_stability", "unknown"))),
                 html.escape(str(item.get("summation_quality", "unknown"))),
                 html.escape(str(item.get("predicted_sum_match", "unknown"))),
+                html.escape(robustness),
                 decision,
                 html.escape(str(ladder.get("reason", ""))),
             )
@@ -963,7 +968,8 @@ def build_report_html(summary: dict[str, Any], full: dict[str, Any], summary_pat
     phase_chart = _paired_bar_chart(phase_rows)
     confidence_matrix = (
         "<table><tr><th>Crossover</th><th>Phase stability</th><th>Summation</th>"
-        "<th>Solo prediction</th><th>Decision</th></tr>" + "".join(confidence_table_rows) + "</table>"
+        "<th>Solo prediction</th><th>Robustness</th><th>Decision</th></tr>"
+        + "".join(confidence_table_rows) + "</table>"
         if confidence_table_rows else "<p>No crossover confidence rows were available.</p>"
     )
 

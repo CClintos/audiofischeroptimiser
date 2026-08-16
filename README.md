@@ -257,9 +257,14 @@ data.
 PEQ is a magnitude workflow. Phase-related changes need a fresh,
 timing-referenced sweep session. Before the app can write polarity, relative
 delay, or a residual all-pass filter, it checks that the measured solo phase can
-reproduce the measured together/system behaviour in the crossover band. It also
-rejects mixed timing references, weak or ambiguous improvements, and conflicts
-with available impulse evidence.
+reproduce the measured together/system behaviour in the crossover band.
+
+Every supported phase candidate is then stress-tested against small timing and
+level drift. If centre, left-ear, or right-ear crossover snapshots contain the
+required solos and measured-together trace, share the same timing reference, and
+pass acoustic-sum validation, the chosen hardware setting must improve the worst
+validated position. Mixed references, fragile improvements, and conflicts with
+impulse evidence are rejected rather than written.
 
 If those gates do not pass, phase controls stay untouched. The app can still
 complete a PEQ run; it simply does not make a phase claim it cannot support.

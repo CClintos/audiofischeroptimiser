@@ -992,34 +992,99 @@ def group_delay_ms_from_H(freqs, H):
     w = 2 * np.pi * freqs
     return -np.gradient(ph, w) * 1000.0
 
+# Small timing/level changes are enough to make a razor-tuned crossover null
+# appear or disappear. Phase candidates are therefore selected against this
+# bounded envelope, not only the exact captured vectors.
+PHASE_ROBUST_PERTURBATIONS = (
+    (0.0, 0.0),
+    (0.020, 0.0),
+    (-0.020, 0.0),
+    (0.0, 0.5),
+    (0.0, -0.5),
+    (0.015, 0.35),
+    (-0.015, -0.35),
+)
+
+
+def _phase_snapshot_set(driver_a, driver_b, snapshots=None):
+    if snapshots is None:
+        return [(np.asarray(driver_a, complex), np.asarray(driver_b, complex))]
+    values = [(np.asarray(a, complex), np.asarray(b, complex)) for a, b in snapshots]
+    if not values:
+        raise ValueError('phase snapshots cannot be empty')
+    return values
+
+
+def _phase_perturb(freqs, branch, delay_ms, level_db):
+    return (
+        np.asarray(branch, complex)
+        * np.exp(-1j * 2.0 * np.pi * np.asarray(freqs, float) * float(delay_ms) / 1000.0)
+        * 10.0 ** (float(level_db) / 20.0)
+    )
+
 def optimize_allpass(freqs, driver_a, driver_b, search_band, apply_to='A',
                      order=2, f_steps=96, q_steps=24, q_lim=(0.5, 2.0),
                      damage_band=(60.0, 16000.0), damage_free_db=0.5,
-                     damage_penalty=1.0, gd_penalty=0.0, max_gd_ms=2.0):
-    """Grid-search a 2nd-order APF for a driver-pair sum.
+                     damage_penalty=1.0, gd_penalty=0.0, max_gd_ms=2.0,
+                     snapshots=None, robust=True,
+                     perturbations=PHASE_ROBUST_PERTURBATIONS):
+    """Grid-search a robust 2nd-order APF for one or more driver-pair snapshots.
 
-    Inputs are complex solo-driver responses with shared time zero. The score is
-    the weighted gap from the coherent-sum ceiling inside `search_band`, plus a
-    penalty for making other audible regions worse than the no-APF sum.
-
-    This is a candidate finder, not a blind finalizer: verify the chosen APF by
-    re-measuring the acoustic sum after loading it.
+    Every candidate is tested under bounded timing and level drift. With
+    multiple phase-valid positions, selection minimizes the worst snapshot.
     """
     sel = (freqs >= search_band[0]) & (freqs <= search_band[1])
     dmg_sel = (freqs >= damage_band[0]) & (freqs <= damage_band[1])
     if not np.any(sel):
         raise ValueError('search_band does not overlap the frequency axis')
 
-    sum0 = 20 * np.log10(np.abs(driver_a + driver_b) + 1e-12)
-    coherent = 20 * np.log10(np.abs(driver_a) + np.abs(driver_b) + 1e-12)
+    phase_snapshots = _phase_snapshot_set(driver_a, driver_b, snapshots)
+    active_perturbations = perturbations if robust else ((0.0, 0.0),)
 
     def wrms(y, m):
         w = audibility_weight(freqs[m])
         den = np.sum(w ** 2)
         return float(np.sqrt(np.sum((y[m] * w) ** 2) / den)) if den > 1e-12 else float('inf')
 
-    base_gap = np.maximum(coherent - sum0, 0.0)
-    base_score = wrms(base_gap, sel)
+    def evaluate(H=None):
+        scores = []
+        gap_scores = []
+        damage_scores = []
+        per_snapshot = []
+        for snap_a, snap_b in phase_snapshots:
+            snapshot_scores = []
+            for drift_ms, level_db in active_perturbations:
+                perturbed_b = _phase_perturb(freqs, snap_b, drift_ms, level_db)
+                base_sum_db = 20 * np.log10(np.abs(snap_a + perturbed_b) + 1e-12)
+                coherent_db = 20 * np.log10(np.abs(snap_a) + np.abs(perturbed_b) + 1e-12)
+                if H is None:
+                    candidate_sum_db = base_sum_db
+                elif apply_to.upper() == 'A':
+                    candidate_sum_db = 20 * np.log10(np.abs(snap_a * H + perturbed_b) + 1e-12)
+                elif apply_to.upper() == 'B':
+                    candidate_sum_db = 20 * np.log10(np.abs(snap_a + perturbed_b * H) + 1e-12)
+                else:
+                    raise ValueError("apply_to must be 'A' or 'B'")
+                gap_score = wrms(np.maximum(coherent_db - candidate_sum_db, 0.0), sel)
+                damage_score = (
+                    0.0 if H is None else
+                    wrms(np.maximum(base_sum_db - candidate_sum_db - damage_free_db, 0.0), dmg_sel)
+                )
+                score = gap_score + damage_penalty * damage_score
+                scores.append(score)
+                gap_scores.append(gap_score)
+                damage_scores.append(damage_score)
+                snapshot_scores.append(score)
+            per_snapshot.append(max(snapshot_scores))
+        return {
+            'score': max(scores),
+            'gap': max(gap_scores),
+            'damage': max(damage_scores),
+            'per_snapshot': per_snapshot,
+        }
+
+    base_metrics = evaluate()
+    base_score = float(base_metrics['score'])
     f_grid = np.geomspace(search_band[0], search_band[1], f_steps)
     q_grid = np.linspace(q_lim[0], q_lim[1], q_steps)
 
@@ -1027,31 +1092,41 @@ def optimize_allpass(freqs, driver_a, driver_b, search_band, apply_to='A',
     for F in f_grid:
         for Q in q_grid:
             H = allpass_H(freqs, F, Q, order=order)
-            if apply_to.upper() == 'A':
-                sdb = 20 * np.log10(np.abs(driver_a * H + driver_b) + 1e-12)
-            elif apply_to.upper() == 'B':
-                sdb = 20 * np.log10(np.abs(driver_a + driver_b * H) + 1e-12)
-            else:
-                raise ValueError("apply_to must be 'A' or 'B'")
-            gap = np.maximum(coherent - sdb, 0.0)
-            damage = np.maximum(sum0 - sdb - damage_free_db, 0.0)
+            metrics = evaluate(H)
             gd = group_delay_ms_from_H(freqs, H)
             gd_excess = max(0.0, float(np.max(gd[sel])) - max_gd_ms)
-            score = wrms(gap, sel) + damage_penalty * wrms(damage, dmg_sel) + gd_penalty * gd_excess
+            score = float(metrics['score']) + gd_penalty * gd_excess
             if best is None or score < best['selection_score_after']:
                 iF = int(np.argmin(np.abs(freqs - F)))
-                best = {'F': round(float(F), 1),
-                        'Q': round(float(Q), 2),
-                        'order': int(order),
-                        'apply_to': apply_to.upper(),
-                        'score_before': round(base_score, 3),
-                        'selection_score_after': round(float(score), 3),
-                        'gap_score_after': round(wrms(gap, sel), 3),
-                        'lift_at_F_db': round(float(sdb[iF] - sum0[iF]), 2),
-                        'worst_damage_db': round(float(np.max(np.maximum(sum0[dmg_sel] - sdb[dmg_sel], 0.0))), 2),
-                        'max_apf_gd_ms_in_band': round(float(np.max(gd[sel])), 3)}
+                nominal_a, nominal_b = phase_snapshots[0]
+                nominal_before = 20 * np.log10(np.abs(nominal_a + nominal_b) + 1e-12)
+                nominal_after = 20 * np.log10(np.abs(
+                    nominal_a * H + nominal_b if apply_to.upper() == 'A'
+                    else nominal_a + nominal_b * H
+                ) + 1e-12)
+                best = {
+                    'F': round(float(F), 1),
+                    'Q': round(float(Q), 2),
+                    'order': int(order),
+                    'apply_to': apply_to.upper(),
+                    'score_before': round(base_score, 3),
+                    'selection_score_after': round(float(score), 3),
+                    'gap_score_after': round(float(metrics['gap']), 3),
+                    'robust_score_before': round(base_score, 3),
+                    'robust_score_after': round(float(metrics['score']), 3),
+                    'robust_snapshot_scores': [
+                        round(float(value), 3) for value in metrics['per_snapshot']
+                    ],
+                    'phase_snapshot_count': len(phase_snapshots),
+                    'perturbation_count': len(active_perturbations),
+                    'lift_at_F_db': round(float(nominal_after[iF] - nominal_before[iF]), 2),
+                    'worst_damage_db': round(float(metrics['damage']), 2),
+                    'max_apf_gd_ms_in_band': round(float(np.max(gd[sel])), 3),
+                }
 
-    best['improvement_pct'] = round(100.0 * (base_score - best['gap_score_after']) / max(base_score, 1e-9), 1)
+    best['improvement_pct'] = round(
+        100.0 * (base_score - best['robust_score_after']) / max(base_score, 1e-9), 1
+    )
     return best
 
 def loudness_weight(freqs):
@@ -1393,46 +1468,77 @@ def inert_band_check(target_driver_db, dominant_db, threshold_db=6.0):
 # optimize_allpass, so results are directly comparable. Run THIS first; only if
 # `residual_needs_apf` is True has an APF earned consideration.
 def polarity_delay_search(freqs, driver_a, driver_b, band, max_delay_ms=1.5,
-                          steps=121, damage_band=(60.0, 16000.0), damage_free_db=0.5):
-    """Search polarity (binary, on B) x local delay (on B, +ve = B later) for the
-    best summed response in `band`. Candidate finder, not a finalizer: apply the
-    winning polarity/delay for the caller to write or test, then re-measure the
-    together trace to confirm.
-    SIGN NOTE: delay_ms_B < 0 means B must arrive EARLIER, which hardware can't
-    do -- apply +|delay| to the OTHER branch instead (keep its pair's internal
-    offsets intact), exactly like the doc's negative-delay TA rule."""
+                          steps=121, damage_band=(60.0, 16000.0), damage_free_db=0.5,
+                          snapshots=None, robust=True,
+                          perturbations=PHASE_ROBUST_PERTURBATIONS):
+    """Search polarity and delay against timing/level drift and all snapshots.
+
+    Positive delay is applied to B. A negative result must be implemented as
+    positive delay on the other branch while preserving internal pair offsets.
+    """
     sel = (freqs >= band[0]) & (freqs <= band[1])
     dmg = (freqs >= damage_band[0]) & (freqs <= damage_band[1])
     if not np.any(sel):
         raise ValueError('band does not overlap the frequency axis')
-    coh = 20 * np.log10(np.abs(driver_a) + np.abs(driver_b) + 1e-12)
-    sum0 = 20 * np.log10(np.abs(driver_a + driver_b) + 1e-12)
+    phase_snapshots = _phase_snapshot_set(driver_a, driver_b, snapshots)
+    active_perturbations = perturbations if robust else ((0.0, 0.0),)
 
     def wr(y, m):
         w = audibility_weight(freqs[m])
         den = np.sum(w ** 2)
         return float(np.sqrt(np.sum((y[m] * w) ** 2) / den)) if den > 1e-12 else float('inf')
 
-    # NOTE (2026-07-03): the R&D brief proposed a gain-trim rung below polarity.
-    # REJECTED after a failing self-test proved it ill-posed here: this score is
-    # gap-to-coherent-ceiling with the ceiling fixed from the INPUT solos, so a
-    # level change on B can push the sum past the ceiling and game the metric.
-    # Level mismatch is diagnosed by tune_scorecard's balance metrics instead.
-    base = wr(np.maximum(coh - sum0, 0.0), sel)
+    def evaluate(polarity_flip, delay_ms, active):
+        scores = []
+        per_snapshot = []
+        sign = -1.0 if polarity_flip else 1.0
+        correction = np.exp(-1j * 2.0 * np.pi * freqs * float(delay_ms) / 1000.0)
+        for snap_a, snap_b in phase_snapshots:
+            snapshot_scores = []
+            for drift_ms, level_db in active:
+                perturbed_b = _phase_perturb(freqs, snap_b, drift_ms, level_db)
+                coherent = 20 * np.log10(np.abs(snap_a) + np.abs(perturbed_b) + 1e-12)
+                baseline_db = 20 * np.log10(np.abs(snap_a + perturbed_b) + 1e-12)
+                candidate_db = 20 * np.log10(
+                    np.abs(snap_a + sign * perturbed_b * correction) + 1e-12
+                )
+                gap_score = wr(np.maximum(coherent - candidate_db, 0.0), sel)
+                damage_score = wr(
+                    np.maximum(baseline_db - candidate_db - damage_free_db, 0.0), dmg
+                )
+                score = gap_score + damage_score
+                scores.append(score)
+                snapshot_scores.append(score)
+            per_snapshot.append(max(snapshot_scores))
+        return max(scores), per_snapshot
+
+    base, base_snapshots = evaluate(False, 0.0, active_perturbations)
+    nominal_before, _ = evaluate(False, 0.0, ((0.0, 0.0),))
     best = None
     for pol in (False, True):
-        s = -1.0 if pol else 1.0
         for d_ms in np.linspace(-max_delay_ms, max_delay_ms, steps):
-            B2 = s * driver_b * np.exp(-1j * 2 * np.pi * freqs * d_ms / 1000.0)
-            sdb = 20 * np.log10(np.abs(driver_a + B2) + 1e-12)
-            gap = np.maximum(coh - sdb, 0.0)
-            damage = np.maximum(sum0 - sdb - damage_free_db, 0.0)
-            score = wr(gap, sel) + wr(damage, dmg)
+            score, snapshot_scores = evaluate(pol, d_ms, active_perturbations)
             if best is None or score < best['score_after']:
-                best = {'polarity_flip_B': pol, 'delay_ms_B': round(float(d_ms), 3),
-                        'score_before': round(base, 3), 'score_after': round(score, 3)}
-    best['improvement_pct'] = round(100.0 * (base - best['score_after']) / max(base, 1e-9), 1)
-    # if polarity+delay left >25% of the original gap, an APF search is justified next
+                nominal_after, _ = evaluate(pol, d_ms, ((0.0, 0.0),))
+                best = {
+                    'polarity_flip_B': pol,
+                    'delay_ms_B': round(float(d_ms), 3),
+                    'score_before': round(base, 3),
+                    'score_after': round(score, 3),
+                    'nominal_score_before': round(nominal_before, 3),
+                    'nominal_score_after': round(nominal_after, 3),
+                    'robust_snapshot_scores_before': [
+                        round(float(value), 3) for value in base_snapshots
+                    ],
+                    'robust_snapshot_scores_after': [
+                        round(float(value), 3) for value in snapshot_scores
+                    ],
+                    'phase_snapshot_count': len(phase_snapshots),
+                    'perturbation_count': len(active_perturbations),
+                }
+    best['improvement_pct'] = round(
+        100.0 * (base - best['score_after']) / max(base, 1e-9), 1
+    )
     best['residual_needs_apf'] = bool(best['score_after'] > 0.25 * base)
     return best
 

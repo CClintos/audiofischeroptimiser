@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -148,6 +149,106 @@ class CrossoverLadderTests(unittest.TestCase):
         self.assertTrue(ladder["write_eligible"])
         self.assertTrue(ladder["polarity_flip_B"])
         self.assertAlmostEqual(float(ladder["correction_delay_ms_B"]), -0.5, places=3)
+    def test_phase_search_scores_worst_case_across_snapshots_and_drift(self) -> None:
+        freqs = np.geomspace(1800.0, 4500.0, 160)
+        a = np.ones_like(freqs, dtype=complex)
+        b_center = -np.exp(1j * 2.0 * np.pi * freqs * 0.00012)
+        b_left = -np.exp(1j * 2.0 * np.pi * freqs * 0.00016)
+
+        result = optimizer.polarity_delay_search(
+            freqs,
+            a,
+            b_center,
+            (1800.0, 4500.0),
+            max_delay_ms=0.4,
+            steps=81,
+            snapshots=[(a, b_center), (a, b_left)],
+        )
+
+        self.assertEqual(result["phase_snapshot_count"], 2)
+        self.assertEqual(result["perturbation_count"], 7)
+        self.assertEqual(len(result["robust_snapshot_scores_after"]), 2)
+        self.assertAlmostEqual(
+            result["score_after"],
+            max(result["robust_snapshot_scores_after"]),
+            places=3,
+        )
+        self.assertGreater(result["improvement_pct"], 10.0)
+
+    def test_allpass_search_reports_robust_snapshot_envelope(self) -> None:
+        freqs = np.geomspace(50.0, 120.0, 128)
+        a = np.ones_like(freqs, dtype=complex)
+        b_center = np.exp(1j * np.deg2rad(130.0)) * np.ones_like(freqs, dtype=complex)
+        b_right = np.exp(1j * np.deg2rad(145.0)) * np.ones_like(freqs, dtype=complex)
+
+        result = optimizer.optimize_allpass(
+            freqs,
+            a,
+            b_center,
+            (50.0, 120.0),
+            f_steps=10,
+            q_steps=5,
+            snapshots=[(a, b_center), (a, b_right)],
+        )
+
+        self.assertEqual(result["phase_snapshot_count"], 2)
+        self.assertEqual(result["perturbation_count"], 7)
+        self.assertEqual(len(result["robust_snapshot_scores"]), 2)
+        self.assertGreaterEqual(result["robust_score_after"], 0.0)
+
+    def test_spatial_phase_snapshot_requires_reference_and_pair_validation(self) -> None:
+        freqs = np.geomspace(1800.0, 4500.0, 96)
+        phase_b = np.full_like(freqs, -35.0)
+        pair_spl = 60.0 + 20.0 * np.log10(
+            np.abs(1.0 + np.exp(1j * np.deg2rad(phase_b)))
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {
+                "FL Low": root / "Left Ear Front L Mid.txt",
+                "FL High": root / "Left Ear Front L High.txt",
+                "pair": root / "Left Ear Front L Mid + Tweeter.txt",
+            }
+
+            def write_export(path: Path, spl, phase) -> None:
+                rows = ["* reference played from Rear Right with loopback"]
+                rows.extend(
+                    f"{f:.6f} {level:.6f} {angle:.6f}"
+                    for f, level, angle in zip(freqs, spl, phase)
+                )
+                path.write_text("\n".join(rows), encoding="utf-8")
+
+            write_export(paths["FL Low"], np.full_like(freqs, 60.0), np.zeros_like(freqs))
+            write_export(paths["FL High"], np.full_like(freqs, 60.0), phase_b)
+            write_export(paths["pair"], pair_spl, np.zeros_like(freqs))
+            spec = {
+                "a": "FL Low",
+                "b": "FL High",
+                "band": (1800.0, 4500.0),
+                "together_aliases": ("Front L Mid + Tweeter.txt",),
+            }
+            session = {
+                "manifest": {
+                    "spatial_bundles": {
+                        "left": {
+                            "FL Low": str(paths["FL Low"]),
+                            "FL High": str(paths["FL High"]),
+                        }
+                    }
+                },
+                "audit": {"timing_references": ["Rear Right"]},
+            }
+
+            with patch.object(optimizer, "DATA_ROOT", root):
+                snapshots, audit = optimizer._spatial_phase_snapshots(
+                    spec, freqs, session
+                )
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(audit[0]["usable"])
+        self.assertLessEqual(audit[0]["predicted_sum_rms_db"], 0.01)
+
 
 
 if __name__ == "__main__":

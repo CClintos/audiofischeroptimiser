@@ -1434,7 +1434,7 @@ class OptimizerWindow(QMainWindow):
           <li>Penalties for positive gain, excessive filter count, narrow/deep filters, wasted bands and unsupported asymmetry.</li>
         </ul>
         <h2>How phase is judged</h2>
-        <p>The tool validates that solo traces reproduce the measured together trace, then checks only the crossover band. It tests polarity first, relative delay second and an APF only for a supported residual. Weak or inconsistent evidence is rejected or clearly warned.</p>
+        <p>The tool validates that solo traces reproduce the measured together trace, then checks only the crossover band. It tests polarity first, relative delay second and an APF only for a supported residual. Every candidate must survive small timing/level drift; when valid centre/left/right crossover snapshots exist, one setting must improve the worst position. Weak or inconsistent evidence is rejected or clearly warned.</p>
         <h2>What it deliberately avoids</h2>
         <ul>
           <li>Boosting destructive acoustic nulls or crossover cancellations with PEQ.</li>

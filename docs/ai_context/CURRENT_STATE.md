@@ -38,6 +38,10 @@ record.
 - The one-command runner starts with deterministic seed-sharded Beam search,
   then uses the remaining selected PEQ/Retarget run time for data-guided
   variations. The phase diagnostic remains a short baseline-only pass.
+- Crossover polarity, relative-delay and residual-APF selection is robust
+  rather than cursor-exact: each candidate is scored over seven bounded
+  timing/level perturbations. Valid centre/left/right phase snapshots are
+  acoustic-sum checked and the worst snapshot controls selection.
   Guided/CMA remain available for comparisons and fallback runs.
 - Console output is compact; complete JSON/Markdown/CSV stays local.
 - `assistant_summary.json` contains only the decision core; `optimizer_summary.json`

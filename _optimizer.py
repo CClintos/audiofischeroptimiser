@@ -1766,10 +1766,11 @@ def optional_measurement(data_root: Path, aliases: Tuple[str, ...], freqs: np.nd
 
 def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, object]]:
     specs: List[Dict[str, object]] = []
-    sub_front = optional_measurement(DATA_ROOT, (
+    sub_aliases = (
         "Sub and Mids.txt", "Sub + Mids.txt", "Sub + Front Mids.txt",
         "Sub + Front L/R Midbass.txt", "Mids and Sub.txt", "Midbass and Sub.txt",
-    ), freqs)
+    )
+    sub_front = optional_measurement(DATA_ROOT, sub_aliases, freqs)
     if "Sub" in rich and "Mid Bass Together" in rich:
         specs.append({
             "name": "sub_to_front",
@@ -1777,6 +1778,7 @@ def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, obj
             "a": "Sub",
             "b": "Mid Bass Together",
             "together": sub_front,
+            "together_aliases": sub_aliases,
             "band": (50.0, 120.0),
         })
     if FRONT_LAYOUT == "3way":
@@ -1785,12 +1787,14 @@ def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, obj
         mid_left, mid_right = "FL Low", "FR Low"
     for side, mid, high, aliases in (
         ("left", mid_left, "FL High", (
-            "Front L Mid Tweeter Together.txt", "Front L Mid+Tweeter.txt", "Front L Mid + Tweeter.txt",
-            "Front Left Mid + Tweeter.txt", "Front L Together.txt",
+            "Front L Mid Tweeter Together.txt", "Front L Mid+Tweeter.txt",
+            "Front L Mid + Tweeter.txt", "Front Left Mid + Tweeter.txt",
+            "Front L Together.txt",
         )),
         ("right", mid_right, "FR High", (
-            "Front R Mid Tweeter Together.txt", "Front R Mid+Tweeter.txt", "Front R Mid + Tweeter.txt",
-            "Front Right Mid + Tweeter.txt", "Front R Together.txt",
+            "Front R Mid Tweeter Together.txt", "Front R Mid+Tweeter.txt",
+            "Front R Mid + Tweeter.txt", "Front Right Mid + Tweeter.txt",
+            "Front R Together.txt",
         )),
     ):
         if mid in rich and high in rich:
@@ -1800,9 +1804,98 @@ def crossover_specs(freqs: np.ndarray, rich: RichTraceMap) -> List[Dict[str, obj
                 "a": mid,
                 "b": high,
                 "together": optional_measurement(DATA_ROOT, aliases, freqs),
+                "together_aliases": aliases,
                 "band": (1800.0, 4500.0),
             })
     return specs
+
+
+def _position_measurement(prefixes: Tuple[str, ...], aliases: Tuple[str, ...]) -> Path | None:
+    for prefix in prefixes:
+        for alias in aliases:
+            for path in (DATA_ROOT / (prefix + alias), DATA_ROOT / prefix.strip() / alias):
+                if path.is_file():
+                    return path
+    return None
+
+
+def _export_timing_reference(path: Path) -> str:
+    text_value = path.read_text(encoding="utf-8", errors="replace")[:3000]
+    match = re.search(
+        r"reference played from\s+([^\r\n]+?)(?:\s+with|$)",
+        text_value,
+        re.I | re.M,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _spatial_phase_snapshots(spec: Dict[str, object], freqs: np.ndarray,
+                             measurement_session: Dict[str, object] | None
+                             ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[Dict[str, object]]]:
+    if not measurement_session:
+        return [], []
+    manifest = dict(measurement_session.get("manifest", {}))
+    bundles = dict(manifest.get("spatial_bundles", {}))
+    expected_refs = {
+        str(value) for value in dict(measurement_session.get("audit", {})).get(
+            "timing_references", []
+        ) if value
+    }
+    aliases = tuple(str(value) for value in spec.get("together_aliases", ()))
+    band = tuple(float(value) for value in spec["band"])
+    sel = (freqs >= band[0]) & (freqs <= band[1])
+    snapshots: List[Tuple[np.ndarray, np.ndarray]] = []
+    audit: List[Dict[str, object]] = []
+    prefixes_by_position = {
+        "left": ("Left Ear ", "Left "),
+        "right": ("Right Ear ", "Right "),
+    }
+    for position, raw_bundle in sorted(bundles.items()):
+        bundle = dict(raw_bundle)
+        a_path = Path(str(bundle.get(str(spec["a"]), "")))
+        b_path = Path(str(bundle.get(str(spec["b"]), "")))
+        together_path = _position_measurement(
+            prefixes_by_position.get(str(position), (str(position) + " ",)),
+            aliases,
+        )
+        row: Dict[str, object] = {"position": str(position), "usable": False}
+        if not a_path.is_file() or not b_path.is_file() or together_path is None:
+            row["reason"] = "solo or measured-together crossover trace missing"
+            audit.append(row)
+            continue
+        refs = {
+            value for value in (
+                _export_timing_reference(a_path),
+                _export_timing_reference(b_path),
+                _export_timing_reference(together_path),
+            ) if value
+        }
+        if len(refs) != 1 or (expected_refs and refs != expected_refs):
+            row["reason"] = "timing reference missing or inconsistent"
+            audit.append(row)
+            continue
+        a_trace = interp_rich_trace(load_rew_export(a_path), freqs)
+        b_trace = interp_rich_trace(load_rew_export(b_path), freqs)
+        together_trace = interp_rich_trace(load_rew_export(together_path), freqs)
+        ca = _complex_from_rich(a_trace)
+        cb = _complex_from_rich(b_trace)
+        if ca is None or cb is None:
+            row["reason"] = "phase columns missing"
+            audit.append(row)
+            continue
+        predicted = 20.0 * np.log10(np.abs(ca + cb) + 1e-12)
+        error = erb_smooth(freqs, together_trace["spl"] - predicted)
+        error = error - float(np.median(error[sel]))
+        rms = _band_rms(error, sel)
+        row["predicted_sum_rms_db"] = round(rms, 2)
+        if rms > 2.5:
+            row["reason"] = "solo vectors do not reproduce measured-together trace"
+            audit.append(row)
+            continue
+        row.update({"usable": True, "reason": "phase reference and acoustic sum validated"})
+        snapshots.append((ca, cb))
+        audit.append(row)
+    return snapshots, audit
 
 
 def _impulse_pair_result(a: ImpulseTrace | None, b: ImpulseTrace | None,
@@ -1837,7 +1930,9 @@ def _impulse_pair_result(a: ImpulseTrace | None, b: ImpulseTrace | None,
 
 
 def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap,
-                                impulse_root: Path | None = None) -> List[Dict[str, object]]:
+                                impulse_root: Path | None = None,
+                                measurement_session: Dict[str, object] | None = None
+                                ) -> List[Dict[str, object]]:
     impulses = load_optional_impulses(impulse_root)
     rows: List[Dict[str, object]] = []
     for spec in crossover_specs(freqs, rich):
@@ -1911,6 +2006,14 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
 
         ca = _complex_from_rich(a)
         cb = _complex_from_rich(b)
+        spatial_snapshots, spatial_snapshot_audit = _spatial_phase_snapshots(
+            spec, freqs, measurement_session
+        )
+        phase_snapshots = (
+            [(ca, cb), *spatial_snapshots] if ca is not None and cb is not None else []
+        )
+        row["phase_snapshot_validation"] = spatial_snapshot_audit
+        row["phase_snapshot_count"] = len(phase_snapshots)
         if together is not None and ca is not None and cb is not None:
             predicted = 20.0 * np.log10(np.abs(ca + cb) + 1e-12)
             err = erb_smooth(freqs, together["spl"] - predicted)
@@ -1938,7 +2041,14 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
         reference_valid = row.get("predicted_sum_match") in ("high", "medium")
         if ca is not None and cb is not None:
             max_delay_ms = 3.0 if spec["name"] == "sub_to_front" else 0.5
-            pd = polarity_delay_search(freqs, ca, cb, band, max_delay_ms=max_delay_ms)
+            pd = polarity_delay_search(
+                freqs,
+                ca,
+                cb,
+                band,
+                max_delay_ms=max_delay_ms,
+                snapshots=phase_snapshots,
+            )
             gain = float(pd["score_before"]) - float(pd["score_after"])
             meaningful = (
                 float(pd["score_before"]) >= 0.75
@@ -1965,6 +2075,12 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
                 "score_before": pd["score_before"],
                 "score_after_polarity_delay": pd["score_after"],
                 "improvement_pct": pd["improvement_pct"],
+                "nominal_score_before": pd["nominal_score_before"],
+                "nominal_score_after": pd["nominal_score_after"],
+                "phase_snapshot_count": pd["phase_snapshot_count"],
+                "robust_perturbation_count": pd["perturbation_count"],
+                "robust_snapshot_scores_before": pd["robust_snapshot_scores_before"],
+                "robust_snapshot_scores_after": pd["robust_snapshot_scores_after"],
                 "polarity_flip_B": bool(pd["polarity_flip_B"]),
                 "correction_delay_ms_B": float(pd["delay_ms_B"]),
                 "residual_needs_apf": bool(pd["residual_needs_apf"]),
@@ -1979,9 +2095,24 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
             }
             if ladder["write_eligible"] and pd["residual_needs_apf"]:
                 sign = -1.0 if pd["polarity_flip_B"] else 1.0
-                b_after = sign * cb * np.exp(-1j * 2.0 * np.pi * freqs * float(pd["delay_ms_B"]) / 1000.0)
+                correction = np.exp(
+                    -1j * 2.0 * np.pi * freqs * float(pd["delay_ms_B"]) / 1000.0
+                )
+                corrected_snapshots = [
+                    (snap_a, sign * snap_b * correction)
+                    for snap_a, snap_b in phase_snapshots
+                ]
+                b_after = corrected_snapshots[0][1]
                 apf_options = [
-                    optimize_allpass(freqs, ca, b_after, band, apply_to=side, gd_penalty=0.5)
+                    optimize_allpass(
+                        freqs,
+                        ca,
+                        b_after,
+                        band,
+                        apply_to=side,
+                        gd_penalty=0.5,
+                        snapshots=corrected_snapshots,
+                    )
                     for side in ("A", "B")
                 ]
                 apf = min(apf_options, key=lambda item: float(item["selection_score_after"]))
@@ -2052,6 +2183,8 @@ def phase_diagnostic_fingerprint(measurement_session: Dict[str, object],
                                  impulse_root: Path | None = None) -> str:
     manifest = dict(measurement_session.get("manifest", {}))
     paths = [Path(value) for value in dict(manifest.get("resolved_roles", {})).values()]
+    for bundle in dict(manifest.get("spatial_bundles", {})).values():
+        paths.extend(Path(value) for value in dict(bundle).values())
     paths.extend(Path(value) for value in dict(manifest.get("impulse_files", {})).values())
     if impulse_root is not None:
         paths.extend(path for path in Path(impulse_root).rglob("*") if path.is_file())
@@ -2086,7 +2219,9 @@ def cached_crossover_phase_diagnostics(cache_path: Path | None, freqs: np.ndarra
                 }
         except (OSError, ValueError, TypeError):
             pass
-    rows = crossover_phase_diagnostics(freqs, traces, rich, impulse_root)
+    rows = crossover_phase_diagnostics(
+        freqs, traces, rich, impulse_root, measurement_session
+    )
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "fingerprint": fingerprint, "rows": rows}
@@ -2533,7 +2668,9 @@ def trust_meter_lines(row: Dict[str, object], crossover_rows: List[Dict[str, obj
         ladder_status = "write" if ladder.get("write_eligible") else "report-only"
         notes.append(
             f"- {label} ({item['band']}): phase `{phase}`, excess-GD `{item.get('excess_gd_stability', 'missing')}`, "
-            f"summation `{summing}`, acoustic-sum match `{match}`, ladder `{ladder_status}`"
+            f"summation `{summing}`, acoustic-sum match `{match}`, ladder `{ladder_status}`; "
+            f"robust snapshots `{ladder.get('phase_snapshot_count', item.get('phase_snapshot_count', 0))}`, "
+            f"drift cases `{ladder.get('robust_perturbation_count', 0)}`"
         )
     if gate_ms is None or gate_ms <= 0:
         notes.append("- 70-95 Hz improvement: low confidence, gate/phase-valid measurement missing")
@@ -3844,7 +3981,9 @@ def write_report(
                 f"polarity `{item.get('polarity', '')}`; phase `{item.get('phase_stability', '')}`; "
                 f"excess-GD `{item.get('excess_gd_stability', '')}` ({item.get('minimum_phase_pct', '')}% minimum-phase bins); "
                 f"summation `{item.get('summation_quality', '')}`; predicted-sum `{item.get('predicted_sum_match', '')}` "
-                f"({item.get('predicted_sum_rms_db', '')} dB RMS); ladder {ladder_action}{impulse_text}."
+                f"({item.get('predicted_sum_rms_db', '')} dB RMS); robust snapshots "
+                f"`{ladder.get('phase_snapshot_count', item.get('phase_snapshot_count', 0))}`, drift cases "
+                f"`{ladder.get('robust_perturbation_count', 0)}`; ladder {ladder_action}{impulse_text}."
             )
     else:
         lines.append("- No crossover-band phase diagnostics were available from the supplied measurement set.")

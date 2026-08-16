@@ -3,6 +3,21 @@
 Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
+## 2026-08-16 - v0.10.0 robust crossover phase search
+
+- Polarity, delay and residual APF candidates are now scored against seven
+  bounded timing/level perturbations instead of one exact captured vector.
+- When centre/left/right crossover solos and measured-together sweeps share one
+  timing reference and reproduce the acoustic sum, one hardware setting must
+  improve the worst validated position.
+- Reports now show the snapshot and drift-case counts behind each phase
+  decision. Invalid spatial phase bundles are excluded with a concrete reason.
+- Synthetic regression: an exact-capture delay scored 20.025 under two-snapshot
+  drift stress; robust selection reduced the same worst-case score to 3.714.
+- Inspired by the jitter-robust joint analysis in
+  https://github.com/ayukhno/autosound-tuning-skill; independently integrated
+  with AudioFischer's measured-pair, impulse, group-delay and AFPX write gates.
+
 
 ## 2026-08-16 - v0.9.5 truthful progress and faster merge
 
