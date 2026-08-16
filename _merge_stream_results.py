@@ -55,6 +55,11 @@ def load_worker_best(
             ))
     return out
 
+def attach_fingerprint_context(args, level_calibration, measurement_noise_guard):
+    """Mirror worker-loaded session values before fingerprinting merge inputs."""
+    args.loaded_level_calibration = dict(level_calibration or {})
+    args.measurement_noise_guard = dict(measurement_noise_guard or {})
+
 def unique_best(items, keep):
     out = []
     seen = set()
@@ -134,6 +139,9 @@ def main():
     )
     measurement_noise_guard = opt.configure_repeatability_floor(
         args.repeatability_folder, level_calibration
+    )
+    attach_fingerprint_context(
+        args, level_calibration, measurement_noise_guard,
     )
     opt.sync_external_objective(args.baseline, args.target, level_calibration)
     configure_profile(args.profile)

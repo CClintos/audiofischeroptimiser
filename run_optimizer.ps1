@@ -137,6 +137,8 @@ Set-RunPhase "verifying"
 $merged = Join-Path $Root "_merged_top"
 $verifyDir = Join-Path $merged "verification"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+$verifiedCandidates = 0
+$rejectedCandidates = @()
 foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Where-Object { $_.Name -like "family_*" -or $_.Name -like "voicing_*" }) {
     $verifyArgs = @(
         "scripts\verify_written_tune.py", $baselinePath, $candidate.FullName,
@@ -145,13 +147,23 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
         "--target", $targetPath,
         "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))
     )
+    if ($Mode -eq "peq") { $verifyArgs += @("--allow-peq-edits") }
     if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
     if ($RepeatabilityFolder) { $verifyArgs += @("--repeatability-folder", $RepeatabilityFolder) }
     if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
     $null = & $python @verifyArgs
-    if ($LASTEXITCODE -ne 0) { throw "Candidate verification failed: $($candidate.Name)" }
+    if ($LASTEXITCODE -ne 0) {
+        $rejected = $candidate.FullName + ".rejected"
+        Move-Item -LiteralPath $candidate.FullName -Destination $rejected -Force
+        $rejectedCandidates += $candidate.Name
+        Write-Warning "Candidate rejected by verification: $($candidate.Name)"
+    } else {
+        $verifiedCandidates += 1
+    }
 }
-
+if ($verifiedCandidates -eq 0) {
+    throw "No verified AFPX family candidates remain after safety checks."
+}
 $summary = (Resolve-Path -LiteralPath (Join-Path $merged "assistant_summary.json")).Path
 Set-RunPhase "reporting"
 New-Item -ItemType File -Force -Path $runnerSuccess | Out-Null

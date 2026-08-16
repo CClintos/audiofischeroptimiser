@@ -1642,6 +1642,27 @@ class CacheTests(unittest.TestCase):
             )
 
         self.assertNotEqual(off, automatic)
+    def test_merge_attaches_the_same_fingerprint_context_as_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker_args = self._fingerprint_args(root)
+            merge_args = self._fingerprint_args(
+                root,
+                measurement_noise_guard={},
+                loaded_level_calibration={},
+            )
+            noise_guard = dict(worker_args.measurement_noise_guard)
+            calibration = {"FL Low": 0.0}
+            worker_args.loaded_level_calibration = calibration
+
+            merge_stream.attach_fingerprint_context(
+                merge_args, calibration, noise_guard,
+            )
+
+            self.assertEqual(
+                stream.stream_input_fingerprint(worker_args, self.config),
+                stream.stream_input_fingerprint(merge_args, self.config),
+            )
     def _fingerprint_args(self, root, **overrides):
         baseline = root / "baseline.afpx"
         target = root / "target.txt"

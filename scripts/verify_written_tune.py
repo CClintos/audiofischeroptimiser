@@ -249,11 +249,20 @@ def _measurement_lint(data_root: Path, baseline: Path, target_path: Path,
     )
 
 
+def unapproved_removed_filters(removed_nonfree, allow_peq_edits=False):
+    if not allow_peq_edits:
+        return list(removed_nonfree)
+    return [
+        item for item in removed_nonfree
+        if dict(item).get("T") != "17"
+    ]
+
 def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
            allow_polarity: bool = False, allow_output_trim: bool = False,
            data_root: Path | None = None, target: Path | None = None,
            role_map: Path | None = None,
-           repeatability_folder: Path | None = None) -> dict[str, object]:
+           repeatability_folder: Path | None = None,
+           allow_peq_edits: bool = False) -> dict[str, object]:
     old_xml = decode_afpx(baseline)
     new_xml = decode_afpx(candidate)
     old_all = filter_keys(old_xml)
@@ -315,7 +324,10 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         errors.append("crossover_changed")
     if apf_added and not allow_apf:
         errors.append("apf_added")
-    if removed_nonfree:
+    unapproved_removed = unapproved_removed_filters(
+        removed_nonfree, allow_peq_edits,
+    )
+    if unapproved_removed:
         errors.append("existing_filter_removed_or_changed")
     if forbidden_added:
         errors.append("forbidden_filter_type_added")
@@ -327,7 +339,7 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         "candidate": str(candidate),
         "pass": not errors,
         "errors": errors,
-        "peq_only": not delay_changed and not crossover_changed and not apf_added and not forbidden_added and not removed_nonfree,
+        "peq_only": not delay_changed and not crossover_changed and not apf_added and not forbidden_added and not unapproved_removed,
         "delay_changed": delay_changed,
         "polarity_changed": polarity_changed,
         "output_attributes_changed": output_attributes_changed,
@@ -341,6 +353,7 @@ def verify(baseline: Path, candidate: Path, allow_delay: bool, allow_apf: bool,
         "added_filter_count": len(added),
         "removed_filter_count": len(removed),
         "removed_nonfree_filter_count": len(removed_nonfree),
+        "unapproved_removed_filter_count": len(unapproved_removed),
         "unknown_field_changes": forbidden_added,
         "measurement_guardrail_errors": measurement_lint,
     }
@@ -354,6 +367,7 @@ def main() -> None:
     parser.add_argument("--allow-apf", action="store_true")
     parser.add_argument("--allow-polarity", action="store_true")
     parser.add_argument("--allow-output-trim", action="store_true")
+    parser.add_argument("--allow-peq-edits", action="store_true")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--target", type=Path)
     parser.add_argument("--role-map", type=Path)
@@ -365,9 +379,12 @@ def main() -> None:
         args.baseline.resolve(), args.candidate.resolve(), args.allow_delay,
         args.allow_apf, args.allow_polarity, args.allow_output_trim,
         args.data_root, args.target, args.role_map, args.repeatability_folder,
+        args.allow_peq_edits,
     )
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(payload, indent=2))
+    if not payload["pass"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

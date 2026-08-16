@@ -4,6 +4,15 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-16 - v0.9.4 merge and verification hotfix
+
+- Fixed completed worker runs failing at merge because the merger omitted the
+  calibration and repeatability context included in worker fingerprints.
+- Verification now permits intentional existing-PEQ rehabilitation edits while
+  continuing to protect delay, polarity, crossover and APF data.
+- Unsafe optional candidate families are quarantined individually. A run fails
+  only when no verified family remains, and verifier failures now return a
+  failing process exit code.
 ## 2026-08-11 - v0.9.3 out-of-passband baseline hotfix
 
 - Fixed existing-tune preparation crashing when a matched baseline filter sat

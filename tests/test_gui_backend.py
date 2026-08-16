@@ -66,7 +66,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.9.3")
+        self.assertEqual(__version__, "0.9.4")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -689,6 +689,14 @@ class RehabilitationCacheLaunchTests(unittest.TestCase):
         preparation = preparation.split("& $pythonExe @rehabilitationArgs", 1)[0]
 
         self.assertIn('"--stop-file", $stopFilePath', preparation)
+    def test_peq_verification_allows_rehabilitation_and_quarantines_failed_family(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "run_optimizer.ps1"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn('"--allow-peq-edits"', script)
+        self.assertIn('Move-Item -LiteralPath $candidate.FullName', script)
+        self.assertIn('No verified AFPX family candidates remain', script)
     def test_windows_paths_with_spaces_remain_single_runner_arguments(self):
         config = RunConfig(
             "C:\\Fresh Measurements\\RTA session",

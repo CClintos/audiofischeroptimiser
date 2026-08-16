@@ -1,15 +1,45 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
 import _optimizer as optimizer
 from _make_v3 import afpx_roundtrip_lint, apply_output_trim
+import scripts.verify_written_tune as written_verifier
+from scripts.verify_written_tune import unapproved_removed_filters
 
 
 class CrossoverLadderTests(unittest.TestCase):
+    def test_verifier_cli_exits_nonzero_when_candidate_fails(self):
+        with patch.object(
+            written_verifier, "verify", return_value={"pass": False},
+        ), patch.object(
+            written_verifier.sys,
+            "argv",
+            ["verify_written_tune.py", "baseline.afpx", "candidate.afpx"],
+        ), patch.object(Path, "write_text"):
+            with self.assertRaises(SystemExit) as raised:
+                written_verifier.main()
+
+        self.assertEqual(raised.exception.code, 1)
+    def test_verifier_can_allow_peq_edits_without_allowing_crossover_edits(self):
+        removed = (
+            tuple(sorted({"T": "17", "F": "100"}.items())),
+            tuple(sorted({"T": "15", "F": "80"}.items())),
+        )
+
+        self.assertEqual(
+            unapproved_removed_filters(removed, allow_peq_edits=True),
+            [removed[1]],
+        )
+        self.assertEqual(
+            unapproved_removed_filters(removed, allow_peq_edits=False),
+            list(removed),
+        )
+
     def test_lint_allows_only_declared_protective_output_trim(self) -> None:
         block = '<OC><Vol i="0" L="1" T="15"/></OC>'
         old = '<Root>' + block * 4 + '</Root>'
