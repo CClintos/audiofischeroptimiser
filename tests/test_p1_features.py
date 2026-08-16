@@ -402,6 +402,11 @@ class BeamSearchTests(unittest.TestCase):
 
 
 class FamilySelectionTests(unittest.TestCase):
+    def test_single_safe_candidate_only_writes_balanced_family(self) -> None:
+        row = {"components": {"objective": 1.0}, "name": "baseline"}
+        picks = optimizer.select_family_rows([row])
+        self.assertEqual(list(picks), ["balanced"])
+        self.assertIs(picks["balanced"], row)
     def test_equal_family_scores_do_not_compare_row_dicts(self) -> None:
         metrics = {
             "objective": 1.0,

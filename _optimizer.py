@@ -3279,6 +3279,9 @@ def select_family_rows(rows: List[Dict[str, object]]) -> Dict[str, Dict[str, obj
         row["family_role"] = ""
     if not rows:
         return {}
+    if len(rows) == 1:
+        rows[0]["family_role"] = "balanced"
+        return {"balanced": rows[0]}
     pareto_rank_rows(rows)
     first_front = [row for row in rows if int(row.get("pareto_rank", 99)) == 1]
     pool = first_front if first_front else list(rows)
@@ -3829,6 +3832,18 @@ def write_report(
         "filter": item.get("filter"),
         "change_db": round(float(item.get("max_change_db", 0.0)), 3),
     } for item in rejection_source[:3]]
+    no_change_proposed = bool(
+        getattr(
+            args, "no_change_proposed",
+            getattr(args, "census_found_nothing_eligible", False),
+        )
+    )
+    no_change_reason = str(getattr(args, "no_change_reason", "") or "")
+    if no_change_proposed and not no_change_reason:
+        no_change_reason = (
+            "The pre-search problem census found no eligible correction centres in this "
+            "measurement set; the baseline is the result."
+        )
     assistant_payload = {
         "schema": "audiofischer-assistant-summary-v1",
         "run_folder": str(out_dir),
@@ -3845,12 +3860,8 @@ def write_report(
             key: round(float(value), 4)
             for key, value in dict(base_components.get("active_weights", {})).items()
         },
-        "no_change_proposed": bool(getattr(args, "census_found_nothing_eligible", False)),
-        "no_change_reason": (
-            "The pre-search problem census found no eligible correction centres in this "
-            "measurement set; the baseline is the result. (DEFECT 4b hard gate - see CHANGELOG.md.)"
-            if getattr(args, "census_found_nothing_eligible", False) else ""
-        ),
+        "no_change_proposed": no_change_proposed,
+        "no_change_reason": no_change_reason,
         "baseline": baseline_core,
         "baseline_position_tonal_db": base_components.get("spatial_position_tonal_db", {}),
         "best": None if best_row is None else {

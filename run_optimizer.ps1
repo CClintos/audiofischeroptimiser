@@ -163,7 +163,30 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
     }
 }
 if ($verifiedCandidates -eq 0) {
-    throw "No verified AFPX family candidates remain after safety checks."
+    Write-Warning "No named family passed verification; checking ranked safe candidates."
+    foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "candidate_*.afpx" | Sort-Object Name) {
+        $verifyArgs = @(
+            "scripts\verify_written_tune.py", $baselinePath, $candidate.FullName,
+            "--allow-output-trim",
+            "--data-root", $data,
+            "--target", $targetPath,
+            "--out", (Join-Path $verifyDir ($candidate.BaseName + ".json"))
+        )
+        if ($Mode -eq "peq") { $verifyArgs += @("--allow-peq-edits") }
+        if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
+        if ($RepeatabilityFolder) { $verifyArgs += @("--repeatability-folder", $RepeatabilityFolder) }
+        if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
+        $null = & $python @verifyArgs
+        if ($LASTEXITCODE -eq 0) {
+            Copy-Item -LiteralPath $candidate.FullName -Destination (Join-Path $merged "family_balanced.afpx") -Force
+            $verifiedCandidates = 1
+            Write-Warning "Recovered verified balanced result from $($candidate.Name)."
+            break
+        }
+    }
+}
+if ($verifiedCandidates -eq 0) {
+    throw "No verified AFPX candidates remain after safety checks."
 }
 $summary = (Resolve-Path -LiteralPath (Join-Path $merged "assistant_summary.json")).Path
 Set-RunPhase "reporting"

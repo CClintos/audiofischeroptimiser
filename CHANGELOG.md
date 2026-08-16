@@ -4,6 +4,15 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-16 - v0.10.2 truthful no-change result hotfix
+
+- Final merge now removes candidates that introduce any new measurement,
+  headroom, spatial or boolean safety-gate violation before family selection.
+- If no candidate beats the supplied tune beyond repeatability, the run now
+  completes with one verified balanced baseline result and clearly reports
+  `no_change_proposed` instead of manufacturing worse family alternatives.
+- Final verification can recover from an unexpected family-alias rejection by
+  promoting the first independently verified ranked candidate.
 ## 2026-08-16 - v0.10.1 hardware-real phase and leaner candidates
 
 - Relative-delay search now evaluates only integer samples at the selected DSP

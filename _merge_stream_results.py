@@ -114,6 +114,31 @@ def apply_census_gate(items, gate_active: bool):
     ]
 
 
+def final_gate_passes(baseline_components, candidate_components) -> bool:
+    """Keep merge output at least as safe as the supplied baseline."""
+    return not rehab.hard_gate_regressed(
+        baseline_components, candidate_components
+    )
+
+
+def preferred_over_baseline(
+    plan, components, baseline_plan, baseline_components,
+    repeatability_db=0.1,
+) -> bool:
+    """Accept audible gains or an acoustically tied, simpler tune."""
+    candidate = rehab.ScoredCandidate(plan, dict(components))
+    baseline = rehab.ScoredCandidate(baseline_plan, dict(baseline_components))
+    winner = rehab.compare_candidates(
+        candidate, baseline, repeatability_db=repeatability_db
+    )
+    return (
+        rehab.candidate_plan_signature(winner.plan)
+        == rehab.candidate_plan_signature(candidate.plan)
+        and rehab.candidate_plan_signature(candidate.plan)
+        != rehab.candidate_plan_signature(baseline.plan)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge streaming optimizer worker outputs.")
     parser.add_argument("root", type=Path, help="Folder containing worker_* folders.")
@@ -334,6 +359,8 @@ def main():
                 )
             )
             continue
+        if not final_gate_passes(baseline_components, components):
+            continue
         signature = rehab.candidate_plan_signature(plan)
         rescored_items.append((
             float(components["objective"]), signature, plan, source,
@@ -353,8 +380,34 @@ def main():
             break
     if not rescored_items:
         raise SystemExit("Every stored candidate conflicts with an attached crossover phase write")
-    family_pool = unique_best(rescored_items, target_family_size)
-    best = family_pool[: args.top]
+    safe_pool = unique_best(rescored_items, target_family_size)
+    baseline_signature = rehab.candidate_plan_signature(baseline_plan)
+    baseline_item = next(
+        (item for item in safe_pool if item[1] == baseline_signature), None
+    )
+    if baseline_item is None:
+        raise SystemExit("The supplied baseline did not survive final safety checks")
+    improved_pool = [
+        item for item in safe_pool
+        if preferred_over_baseline(
+            item[2], rescored_components[item[1]],
+            baseline_plan, baseline_components,
+        )
+    ]
+    if improved_pool:
+        family_pool = improved_pool
+        best = family_pool[: args.top]
+        args.no_change_proposed = False
+        args.no_change_reason = ""
+    else:
+        family_pool = [baseline_item]
+        best = [baseline_item]
+        args.no_change_proposed = True
+        args.no_change_reason = (
+            "No candidate improved the supplied tune beyond measurement "
+            "repeatability without weakening a safety gate; the verified "
+            "baseline is the result."
+        )
     out_dir = args.out or (args.root / "_merged_top")
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("candidate_*.afpx"):
@@ -491,6 +544,8 @@ def main():
         # the DEFECT 4b hard gate above; see CHANGELOG.md.
         proposal_audit=args.proposal_audit,
         census_found_nothing_eligible=args.census_found_nothing_eligible,
+        no_change_proposed=args.no_change_proposed,
+        no_change_reason=args.no_change_reason,
         rehabilitation=args.rehabilitation,
     )
     write_merge_progress(progress_path, "writing_summary", 0, 1)

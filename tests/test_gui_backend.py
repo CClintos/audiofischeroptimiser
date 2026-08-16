@@ -84,7 +84,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.10.1")
+        self.assertEqual(__version__, "0.10.2")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -734,7 +734,9 @@ class RehabilitationCacheLaunchTests(unittest.TestCase):
 
         self.assertIn('"--allow-peq-edits"', script)
         self.assertIn('Move-Item -LiteralPath $candidate.FullName', script)
-        self.assertIn('No verified AFPX family candidates remain', script)
+        self.assertIn('checking ranked safe candidates', script)
+        self.assertIn('Copy-Item -LiteralPath $candidate.FullName', script)
+        self.assertIn('No verified AFPX candidates remain', script)
     def test_windows_paths_with_spaces_remain_single_runner_arguments(self):
         config = RunConfig(
             "C:\\Fresh Measurements\\RTA session",

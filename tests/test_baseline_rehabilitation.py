@@ -1070,6 +1070,20 @@ class InteractionBeamTests(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "hard gate regressed")
 
+    def test_final_merge_gate_rejects_new_measurement_violation(self):
+        baseline = {"objective": 5.0, "filter_noise_floor_violation_count": 0}
+        candidate = {"objective": 4.0, "filter_noise_floor_violation_count": 1}
+        self.assertFalse(merge_stream.final_gate_passes(baseline, candidate))
+
+    def test_final_merge_calls_exact_baseline_no_change(self):
+        plan = rehab.CandidatePlan()
+        components = self.components(5.0, 0, tonal=1.0, headroom=5.0)
+        self.assertFalse(
+            merge_stream.preferred_over_baseline(
+                plan, components, plan, components, repeatability_db=0.1
+            )
+        )
+
     def test_merge_rejected_above_point_one_db(self):
         first = rehab.SlotEdit.modify(self.left, (1000.0, 0.5, 6.0))
         second = rehab.SlotEdit.modify(self.second, (1000.0, 10.0, -6.0))
