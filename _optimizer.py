@@ -103,6 +103,8 @@ from _tunefit import (
     modal_null_evidence,
     signed_offset_evidence,
     ms_to_samples,
+    samples_to_ms,
+    temporal_group_delay_cost,
     optimize_allpass,
     polarity_delay_search,
     target_anchor_offset,
@@ -1931,7 +1933,8 @@ def _impulse_pair_result(a: ImpulseTrace | None, b: ImpulseTrace | None,
 
 def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMap,
                                 impulse_root: Path | None = None,
-                                measurement_session: Dict[str, object] | None = None
+                                measurement_session: Dict[str, object] | None = None,
+                                sample_rate_hz: float = 96000.0,
                                 ) -> List[Dict[str, object]]:
     impulses = load_optional_impulses(impulse_root)
     rows: List[Dict[str, object]] = []
@@ -2048,6 +2051,7 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
                 band,
                 max_delay_ms=max_delay_ms,
                 snapshots=phase_snapshots,
+                sample_rate_hz=sample_rate_hz,
             )
             gain = float(pd["score_before"]) - float(pd["score_after"])
             meaningful = (
@@ -2083,6 +2087,9 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
                 "robust_snapshot_scores_after": pd["robust_snapshot_scores_after"],
                 "polarity_flip_B": bool(pd["polarity_flip_B"]),
                 "correction_delay_ms_B": float(pd["delay_ms_B"]),
+                "correction_delay_samples_B": int(pd["delay_samples_B"]),
+                "delay_step_ms": float(pd["delay_step_ms"]),
+                "sample_rate_hz": float(pd["sample_rate_hz"]),
                 "residual_needs_apf": bool(pd["residual_needs_apf"]),
                 "impulse_delay_agreement": impulse_delay_agreement,
                 "impulse_polarity_agreement": impulse_polarity_agreement,
@@ -2180,7 +2187,8 @@ def crossover_phase_diagnostics(freqs: np.ndarray, traces: TraceMap, rich: RichT
 
 
 def phase_diagnostic_fingerprint(measurement_session: Dict[str, object],
-                                 impulse_root: Path | None = None) -> str:
+                                 impulse_root: Path | None = None,
+                                 sample_rate_hz: float = 96000.0) -> str:
     manifest = dict(measurement_session.get("manifest", {}))
     paths = [Path(value) for value in dict(manifest.get("resolved_roles", {})).values()]
     for bundle in dict(manifest.get("spatial_bundles", {})).values():
@@ -2200,6 +2208,7 @@ def phase_diagnostic_fingerprint(measurement_session: Dict[str, object],
         "layout": manifest.get("detected_layout"),
         "paths": records,
         "audit": measurement_session.get("audit", {}),
+        "sample_rate_hz": float(sample_rate_hz),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -2207,8 +2216,11 @@ def phase_diagnostic_fingerprint(measurement_session: Dict[str, object],
 def cached_crossover_phase_diagnostics(cache_path: Path | None, freqs: np.ndarray,
                                        traces: TraceMap, rich: RichTraceMap,
                                        measurement_session: Dict[str, object],
-                                       impulse_root: Path | None = None) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
-    fingerprint = phase_diagnostic_fingerprint(measurement_session, impulse_root)
+                                       impulse_root: Path | None = None,
+                                       sample_rate_hz: float = 96000.0) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    fingerprint = phase_diagnostic_fingerprint(
+        measurement_session, impulse_root, sample_rate_hz
+    )
     path = Path(cache_path) if cache_path is not None else None
     if path is not None and path.exists():
         try:
@@ -2220,7 +2232,7 @@ def cached_crossover_phase_diagnostics(cache_path: Path | None, freqs: np.ndarra
         except (OSError, ValueError, TypeError):
             pass
     rows = crossover_phase_diagnostics(
-        freqs, traces, rich, impulse_root, measurement_session
+        freqs, traces, rich, impulse_root, measurement_session, sample_rate_hz
     )
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2254,7 +2266,8 @@ def analyze_phase_session(freqs: np.ndarray, traces: TraceMap, rich: RichTraceMa
                           writes: bool = True) -> Dict[str, object]:
     """Canonical routine phase entry point and stable report schema."""
     rows, cache = cached_crossover_phase_diagnostics(
-        phase_cache, freqs, traces, rich, measurement_session, impulse_root
+        phase_cache, freqs, traces, rich, measurement_session, impulse_root,
+        sample_rate_hz,
     )
     apply_session_phase_validity(rows, dict(measurement_session.get("audit", {})))
     plan = phase_write_plan(rows, sample_rate_hz) if writes else []
@@ -2312,6 +2325,7 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
 
         delay_channels: Tuple[int, ...] = ()
         write_delay_ms = 0.0
+        write_delay_samples = 0
         if abs(correction_ms_b) >= 0.02:
             if correction_ms_b > 0.0:
                 if name == "sub_to_front":
@@ -2320,7 +2334,13 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
                     delay_channels = trace_channels(b_trace)
             else:
                 delay_channels = trace_channels(a_trace)
-            write_delay_ms = abs(correction_ms_b)
+            stored_samples = ladder.get("correction_delay_samples_B")
+            write_delay_samples = abs(
+                int(stored_samples)
+                if stored_samples is not None
+                else int(round(ms_to_samples(correction_ms_b, sample_rate_hz)))
+            )
+            write_delay_ms = samples_to_ms(write_delay_samples, sample_rate_hz)
 
         apf = ladder.get("apf") if isinstance(ladder.get("apf"), dict) else None
         apf_channels: Tuple[int, ...] = ()
@@ -2354,7 +2374,7 @@ def phase_write_plan(crossover_rows: List[Dict[str, object]], sample_rate_hz: fl
             "polarity_channels": polarity_channels,
             "channels": delay_channels,
             "delay_ms": round(write_delay_ms, 4),
-            "delay_samples": int(round(ms_to_samples(write_delay_ms, sample_rate_hz))),
+            "delay_samples": write_delay_samples,
             "apf_channels": apf_channels,
             "apf_f": None if apf is None else float(apf["F"]),
             "apf_q": None if apf is None else float(apf["Q"]),
@@ -3597,7 +3617,7 @@ def write_report(
             "peak_penalty_db", "narrow_peak_penalty_db", "balance_penalty_db",
             "low_balance_rms_db", "high_balance_rms_db", "positive_gain_penalty_db",
             "filter_count", "tonal_masked", "worst_masked", "mid_balance", "tweeter_balance",
-            "headroom_peak", "null_boost_avg", "n_front_bands", "left_alone", "bands",
+            "headroom_peak", "null_boost_avg", "n_front_bands", "simplified_filters", "left_alone", "bands",
         ])
         for row in rows:
             sc = row["score"]
@@ -3616,8 +3636,9 @@ def write_report(
                 comp.get("tonal_masked", ""), comp.get("worst_masked", ""),
                 comp.get("mid_balance", ""), comp.get("tweeter_balance", ""),
                 comp.get("headroom_peak", ""), comp.get("null_boost_avg", ""),
-                comp.get("n_front_bands", ""), row.get("left_alone", ""),
-                row["signature"],
+                comp.get("n_front_bands", ""),
+                dict(row.get("simplification", {})).get("removed_count", 0),
+                row.get("left_alone", ""), row["signature"],
             ])
 
     summary_rows = []
@@ -3662,6 +3683,7 @@ def write_report(
                 if key in comp
             },
             "left_alone": row.get("left_alone", ""),
+            "simplification": dict(row.get("simplification", {})),
         })
     summary_payload = {
         "run_folder": str(out_dir),
@@ -4063,6 +4085,12 @@ def write_report(
         sc = row["score"]
         comp = row.get("components", {})
         component_line = ""
+        simplification = dict(row.get("simplification", {}))
+        removed_count = int(simplification.get("removed_count", 0) or 0)
+        simplification_lines = [] if not removed_count else [
+            f"- simplified: removed {removed_count} filters whose combined "
+            "contribution stayed within the 0.1 dB tie envelope"
+        ]
         if comp:
             component_line = f"- components: {format_component_summary(comp)}"
             lines.extend([
@@ -4075,6 +4103,7 @@ def write_report(
             ),
             component_line,
             *trust_meter_lines(row, crossover_rows, getattr(args, "gate_ms", None)),
+            *simplification_lines,
             f"- left alone: {row.get('left_alone', '')}",
             format_bands(row["groups"]),
             "",

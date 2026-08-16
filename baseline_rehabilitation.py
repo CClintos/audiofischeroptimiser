@@ -998,6 +998,67 @@ def select_best_candidate(
     return min(equivalence_class or (reference,), key=tie_key)
 
 
+def simplify_appended_groups(plan, score_plan, repeatability_db=0.1):
+    """Remove appended PEQ bands that are inaudible under the full objective.
+
+    Single-removal probes rank the weakest bands, then at most one cumulative
+    rescore per band verifies the final combination against the original
+    candidate. This avoids both chained audible drift and a quadratic merge.
+    Existing-slot edits remain untouched.
+    """
+    reference = ScoredCandidate(plan=plan, components=dict(score_plan(plan)))
+    original_groups = thaw_groups(plan.groups)
+    ranked = []
+    for group in sorted(original_groups):
+        for index, band in enumerate(original_groups[group]):
+            trial_groups = {
+                key: list(value) for key, value in original_groups.items()
+            }
+            trial_groups[group].pop(index)
+            trial_plan = CandidatePlan(
+                slot_edits=plan.slot_edits,
+                groups=freeze_groups(trial_groups),
+            )
+            trial = ScoredCandidate(
+                plan=trial_plan,
+                components=dict(score_plan(trial_plan)),
+            )
+            if _acoustically_tied(reference, trial, repeatability_db):
+                ranked.append((
+                    trial.objective,
+                    tie_key(trial),
+                    group,
+                    canonical_peq_band(band),
+                ))
+
+    current = reference
+    removed = []
+    for _objective, _tie, group, band in sorted(ranked):
+        groups = thaw_groups(current.plan.groups)
+        try:
+            index = groups[group].index(band)
+        except (KeyError, ValueError):
+            continue
+        groups[group].pop(index)
+        trial_plan = CandidatePlan(
+            slot_edits=current.plan.slot_edits,
+            groups=freeze_groups(groups),
+        )
+        trial = ScoredCandidate(
+            plan=trial_plan,
+            components=dict(score_plan(trial_plan)),
+        )
+        if not _acoustically_tied(reference, trial, repeatability_db):
+            continue
+        current = trial
+        removed.append({
+            "group": group,
+            "frequency_hz": float(band[0]),
+            "q": float(band[1]),
+            "gain_db": float(band[2]),
+        })
+    return current, tuple(removed)
+
 def _operation_keys(operation):
     return frozenset((edit.ref.channel, edit.ref.slot) for edit in operation.edits)
 

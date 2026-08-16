@@ -251,5 +251,79 @@ class CrossoverLadderTests(unittest.TestCase):
 
 
 
+class HardwareRealPhaseTests(unittest.TestCase):
+    def test_delay_search_returns_an_exact_hardware_sample(self) -> None:
+        freqs = np.geomspace(1800.0, 4500.0, 160)
+        sample_rate = 48000.0
+        a = np.ones_like(freqs, dtype=complex)
+        b = -np.exp(1j * 2.0 * np.pi * freqs * 0.000137)
+
+        result = optimizer.polarity_delay_search(
+            freqs, a, b, (1800.0, 4500.0), max_delay_ms=0.4,
+            steps=121, sample_rate_hz=sample_rate,
+        )
+
+        self.assertEqual(
+            result["delay_samples_B"],
+            round(result["delay_ms_B"] * sample_rate / 1000.0),
+        )
+        self.assertAlmostEqual(
+            result["delay_ms_B"] * sample_rate / 1000.0,
+            result["delay_samples_B"],
+            places=10,
+        )
+        self.assertAlmostEqual(result["delay_step_ms"], 1000.0 / sample_rate, places=6)
+
+    def test_group_delay_cost_is_frequency_relative(self) -> None:
+        freqs = np.geomspace(50.0, 5000.0, 512)
+        delay = np.full_like(freqs, 1.0)
+        low = optimizer.temporal_group_delay_cost(freqs, delay, (80.0, 120.0))
+        high = optimizer.temporal_group_delay_cost(freqs, delay, (2500.0, 3500.0))
+        self.assertGreater(high, low + 1.0)
+
+    def test_temporal_cost_avoids_a_razor_upper_mid_apf(self) -> None:
+        freqs = np.geomspace(1000.0, 7000.0, 300)
+        a = np.ones_like(freqs, dtype=complex)
+        measured = np.exp(
+            -1j * np.angle(optimizer.allpass_H(freqs, 2200.0, 0.8)) * 0.7
+        )
+
+        acoustic_only = optimizer.optimize_allpass(
+            freqs, a, measured, (1800.0, 5000.0), apply_to="B",
+            f_steps=14, q_steps=6, gd_penalty=0.0, robust=False,
+        )
+        temporal_aware = optimizer.optimize_allpass(
+            freqs, a, measured, (1800.0, 5000.0), apply_to="B",
+            f_steps=14, q_steps=6, gd_penalty=0.5, robust=False,
+        )
+
+        self.assertEqual(acoustic_only["Q"], 2.0)
+        self.assertLessEqual(temporal_aware["Q"], 0.8)
+        self.assertLess(
+            temporal_aware["temporal_gd_cost"],
+            acoustic_only["temporal_gd_cost"],
+        )
+
+    def test_phase_write_uses_the_scored_sample_count(self) -> None:
+        rows = [{
+            "name": "left_mid_to_tweeter",
+            "label": "Left mid to tweeter",
+            "a": "FL Low",
+            "b": "FL High",
+            "band": "1800-4500 Hz",
+            "crossover_ladder": {
+                "write_eligible": True,
+                "source": "complex_phase",
+                "polarity_flip_B": False,
+                "correction_delay_ms_B": 0.062,
+                "correction_delay_samples_B": 6,
+            },
+        }]
+
+        plan = optimizer.phase_write_plan(rows, 96000.0)
+
+        self.assertEqual(plan[0]["delay_samples"], 6)
+        self.assertEqual(plan[0]["delay_ms"], 0.0625)
+
 if __name__ == "__main__":
     unittest.main()

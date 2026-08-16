@@ -992,6 +992,31 @@ def group_delay_ms_from_H(freqs, H):
     w = 2 * np.pi * freqs
     return -np.gradient(ph, w) * 1000.0
 
+
+def temporal_group_delay_cost(freqs, group_delay_ms, band,
+                              allowance_cycles=0.35):
+    """Frequency-normalised temporal cost for an all-pass candidate.
+
+    A fixed millisecond threshold treats 100 Hz and 3 kHz as if the ear heard
+    timing identically at both frequencies. This cost instead measures delay
+    against a conservative fraction of one local cycle. It is a ranking cost,
+    not a claim that one universal psychoacoustic threshold exists.
+    """
+    f = np.asarray(freqs, dtype=float)
+    gd = np.maximum(np.asarray(group_delay_ms, dtype=float), 0.0)
+    selected = (f >= float(band[0])) & (f <= float(band[1]))
+    if not np.any(selected):
+        raise ValueError('band does not overlap the frequency axis')
+    allowance_ms = 1000.0 * float(allowance_cycles) / np.maximum(f, 1e-9)
+    excess_ratio = np.maximum(gd / allowance_ms - 1.0, 0.0)
+    weights = audibility_weight(f[selected])
+    denominator = float(np.sum(weights ** 2))
+    if denominator <= 1e-12:
+        return 0.0
+    return float(np.sqrt(np.sum(
+        (excess_ratio[selected] * weights) ** 2
+    ) / denominator))
+
 # Small timing/level changes are enough to make a razor-tuned crossover null
 # appear or disappear. Phase candidates are therefore selected against this
 # bounded envelope, not only the exact captured vectors.
@@ -1026,6 +1051,7 @@ def optimize_allpass(freqs, driver_a, driver_b, search_band, apply_to='A',
                      order=2, f_steps=96, q_steps=24, q_lim=(0.5, 2.0),
                      damage_band=(60.0, 16000.0), damage_free_db=0.5,
                      damage_penalty=1.0, gd_penalty=0.0, max_gd_ms=2.0,
+                     gd_allowance_cycles=0.35,
                      snapshots=None, robust=True,
                      perturbations=PHASE_ROBUST_PERTURBATIONS):
     """Grid-search a robust 2nd-order APF for one or more driver-pair snapshots.
@@ -1094,8 +1120,15 @@ def optimize_allpass(freqs, driver_a, driver_b, search_band, apply_to='A',
             H = allpass_H(freqs, F, Q, order=order)
             metrics = evaluate(H)
             gd = group_delay_ms_from_H(freqs, H)
-            gd_excess = max(0.0, float(np.max(gd[sel])) - max_gd_ms)
-            score = float(metrics['score']) + gd_penalty * gd_excess
+            cycle_cost = temporal_group_delay_cost(
+                freqs, gd, search_band, allowance_cycles=gd_allowance_cycles
+            )
+            absolute_cost = max(
+                0.0,
+                float(np.max(gd[sel])) / max(float(max_gd_ms), 1e-9) - 1.0,
+            )
+            temporal_cost = max(cycle_cost, absolute_cost)
+            score = float(metrics['score']) + gd_penalty * temporal_cost
             if best is None or score < best['selection_score_after']:
                 iF = int(np.argmin(np.abs(freqs - F)))
                 nominal_a, nominal_b = phase_snapshots[0]
@@ -1122,6 +1155,8 @@ def optimize_allpass(freqs, driver_a, driver_b, search_band, apply_to='A',
                     'lift_at_F_db': round(float(nominal_after[iF] - nominal_before[iF]), 2),
                     'worst_damage_db': round(float(metrics['damage']), 2),
                     'max_apf_gd_ms_in_band': round(float(np.max(gd[sel])), 3),
+                    'temporal_gd_cost': round(float(temporal_cost), 3),
+                    'gd_allowance_cycles': float(gd_allowance_cycles),
                 }
 
     best['improvement_pct'] = round(
@@ -1470,7 +1505,8 @@ def inert_band_check(target_driver_db, dominant_db, threshold_db=6.0):
 def polarity_delay_search(freqs, driver_a, driver_b, band, max_delay_ms=1.5,
                           steps=121, damage_band=(60.0, 16000.0), damage_free_db=0.5,
                           snapshots=None, robust=True,
-                          perturbations=PHASE_ROBUST_PERTURBATIONS):
+                          perturbations=PHASE_ROBUST_PERTURBATIONS,
+                          sample_rate_hz=FS):
     """Search polarity and delay against timing/level drift and all snapshots.
 
     Positive delay is applied to B. A negative result must be implemented as
@@ -1514,15 +1550,27 @@ def polarity_delay_search(freqs, driver_a, driver_b, band, max_delay_ms=1.5,
 
     base, base_snapshots = evaluate(False, 0.0, active_perturbations)
     nominal_before, _ = evaluate(False, 0.0, ((0.0, 0.0),))
+    sample_rate_hz = float(sample_rate_hz)
+    if sample_rate_hz <= 0.0:
+        raise ValueError('sample_rate_hz must be positive')
+    raw_delays = np.linspace(-max_delay_ms, max_delay_ms, steps)
+    delay_samples = sorted(set(
+        int(round(ms_to_samples(value, sample_rate_hz)))
+        for value in raw_delays
+    ))
     best = None
     for pol in (False, True):
-        for d_ms in np.linspace(-max_delay_ms, max_delay_ms, steps):
+        for samples in delay_samples:
+            d_ms = samples_to_ms(samples, sample_rate_hz)
             score, snapshot_scores = evaluate(pol, d_ms, active_perturbations)
             if best is None or score < best['score_after']:
                 nominal_after, _ = evaluate(pol, d_ms, ((0.0, 0.0),))
                 best = {
                     'polarity_flip_B': pol,
-                    'delay_ms_B': round(float(d_ms), 3),
+                    'delay_ms_B': float(d_ms),
+                    'delay_samples_B': int(samples),
+                    'delay_step_ms': round(1000.0 / sample_rate_hz, 6),
+                    'sample_rate_hz': sample_rate_hz,
                     'score_before': round(base, 3),
                     'score_after': round(score, 3),
                     'nominal_score_before': round(nominal_before, 3),

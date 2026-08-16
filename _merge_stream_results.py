@@ -301,12 +301,18 @@ def main():
     ranked_items = unique_best(items, len(items))
     rescored_items = []
     rescored_components = {}
+    simplification_audits = {}
     phase_peq_rejections = []
     write_merge_progress(
         progress_path, "rescoring_finalists", 0,
         min(target_family_size, len(ranked_items)),
     )
     for _stored_value, _sig, plan, source in ranked_items:
+        simplified, removed_filters = rehab.simplify_appended_groups(
+            plan, score_plan, repeatability_db=0.1
+        )
+        plan = simplified.plan
+        components = dict(simplified.components)
         groups = {group: [] for group in opt.GROUPS}
         groups.update(rehab.thaw_groups(plan.groups))
         if phase_valid and phase_plan:
@@ -321,7 +327,6 @@ def main():
             if conflicts:
                 phase_peq_rejections.extend(conflicts)
                 continue
-        components = dict(score_plan(plan))
         if components.get("phase_peq_conflict_count", 0.0) > 0.0:
             phase_peq_rejections.extend(
                 opt.candidate_plan_phase_conflicts(
@@ -334,6 +339,12 @@ def main():
             float(components["objective"]), signature, plan, source,
         ))
         rescored_components[signature] = components
+        if removed_filters:
+            simplification_audits[signature] = {
+                "removed_count": len(removed_filters),
+                "removed_filters": list(removed_filters),
+                "tie_tolerance_db": 0.1,
+            }
         write_merge_progress(
             progress_path, "rescoring_finalists", len(rescored_items),
             min(target_family_size, len(ranked_items)),
@@ -377,6 +388,7 @@ def main():
             "headroom": opt.candidate_plan_headroom(freqs, plan),
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
+            "simplification": dict(simplification_audits.get(sig, {})),
         })
         write_merge_progress(progress_path, "writing_candidates", rank, len(best))
     family_rows = []
@@ -403,6 +415,7 @@ def main():
             "signature": sig,
             "source": source,
             "left_alone": opt.left_alone_note(freqs, traces),
+            "simplification": dict(simplification_audits.get(sig, {})),
         })
         write_merge_progress(progress_path, "building_families", rank, len(family_pool))
     rehabilitation_file = ""

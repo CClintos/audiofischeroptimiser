@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--impulse-root", type=Path, default=None)
     parser.add_argument("--level-calibration", type=Path, default=None)
     parser.add_argument("--validation-threshold", type=float, default=2.5)
+    parser.add_argument("--sample-rate", type=float, default=96000.0)
     parser.add_argument("--print-mode", choices=("path", "json", "none"), default="path")
     args = parser.parse_args()
 
@@ -37,7 +38,8 @@ def main() -> None:
             f"{item['pair']} {item['rms_db']} dB > {item['threshold_db']} dB" for item in failed
         ))
     rows, cache = opt.cached_crossover_phase_diagnostics(
-        args.out, freqs, traces, rich, session, args.impulse_root
+        args.out, freqs, traces, rich, session, args.impulse_root,
+        args.sample_rate,
     )
     payload = {**cache, "row_count": len(rows), "pair_validation": validation}
     if args.print_mode == "json":

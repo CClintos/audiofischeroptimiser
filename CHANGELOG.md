@@ -3,6 +3,21 @@
 Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
+
+## 2026-08-16 - v0.10.1 hardware-real phase and leaner candidates
+
+- Relative-delay search now evaluates only integer samples at the selected DSP
+  sample rate, and AFPX writes use that exact scored sample count.
+- Residual APFs now pay a frequency-normalised temporal/group-delay cost. In the
+  upper-mid regression, this changed the selected correction from Q 2.0 to Q 0.8
+  rather than buying a small response gain with concentrated interaural timing.
+- Final PEQ candidates remove appended filters whose combined acoustic effect
+  stays within a non-chaining 0.1 dB repeatability envelope. Existing tune-slot
+  edits remain untouched and every removal is reported.
+- Deliberately deferred OEM-input, nonlinear-driver, limiter and decay models:
+  without their required measurements and hardware fixtures they would add UI
+  and scoring weight without making trustworthy tune decisions.
+
 ## 2026-08-16 - v0.10.0 robust crossover phase search
 
 - Polarity, delay and residual APF candidates are now scored against seven

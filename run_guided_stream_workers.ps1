@@ -98,6 +98,7 @@ $cacheArgs = @(
     "--target", $targetPath,
     "--out", $phaseCachePath,
     "--validation-threshold", "$ValidationThreshold",
+    "--sample-rate", "$SampleRate",
     "--print-mode", "none"
 )
 if ($impulseRootPath -ne "") { $cacheArgs += @("--impulse-root", $impulseRootPath) }

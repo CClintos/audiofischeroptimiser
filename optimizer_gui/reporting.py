@@ -584,6 +584,13 @@ def _plain_findings(summary: dict[str, Any], phase_mode: bool) -> list[str]:
             f"The largest predicted system change is {delta:+.1f} dB near {frequency:.0f} Hz. "
             f"That mainly {direction} {_frequency_region(frequency)}."
         )
+    simplification = best.get("simplification") or {}
+    removed_count = int(simplification.get("removed_count", 0) or 0)
+    if removed_count:
+        findings.append(
+            f"Removed {removed_count} filter{'s' if removed_count != 1 else ''} whose combined "
+            "predicted contribution was below the repeatability threshold."
+        )
     baseline = summary.get("baseline") or {}
     components = best.get("components") or {}
     for key, label in (

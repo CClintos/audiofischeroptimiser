@@ -38,6 +38,14 @@ record.
 - The one-command runner starts with deterministic seed-sharded Beam search,
   then uses the remaining selected PEQ/Retarget run time for data-guided
   variations. The phase diagnostic remains a short baseline-only pass.
+- Relative-delay candidates are quantised to integer samples at the selected
+  device sample rate before scoring; the AFPX writer uses the exact winning
+  sample count. Residual APF ranking includes a frequency-normalised temporal
+  cost as well as the existing absolute group-delay safety bound.
+- Final merged PEQ candidates remove only appended bands whose cumulative
+  acoustic-component change remains inside a non-chaining 0.1 dB repeatability
+  envelope. Existing-slot rehabilitation edits remain untouched and removals
+  are included in reports and `assistant_summary.json`.
 - Crossover polarity, relative-delay and residual-APF selection is robust
   rather than cursor-exact: each candidate is scored over seven bounded
   timing/level perturbations. Valid centre/left/right phase snapshots are
@@ -105,7 +113,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.5.1` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.10.1` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
@@ -253,7 +261,7 @@ record.
 
 ## Verified State
 
-- Ninety-seven regression tests pass, including objective/target-shape invariants,
+- Two hundred thirty-eight regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.

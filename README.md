@@ -185,8 +185,12 @@ filters that mostly cancel each other out, is dropped rather than left in
 place using a slot for nothing.
 
 The result is not simply the candidate with the most filters or the flattest
-single trace. The search favours the smallest correction that makes a meaningful
-improvement across the evidence available.
+single trace. At final merge, appended filters are removed when the complete
+acoustic component set remains within a cumulative 0.1 dB repeatability
+envelope; removals cannot chain into a larger hidden change and are listed in
+the report. Existing tune-slot edits are never silently simplified. The search
+therefore favours the smallest correction that makes a meaningful improvement
+across the evidence available.
 
 ### 3. Separate real L/R offsets from cabin combing
 
@@ -260,7 +264,15 @@ delay, or a residual all-pass filter, it checks that the measured solo phase can
 reproduce the measured together/system behaviour in the crossover band.
 
 Every supported phase candidate is then stress-tested against small timing and
-level drift. If centre, left-ear, or right-ear crossover snapshots contain the
+level drift.
+
+Delay search tests only integer samples at the selected DSP sample rate, so
+the correction being scored is exactly the correction AFPX can write. Residual
+all-pass candidates also pay a frequency-relative temporal cost: a concentrated
+millisecond of group delay is treated as more intrusive in the upper mids than
+around a subwoofer crossover.
+
+If centre, left-ear, or right-ear crossover snapshots contain the
 required solos and measured-together trace, share the same timing reference, and
 pass acoustic-sum validation, the chosen hardware setting must improve the worst
 validated position. Mixed references, fragile improvements, and conflicts with

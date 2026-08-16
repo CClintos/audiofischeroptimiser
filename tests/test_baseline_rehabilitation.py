@@ -1938,5 +1938,55 @@ class ReportingTests(unittest.TestCase):
             [row["label"] for row in payload["comparison_stages"]],
             ["Supplied"],
         )
+
+class FinalCandidateSimplificationTests(unittest.TestCase):
+    @staticmethod
+    def _scorer(effect_by_frequency):
+        def score(plan):
+            bands = [band for _group, values in plan.groups for band in values]
+            present = {round(float(band[0]), 1) for band in bands}
+            tonal = sum(
+                effect for frequency, effect in effect_by_frequency.items()
+                if round(float(frequency), 1) not in present
+            )
+            return {
+                "objective": tonal + 0.01 * len(bands),
+                "tonal_masked": tonal,
+                "filter_count": len(bands),
+                "headroom_margin_db": {"front": 3.0},
+            }
+        return score
+
+    def test_simplifier_drops_only_the_inaudible_appended_band(self) -> None:
+        tiny = (100.0, 1.0, -0.5)
+        meaningful = (200.0, 1.0, -3.0)
+        plan = rehab.CandidatePlan(groups=rehab.freeze_groups({
+            "low_sym": [tiny, meaningful],
+        }))
+
+        result, removed = rehab.simplify_appended_groups(
+            plan, self._scorer({100.0: 0.04, 200.0: 0.30}),
+            repeatability_db=0.1,
+        )
+
+        remaining = rehab.thaw_groups(result.plan.groups)["low_sym"]
+        self.assertNotIn(tiny, remaining)
+        self.assertIn(meaningful, remaining)
+        self.assertEqual([row["frequency_hz"] for row in removed], [100.0])
+
+    def test_simplification_cannot_chain_past_original_tie_envelope(self) -> None:
+        first = (100.0, 1.0, -0.5)
+        second = (200.0, 1.0, -0.5)
+        plan = rehab.CandidatePlan(groups=rehab.freeze_groups({
+            "low_sym": [first, second],
+        }))
+
+        result, removed = rehab.simplify_appended_groups(
+            plan, self._scorer({100.0: 0.06, 200.0: 0.06}),
+            repeatability_db=0.1,
+        )
+
+        self.assertEqual(len(rehab.thaw_groups(result.plan.groups)["low_sym"]), 1)
+        self.assertEqual(len(removed), 1)
 if __name__ == "__main__":
     unittest.main()
