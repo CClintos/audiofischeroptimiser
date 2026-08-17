@@ -87,6 +87,7 @@ jobs:
           python -c "
           import _optimizer
           import _make_v3
+          import baseline_rehabilitation
           import durable_io
           import objective_module.afpx_objective
           import objective_module.device_profile
