@@ -14,12 +14,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from optimizer_gui.backend import (
     RunConfig, RunRootBusyError, active_run_pid, candidate_files, claim_run_root,
     collect_progress, create_measurement_template, default_export_name,
-    export_candidate, load_target_curve, measurement_checklist, merge_progress_fraction,
+    export_candidate, finalization_resume_available, load_target_curve, measurement_checklist, merge_progress_fraction,
     powershell_command, release_run_claim,
     locate_summary, record_run_decision, runner_completed_successfully, runner_failure_reason, save_role_map,
     start_detached_process, suggest_measurement_role, timestamped_run_root, validate_config,
@@ -34,6 +35,7 @@ from optimizer_gui.reporting import (
 from optimizer_gui.warning_text import warning_info
 from optimizer_gui.window import OptimizerWindow
 from scripts.make_measurement_manifest import build_manifest
+from durable_io import atomic_write_json
 
 
 class GuiJobTests(unittest.TestCase):
@@ -84,7 +86,7 @@ class GuiJobTests(unittest.TestCase):
     def test_version_has_one_package_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
         project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(__version__, "0.10.2")
+        self.assertEqual(__version__, "0.10.3")
         self.assertEqual(project["project"]["dynamic"], ["version"])
         self.assertNotIn("version", project["project"])
         self.assertEqual(
@@ -131,8 +133,8 @@ class GuiJobTests(unittest.TestCase):
                 "PermissionError: stream_state.json was locked", encoding="utf-8",
             )
             reason = runner_failure_reason(root)
-        self.assertIn("Windows kept the state file locked", reason)
-        self.assertIn("resumable", reason)
+        self.assertIn("Windows briefly locked", reason)
+        self.assertIn("resume", reason)
 
     def test_windows_runner_uses_hidden_process_group_without_detached_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,6 +158,88 @@ class GuiJobTests(unittest.TestCase):
 
         OptimizerWindow._start_clicked(DummyWindow(), False)
         self.assertEqual(calls, [()])
+
+    def test_start_stop_action_is_mutually_exclusive(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = OptimizerWindow()
+        try:
+            window._set_run_action_state("launching")
+            self.assertTrue(window.start_button.isHidden())
+            self.assertFalse(window.cancel_button.isHidden())
+            self.assertEqual(window.cancel_button.text(), "Starting...")
+            self.assertTrue(window.cancel_button.testAttribute(Qt.WA_ForceDisabled))
+            window._set_run_action_state("running")
+            self.assertEqual(window.cancel_button.text(), "Stop Safely")
+            self.assertFalse(window.cancel_button.testAttribute(Qt.WA_ForceDisabled))
+            window._set_run_action_state("stopping")
+            self.assertEqual(window.cancel_button.text(), "Stopping...")
+            self.assertTrue(window.cancel_button.testAttribute(Qt.WA_ForceDisabled))
+            window._set_run_action_state("idle")
+            self.assertFalse(window.start_button.isHidden())
+            self.assertTrue(window.cancel_button.isHidden())
+        finally:
+            window.close()
+
+    def test_progress_animation_is_monotonic_and_freezes(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        window = OptimizerWindow()
+        try:
+            window._set_run_progress(100)
+            window._set_run_progress_target(300)
+            values = []
+            for _ in range(8):
+                window._advance_run_progress()
+                values.append(window.last_progress_value)
+            self.assertEqual(values, sorted(values))
+            self.assertGreater(values[-1], 100)
+            window._set_run_progress_target(50)
+            self.assertGreaterEqual(window.progress_target_value, values[-1])
+            window._freeze_run_progress()
+            self.assertEqual(window.progress_target_value, window.last_progress_value)
+        finally:
+            window.close()
+
+    def test_atomic_json_publish_retries_transient_reader_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "merge_progress.json"
+            original_replace = Path.replace
+            calls = 0
+
+            def flaky_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise PermissionError("reader still holds the old file")
+                return original_replace(source, destination)
+
+            with patch.object(Path, "replace", new=flaky_replace), patch(
+                "durable_io.time.sleep", return_value=None,
+            ):
+                atomic_write_json(target, {"stage": "rescoring_finalists", "completed": 19})
+            self.assertEqual(json.loads(target.read_text()), {
+                "stage": "rescoring_finalists", "completed": 19,
+            })
+            self.assertEqual(calls, 3)
+
+    def test_completed_worker_archives_allow_finalization_only_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = root / "worker_01"
+            worker.mkdir()
+            (worker / "stream_state.json").write_text(
+                json.dumps({"completed_trials": 42}), encoding="utf-8",
+            )
+            (root / "worker_processes.json").write_text(json.dumps([{
+                "Id": 999999, "Worker": "worker_01", "Out": str(worker),
+            }]), encoding="utf-8")
+            self.assertFalse(finalization_resume_available(root))
+            (root / ".phase_merging").touch()
+            self.assertTrue(finalization_resume_available(root))
+            config = RunConfig("data", "base.afpx", "target.txt", str(root))
+            _program, args = powershell_command(
+                config, executable="C:\\python.exe", finalize_only=True,
+            )
+            self.assertIn("-FinalizeOnly", args)
 
     def test_job_round_trip_and_worker_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

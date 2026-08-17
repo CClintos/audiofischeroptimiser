@@ -4,6 +4,20 @@ Notable changes to the GUI and optimizer, newest first. This is a plain
 human/AI-readable log, not auto-generated; keep entries short and specific
 enough that Codex or Claude can pick up context without rereading the diff.
 
+## 2026-08-17 - v0.10.3 runner reliability and recovery
+
+- Fixed the Windows merge-progress publish race that could fail an otherwise
+  complete run when the GUI read `merge_progress.json` during atomic replace.
+  Durable JSON now uses unique temporary files and bounded lock retries.
+- Failed finalisation can resume directly from intact worker archives without
+  repeating the timed search. A run is published as complete only after the
+  merged candidate set passes independent verification.
+- Native worker, merge, and verifier failures now retain their complete output
+  instead of PowerShell stopping at the first stderr line.
+- The Run action is now a strict state machine: Start disappears immediately,
+  becomes Stop Safely while active, then becomes a disabled Stopping action
+  after one click. Progress is monotonic and eased between durable checkpoints.
+
 ## 2026-08-16 - v0.10.2 truthful no-change result hotfix
 
 - Final merge now removes candidates that introduce any new measurement,

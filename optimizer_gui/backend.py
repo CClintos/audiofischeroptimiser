@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from durable_io import atomic_write_json
+
 from scripts.make_measurement_manifest import (
     ALL_MEASUREMENT_ROLES, build_manifest, compact_manifest, detect_layout,
     first_existing, load_role_map, mapped_measurement, measurement_spec,
@@ -196,9 +198,7 @@ def update_run_claim(run_root: Path, pid: int) -> None:
         "claimed_at": datetime.now().isoformat(timespec="seconds"),
         "run_root": str(Path(run_root).resolve()),
     }
-    temporary = claim.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary.replace(claim)
+    atomic_write_json(claim, payload, indent=2)
 
 
 def release_run_claim(run_root: Path, pid: int | None = None) -> None:
@@ -272,9 +272,7 @@ class RunConfig:
         root = Path(self.run_root)
         root.mkdir(parents=True, exist_ok=True)
         path = root / JOB_FILE
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_json(path, asdict(self), indent=2)
         return path
 
     @classmethod
@@ -407,7 +405,9 @@ def validate_config(config: RunConfig, cancel_event: Any = None) -> dict[str, An
     }
 
 
-def powershell_command(config: RunConfig, executable: str | None = None) -> tuple[str, list[str]]:
+def powershell_command(
+    config: RunConfig, executable: str | None = None, *, finalize_only: bool = False,
+) -> tuple[str, list[str]]:
     script = runtime_root() / "run_optimizer.ps1"
     python_exe = executable or worker_executable()
     args = [
@@ -437,6 +437,8 @@ def powershell_command(config: RunConfig, executable: str | None = None) -> tupl
         args.extend(["-LevelCalibration", config.level_calibration])
     if config.role_map:
         args.extend(["-RoleMap", config.role_map])
+    if finalize_only:
+        args.append("-FinalizeOnly")
     return "powershell.exe", args
 
 
@@ -475,9 +477,7 @@ def record_run_decision(run_root: Path, candidate: str, verdict: str,
         "run_folder": str(root),
         "entries": entries,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, payload, indent=2)
     return path
 
 
@@ -529,9 +529,10 @@ def collect_progress(run_root: Path) -> dict[str, Any]:
                 merge_progress = loaded
         except (OSError, ValueError, TypeError):
             merge_progress = {}
-    verified = len(list((run_root / "_merged_top" / "verification").glob("*.json")))
+    merge_root = run_root / "_merged_top"
+    verified = len(list((merge_root / "verification").glob("*.json")))
     candidates = len([
-        path for path in (run_root / "_merged_top").glob("*.afpx")
+        path for path in merge_root.glob("*.afpx")
         if path.name.startswith(("family_", "voicing_"))
     ])
     phase = next(
@@ -594,12 +595,48 @@ def runner_failure_reason(run_root: Path) -> str:
     if not text:
         return "Optimizer stopped before producing a merged and verified result."
     compact = " ".join(text.split())
-    if "PermissionError" in compact and "stream_state.json" in compact:
+    if "PermissionError" in compact and (
+        "stream_state.json" in compact or "merge_progress.json" in compact
+    ):
         return (
-            "A worker could not save its checkpoint because Windows kept the state file "
-            "locked. The run remains resumable from its last intact checkpoint."
+            "Windows briefly locked an optimizer state file while it was being published. "
+            "The completed work is intact and the run can resume from its last stage."
         )
     return compact[-2000:]
+
+
+def finalization_resume_available(run_root: Path) -> bool:
+    """True when completed worker archives can be merged again without searching."""
+    root = Path(run_root)
+    finalization_started = any(
+        (root / f".phase_{phase}").is_file()
+        for phase in ("merging", "verifying", "reporting")
+    )
+    if not finalization_started:
+        return False
+    process_file = root / "worker_processes.json"
+    if not process_file.is_file():
+        return False
+    try:
+        rows = json.loads(process_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(rows, list) or not rows:
+        return False
+    states = []
+    for row in rows:
+        try:
+            worker_root = Path(str(row["Out"]))
+        except (KeyError, TypeError):
+            return False
+        state = worker_root / "stream_state.json"
+        if not state.is_file():
+            return False
+        try:
+            states.append(json.loads(state.read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError, TypeError):
+            return False
+    return bool(states) and all(int(state.get("completed_trials", 0)) > 0 for state in states)
 
 
 def load_summary(path: Path) -> dict[str, Any]:
@@ -786,9 +823,7 @@ def save_role_map(
             if role in ALL_MEASUREMENT_ROLES and filename
         },
     }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload, indent=2)
     return path
 
 

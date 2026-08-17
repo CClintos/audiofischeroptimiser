@@ -113,7 +113,7 @@ record.
   centre markers, and click-to-enlarge. Retarget uses the same chart widget.
 - Failed or malformed preflight attempts retain copyable diagnostics containing
   stderr/stdout, the exact job configuration, and the measurement manifest.
-- Version `0.10.2` is sourced only from `optimizer_gui/_version.py`; package
+- Version `0.10.3` is sourced only from `optimizer_gui/_version.py`; package
   metadata reads it dynamically, and the GUI title/About panel display it.
 - GUI-launched PowerShell runners are detached and survive an intentional window
   close. The close prompt can keep the run alive, stop safely, or cancel; active
@@ -122,6 +122,14 @@ record.
   retries for transient Windows reader locks. The GUI requires a durable runner
   success marker plus the merged summary, so worker partials and failed
   verification can never be presented as Complete.
+- Merge progress, GUI jobs, run claims, role maps, and decision ledgers use the
+  same unique-temporary-file and bounded-retry publication path. A failed merge
+  or verification can resume finalisation from intact worker archives without
+  repeating the timed search.
+- Start and Stop are one mutually exclusive GUI action: Start is removed as soon
+  as launch begins, Stop is shown only while active, and a single stop click
+  becomes a disabled Stopping state. Phase progress is monotonic and eased
+  between durable checkpoints.
 - Run directories are atomically reserved with collision suffixes, and an
   active-process claim blocks a second GUI instance from starting the same root.
 - Retarget previews the selected target against the built-in reference at a common
@@ -261,7 +269,7 @@ record.
 
 ## Verified State
 
-- Two hundred thirty-eight regression tests pass, including objective/target-shape invariants,
+- Two hundred forty-five regression tests pass, including objective/target-shape invariants,
   session gates, crossover PEQ vetoes, protective volume-write safety, and a
   modern five-column TXT/AFPX golden benchmark.
 - Python compilation and `git diff --check` pass.

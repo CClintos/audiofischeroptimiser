@@ -48,5 +48,6 @@ py-modules = [
   "_tunefit",
   "afpx",
   "audiofischer_gui",
+  "durable_io",
   "pct6",
 ]

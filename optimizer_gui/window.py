@@ -30,7 +30,7 @@ from .backend import (
     APP_NAME, RunConfig, RunRootBusyError, active_run_pid, candidate_files,
     claim_run_root, collect_progress, create_measurement_template, default_export_name,
     default_target, discover_baseline, export_candidate, load_summary,
-    load_target_curve, locate_summary, measurement_checklist,
+    finalization_resume_available, load_target_curve, locate_summary, measurement_checklist,
     memory_guard_status, merge_progress_fraction, powershell_command, process_is_running,
     process_tree_memory, record_run_decision, release_run_claim, save_role_map, stop_process_tree,
     start_detached_process, suggest_measurement_role, timestamped_run_root,
@@ -446,6 +446,8 @@ class OptimizerWindow(QMainWindow):
         self.close_after_stop = False
         self.current_run_phase = ""
         self.last_progress_value = 0
+        self.progress_target_value = 0
+        self.run_action_state = "idle"
         self.pending_role_dialog: tuple[str, QTextEdit, RunConfig, dict] | None = None
         self.role_mapping_attempted: set[str] = set()
         self.thread_pool = QThreadPool.globalInstance()
@@ -453,6 +455,9 @@ class OptimizerWindow(QMainWindow):
         self._apply_style()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_run)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(40)
+        self.progress_timer.timeout.connect(self._advance_run_progress)
         self.data_edit.textChanged.connect(lambda: self._workflow_input_changed("peq"))
         self.baseline_edit.textChanged.connect(lambda: self._workflow_input_changed("peq"))
         self.target_edit.textChanged.connect(lambda: self._workflow_input_changed("peq"))
@@ -1055,6 +1060,7 @@ class OptimizerWindow(QMainWindow):
         self.cancel_button.setIcon(theme.make_icon("stop", theme.DANGER))
         self.cancel_button.clicked.connect(self.cancel_run)
         self.cancel_button.setEnabled(False)
+        self.cancel_button.hide()
         self.open_run_button = QPushButton("Open Run Folder")
         self.open_run_button.setIcon(theme.make_icon("folder-open"))
         self.open_run_button.clicked.connect(self._open_run_folder)
@@ -2124,20 +2130,60 @@ class OptimizerWindow(QMainWindow):
 
     def _set_run_progress(self, value: int) -> None:
         self.last_progress_value = max(0, min(1000, int(value)))
+        self.progress_target_value = self.last_progress_value
         self.progress.setRange(0, 1000)
+        self.progress.setValue(self.last_progress_value)
+
+    def _set_run_progress_target(self, value: int) -> None:
+        value = max(self.last_progress_value, min(1000, int(value)))
+        self.progress_target_value = max(self.progress_target_value, value)
+        self.progress.setRange(0, 1000)
+        if self.progress_target_value > self.last_progress_value and not self.progress_timer.isActive():
+            self.progress_timer.start()
+
+    def _advance_run_progress(self) -> None:
+        remaining = self.progress_target_value - self.last_progress_value
+        if remaining <= 0:
+            self.progress_timer.stop()
+            return
+        step = max(1, min(18, math.ceil(remaining * 0.14)))
+        self.last_progress_value = min(self.progress_target_value, self.last_progress_value + step)
         self.progress.setValue(self.last_progress_value)
 
     def _freeze_run_progress(self) -> None:
+        self.progress_timer.stop()
+        self.progress_target_value = self.last_progress_value
         self.progress.setRange(0, 1000)
         self.progress.setValue(self.last_progress_value)
 
+    def _set_run_action_state(self, state: str) -> None:
+        """Keep Start and Stop mutually exclusive throughout every transition."""
+        self.run_action_state = state
+        active = state in {"launching", "running", "stopping"}
+        self.start_button.setVisible(not active)
+        self.cancel_button.setVisible(active)
+        if state == "launching":
+            self.cancel_button.setText("Starting...")
+            self.cancel_button.setEnabled(False)
+        elif state == "running":
+            self.cancel_button.setText("Stop Safely")
+            self.cancel_button.setEnabled(True)
+        elif state == "stopping":
+            self.cancel_button.setText("Stopping...")
+            self.cancel_button.setEnabled(False)
+        else:
+            self.cancel_button.setText("Stop Safely")
+            self.cancel_button.setEnabled(False)
+
     def _start_clicked(self, _checked: bool = False):
+        if getattr(self, "run_action_state", "idle") != "idle":
+            return
         self.start_run()
 
     def start_run(self, resume_root: Path | None = None):
         if isinstance(resume_root, bool):
             resume_root = None
-        if self._run_is_active():
+        if self.run_action_state != "idle" or self._run_is_active():
             return
         if resume_root is None:
             validated = self.validated_configs.get(self.active_mode)
@@ -2163,6 +2209,10 @@ class OptimizerWindow(QMainWindow):
             config.error = ""
         else:
             config = current
+        finalize_only = bool(
+            resume_root is not None and finalization_resume_available(Path(config.run_root))
+        )
+        self._set_run_action_state("launching")
         try:
             claim_run_root(Path(config.run_root))
         except RunRootBusyError as exc:
@@ -2170,6 +2220,7 @@ class OptimizerWindow(QMainWindow):
                 self, "Run already active",
                 f"{exc}\n\nOpen that run from Recent Runs instead of starting it twice.",
             )
+            self._set_run_action_state("idle")
             return
         config.started_at = datetime.now().isoformat(timespec="seconds")
         config.status = "running"
@@ -2183,7 +2234,7 @@ class OptimizerWindow(QMainWindow):
         self.current_run_phase = ""
         self.process_finished_handled = False
         self.runner_log_offset = 0
-        program, args = powershell_command(config)
+        program, args = powershell_command(config, finalize_only=finalize_only)
         try:
             pid = start_detached_process(
                 program, args, Path(config.run_root).parent,
@@ -2195,11 +2246,11 @@ class OptimizerWindow(QMainWindow):
             config.error = f"The detached optimizer process could not be started: {exc}"
             config.save()
             QMessageBox.critical(self, "Could not start", config.error)
+            self._set_run_action_state("idle")
             return
         self.process_pid = int(pid)
         update_run_claim(Path(config.run_root), self.process_pid)
-        self.start_button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
+        self._set_run_action_state("running")
         self.open_run_button.setEnabled(True)
         self._set_badge("RUNNING")
         memory_line = (
@@ -2209,6 +2260,7 @@ class OptimizerWindow(QMainWindow):
         )
         self.run_log.setPlainText(
             f"Run folder: {config.run_root}\nWorkers: {config.workers}\n"
+            f"{'Resuming merge and verification from completed workers.\n' if finalize_only else ''}"
             f"{memory_line}\n"
         )
         self.memory_guard_error_logged = not self.memory_guard_available
@@ -2277,11 +2329,11 @@ class OptimizerWindow(QMainWindow):
             self.run_log.append(f"Phase: {phase_names.get(phase, phase.title())}")
         if phase == "preparing":
             self.phase_label.setText(phase_names["preparing"])
-            self._set_run_progress(0)
+            self._set_run_progress_target(0)
         elif phase == "searching":
             self.phase_label.setText("Searching")
             worker_elapsed = float(progress.get("elapsed_worker_seconds", 0.0))
-            self._set_run_progress(
+            self._set_run_progress_target(
                 min(800, round(800 * worker_elapsed / max(self.config.seconds, 1)))
             )
         elif phase == "merging":
@@ -2289,20 +2341,20 @@ class OptimizerWindow(QMainWindow):
             fraction = merge_progress_fraction(merge)
             stage = str(merge.get("stage") or "").replace("_", " ").strip()
             self.phase_label.setText("Merging" + (f" - {stage}" if stage else ""))
-            self._set_run_progress(round(800 + 100 * fraction))
+            self._set_run_progress_target(round(800 + 100 * fraction))
         elif phase == "verifying":
             verified = progress["verified_candidates"]
             candidates = progress["verification_candidates"]
             suffix = f" {verified}/{candidates}" if candidates else ""
             self.phase_label.setText(f"Verifying{suffix}")
             fraction = verified / candidates if candidates else 0.0
-            self._set_run_progress(round(900 + 80 * min(1.0, fraction)))
+            self._set_run_progress_target(round(900 + 80 * min(1.0, fraction)))
         elif phase == "reporting":
             self.phase_label.setText("Writing report")
-            self._set_run_progress(990)
+            self._set_run_progress_target(990)
         else:
             self.phase_label.setText("Finalizing")
-            self._set_run_progress(995)
+            self._set_run_progress_target(995)
         self.worker_value.setText(str(progress["workers_reporting"]))
         self.trial_value.setText(f"{progress['trials']:,}")
         objective = progress["best_objective"]
@@ -2355,13 +2407,13 @@ class OptimizerWindow(QMainWindow):
             return
         pid = self.process_pid
         self.stop_requested_reason = "memory" if memory_stop else "user"
+        self._set_run_action_state("stopping")
         stop_file = Path(self.config.run_root) / "stop_requested" if self.config else None
         if stop_file:
             stop_file.write_text(self.stop_requested_reason, encoding="ascii")
         self._freeze_run_progress()
         self._set_badge("STOPPING SAFELY")
         self.phase_label.setText("Stopping safely")
-        self.cancel_button.setEnabled(False)
         self._show_busy("Stopping safely and preserving checkpoints")
         if self.config:
             self.config.status = "memory_stopped" if memory_stop else "stopped"
@@ -2402,11 +2454,12 @@ class OptimizerWindow(QMainWindow):
         self.process_finished_handled = True
         self._read_runner_log()
         self.poll_timer.stop()
-        self.cancel_button.setEnabled(False)
+        self.progress_timer.stop()
         if not self.config:
             return
         finished_pid = self.process_pid
         self.process_pid = 0
+        self._set_run_action_state("idle")
         release_run_claim(Path(self.config.run_root), finished_pid)
         summary = locate_summary(Path(self.config.run_root))
         if exit_code == 0 and summary:
@@ -2463,8 +2516,7 @@ class OptimizerWindow(QMainWindow):
             self.process_finished_handled = False
             self.runner_log_offset = 0
             self.started_monotonic = time.monotonic()
-            self.start_button.setEnabled(False)
-            self.cancel_button.setEnabled(True)
+            self._set_run_action_state("running")
             self.open_run_button.setEnabled(True)
             self._set_badge("RUNNING IN BACKGROUND")
             self.run_log.setPlainText(

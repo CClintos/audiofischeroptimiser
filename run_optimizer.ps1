@@ -23,7 +23,8 @@ param(
     [ValidateSet("off", "audition")]
     [string]$VoicingVariants = "off",
     [string]$RehabilitationCache = "",
-    [string]$PythonExe = ""
+    [string]$PythonExe = "",
+    [switch]$FinalizeOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,6 +68,34 @@ function Set-RunPhase([string]$Phase) {
     }
     New-Item -ItemType File -Force -Path (Join-Path $Root (".phase_" + $Phase)) | Out-Null
 }
+function Invoke-NativeCommand([string[]]$Arguments) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell turns native stderr into terminating ErrorRecords when
+        # the script preference is Stop. Capture the entire diagnostic first.
+        $ErrorActionPreference = "Continue"
+        $output = @(& $python @Arguments 2>&1)
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [PSCustomObject]@{
+        Code = [int]$code
+        Output = @($output | ForEach-Object { $_.ToString() })
+    }
+}
+function Remove-DirectoryWithRetry([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    for ($attempt = 0; $attempt -lt 16; $attempt += 1) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge 15) { throw }
+            Start-Sleep -Milliseconds ([Math]::Min(400, 25 * [Math]::Pow(2, $attempt)))
+        }
+    }
+}
 if ($Workers -le 0) {
     $logical = [Environment]::ProcessorCount
     $Workers = [Math]::Max(1, [Math]::Min(12, [Math]::Floor($logical * 0.60)))
@@ -88,20 +117,30 @@ if ($ImpulseRoot) { $launch.ImpulseRoot = $ImpulseRoot }
 if ($LevelCalibration) { $launch.LevelCalibration = $LevelCalibration }
 if ($RepeatabilityFolder) { $launch.RepeatabilityFolder = $RepeatabilityFolder }
 if ($RoleMap) { $launch.RoleMap = $roleMapPath }
-if ($RehabilitationCache) { $launch.RehabilitationCache = $RehabilitationCache }
-Set-RunPhase "preparing"
-& (Join-Path $here "run_guided_stream_workers.ps1") @launch
-if ($LASTEXITCODE -ne 0) {
-    throw "Optimizer worker launch failed. See the run log above for the detailed error."
-}
-Set-RunPhase "searching"
-
 $processFile = Join-Path $Root "worker_processes.json"
-if (-not (Test-Path -LiteralPath $processFile)) { throw "Worker process manifest was not created." }
-$workerRows = @((Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
-foreach ($row in $workerRows) {
-    $process = Get-Process -Id ([int]$row.Id) -ErrorAction SilentlyContinue
-    if ($process) { $process | Wait-Process }
+if ($RehabilitationCache) { $launch.RehabilitationCache = $RehabilitationCache }
+if (-not $FinalizeOnly) {
+    Set-RunPhase "preparing"
+    & (Join-Path $here "run_guided_stream_workers.ps1") @launch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Optimizer worker launch failed. See the run log above for the detailed error."
+    }
+    Set-RunPhase "searching"
+    if (-not (Test-Path -LiteralPath $processFile)) { throw "Worker process manifest was not created." }
+    $workerRows = @((Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
+    foreach ($row in $workerRows) {
+        $process = Get-Process -Id ([int]$row.Id) -ErrorAction SilentlyContinue
+        if ($process) { $process | Wait-Process }
+    }
+} else {
+    Write-Host "Resuming finalization from completed worker archives"
+    if (-not (Test-Path -LiteralPath $processFile)) {
+        throw "Finalization cannot resume because worker_processes.json is missing."
+    }
+    $workerRows = @((Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
+    if (-not $workerRows.Count) {
+        throw "Finalization cannot resume because the worker manifest is empty."
+    }
 }
 $failed = @()
 foreach ($row in $workerRows) {
@@ -118,8 +157,10 @@ if ($failed.Count) { throw ($failed -join [Environment]::NewLine) }
 Set-RunPhase "merging"
 Write-Host "Merging candidates"
 $phaseCache = Join-Path $Root "phase_diagnostics.json"
+$merged = Join-Path $Root "_merged_top"
+Remove-DirectoryWithRetry $merged
 $mergeArgs = @(
-    "_merge_stream_results.py", $Root, "--out", (Join-Path $Root "_merged_top"),
+    "_merge_stream_results.py", $Root, "--out", $merged,
     "--top", "20", "--baseline", $baselinePath, "--target", $targetPath,
     "--validation-threshold", "$ValidationThreshold", "--phase-writes", $PhaseWrites,
     "--progress-file", (Join-Path $Root "merge_progress.json")
@@ -131,11 +172,13 @@ if (Test-Path -LiteralPath $phaseCache) { $mergeArgs += @("--phase-cache", $phas
 if ($ImpulseRoot) { $mergeArgs += @("--impulse-root", $ImpulseRoot) }
 if ($LevelCalibration) { $mergeArgs += @("--level-calibration", $LevelCalibration) }
 if ($RepeatabilityFolder) { $mergeArgs += @("--repeatability-folder", $RepeatabilityFolder) }
-$mergeOutput = & $python @mergeArgs 2>&1
-if ($LASTEXITCODE -ne 0) { throw ($mergeOutput -join [Environment]::NewLine) }
+$mergeResult = Invoke-NativeCommand $mergeArgs
+if ($mergeResult.Code -ne 0) {
+    throw ("Candidate merge failed with exit code {0}.`n{1}" -f $mergeResult.Code, ($mergeResult.Output -join [Environment]::NewLine))
+}
+$mergeResult.Output | ForEach-Object { Write-Host $_ }
 
 Set-RunPhase "verifying"
-$merged = Join-Path $Root "_merged_top"
 $verifyDir = Join-Path $merged "verification"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $verifiedCandidates = 0
@@ -152,8 +195,8 @@ foreach ($candidate in Get-ChildItem -LiteralPath $merged -Filter "*.afpx" | Whe
     if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
     if ($RepeatabilityFolder) { $verifyArgs += @("--repeatability-folder", $RepeatabilityFolder) }
     if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
-    $null = & $python @verifyArgs
-    if ($LASTEXITCODE -ne 0) {
+    $verifyResult = Invoke-NativeCommand $verifyArgs
+    if ($verifyResult.Code -ne 0) {
         $rejected = $candidate.FullName + ".rejected"
         Move-Item -LiteralPath $candidate.FullName -Destination $rejected -Force
         $rejectedCandidates += $candidate.Name
@@ -176,8 +219,8 @@ if ($verifiedCandidates -eq 0) {
         if ($RoleMap) { $verifyArgs += @("--role-map", $roleMapPath) }
         if ($RepeatabilityFolder) { $verifyArgs += @("--repeatability-folder", $RepeatabilityFolder) }
         if ($PhaseWrites -eq "auto") { $verifyArgs += @("--allow-delay", "--allow-apf", "--allow-polarity") }
-        $null = & $python @verifyArgs
-        if ($LASTEXITCODE -eq 0) {
+        $verifyResult = Invoke-NativeCommand $verifyArgs
+        if ($verifyResult.Code -eq 0) {
             Copy-Item -LiteralPath $candidate.FullName -Destination (Join-Path $merged "family_balanced.afpx") -Force
             $verifiedCandidates = 1
             Write-Warning "Recovered verified balanced result from $($candidate.Name)."

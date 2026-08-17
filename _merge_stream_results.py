@@ -8,6 +8,7 @@ from pathlib import Path
 
 import _optimizer as opt
 import baseline_rehabilitation as rehab
+from durable_io import atomic_write_json
 from _optimizer_stream import (
     beam_entry_from_json, build_rows, candidate_plan_from_json, configure_profile, interference_notes,
     stream_input_fingerprint,
@@ -66,10 +67,7 @@ def write_merge_progress(path: Path, stage: str, completed: int, total: int):
         "completed": max(0, int(completed)),
         "total": max(0, int(total)),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload)
 
 
 def unique_best(items, keep):
