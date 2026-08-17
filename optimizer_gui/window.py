@@ -2258,9 +2258,13 @@ class OptimizerWindow(QMainWindow):
             if self.memory_guard_available else
             f"Memory guard unavailable: {self.memory_guard_reason}"
         )
+        resume_line = (
+            "Resuming merge and verification from completed workers.\n"
+            if finalize_only else ""
+        )
         self.run_log.setPlainText(
             f"Run folder: {config.run_root}\nWorkers: {config.workers}\n"
-            f"{'Resuming merge and verification from completed workers.\n' if finalize_only else ''}"
+            f"{resume_line}"
             f"{memory_line}\n"
         )
         self.memory_guard_error_logged = not self.memory_guard_available
